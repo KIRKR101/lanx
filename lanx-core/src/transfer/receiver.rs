@@ -1,12 +1,15 @@
 //! Receiver side. Reads from TCP, writes to disk; recomputes the whole-file
 //! hash incrementally.
 
-use super::{read_frame, write_frame, ControlMsg, HelloInfo, ProtocolError, PROTOCOL_VERSION};
+use super::{
+    read_frame, write_frame, ControlMsg, HelloInfo, ProtocolError, DEFAULT_MAX_RETRIES,
+    PROTOCOL_VERSION,
+};
 use crate::destinations::resolve_destinations;
 use crate::hashing::IncrementalHasher;
-use crate::manifest::FileEntry;
+use crate::manifest::{FileEntry, MAX_CHUNK_SIZE, MAX_MANIFEST_FILES};
 use crate::progress::{Progress, TransferSummary};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
@@ -20,7 +23,10 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
     // Hello handshake.
     let hello = read_frame(reader).await?;
     let sender_chunk = match hello {
-        ControlMsg::Hello(HelloInfo { version, chunk_size }) => {
+        ControlMsg::Hello(HelloInfo {
+            version,
+            chunk_size,
+        }) => {
             if version != PROTOCOL_VERSION {
                 return Err(ProtocolError::VersionMismatch {
                     sender: version,
@@ -34,7 +40,10 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
     };
     write_frame(
         writer,
-        &ControlMsg::Hello(HelloInfo { version: PROTOCOL_VERSION, chunk_size: sender_chunk }),
+        &ControlMsg::Hello(HelloInfo {
+            version: PROTOCOL_VERSION,
+            chunk_size: sender_chunk,
+        }),
     )
     .await?;
     writer.flush().await?;
@@ -47,6 +56,31 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
         other => return Err(ProtocolError::Unexpected(format!("{other:?}"))),
     };
 
+    // Validate manifest to prevent DoS via resource exhaustion.
+    if sender_manifest.files.len() > MAX_MANIFEST_FILES {
+        return Err(ProtocolError::Unexpected(format!(
+            "manifest has {} files, maximum is {}",
+            sender_manifest.files.len(),
+            MAX_MANIFEST_FILES,
+        )));
+    }
+    if sender_manifest.chunk_size == 0 || sender_manifest.chunk_size > MAX_CHUNK_SIZE {
+        return Err(ProtocolError::Unexpected(format!(
+            "chunk_size {} is out of valid range (1..{})",
+            sender_manifest.chunk_size, MAX_CHUNK_SIZE,
+        )));
+    }
+    // Reject path-traversal attempts in rel_path. A malicious sender
+    // could use ".." components to write files outside the destination.
+    for entry in &sender_manifest.files {
+        if entry.rel_path.contains("..") {
+            return Err(ProtocolError::Unexpected(format!(
+                "rel_path contains '..' component: {}",
+                entry.rel_path,
+            )));
+        }
+    }
+
     // Notify the UI about the transfer shape (folder / files / single
     // file) before any data starts moving. This lets the UI print a
     // clear header like "Receiving folder `myrepo/` (12 files, …)".
@@ -56,18 +90,25 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
     // Resolve destinations and resume plan now that we know the manifest.
     let dests = resolve_destinations(&sender_manifest, out_dir)
         .map_err(|e| ProtocolError::Unexpected(format!("destinations: {e}")))?;
-    let plan = crate::resume::plan(&sender_manifest, &dests)
+    let mut plan = crate::resume::plan(&sender_manifest, &dests)
         .map_err(|e| ProtocolError::Unexpected(format!("resume plan: {e}")))?;
 
     // Send ManifestAck.
     let accepted = plan.accepted.clone();
     let resume_offsets = plan.offsets.clone();
-    write_frame(writer, &ControlMsg::ManifestAck { accepted, resume_offsets }).await?;
+    write_frame(
+        writer,
+        &ControlMsg::ManifestAck {
+            accepted,
+            resume_offsets,
+        },
+    )
+    .await?;
     writer.flush().await?;
 
     let mut report = ReceiverReport::default();
     for entry in &sender_manifest.files {
-        if plan.complete.contains_key(&entry.id) {
+        if plan.complete.contains(&entry.id) {
             debug!(id = entry.id, "already complete, skipping");
             report.skipped += 1;
             progress.file_done(entry.id, true);
@@ -81,7 +122,8 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
             .get(&entry.id)
             .ok_or_else(|| ProtocolError::Unexpected(format!("no dest for {}", entry.id)))?
             .clone();
-        let verified = recv_file(reader, writer, entry, &dest_path, progress).await?;
+        let hasher = plan.hashers.remove(&entry.id);
+        let verified = recv_file(reader, writer, entry, &dest_path, hasher, progress).await?;
         if verified {
             report.verified += 1;
         } else {
@@ -123,24 +165,62 @@ pub struct ReceiverReport {
     pub skipped: usize,
 }
 
+/// Maximum number of retries per file on hash mismatch before giving up.
+/// Matches the sender's `SenderConfig::max_retries` default; both are
+/// sourced from `DEFAULT_MAX_RETRIES` to stay in sync.
 async fn recv_file<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
     entry: &FileEntry,
-    dest: &PathBuf,
+    dest: &Path,
+    hasher: Option<IncrementalHasher>,
     progress: &dyn Progress,
 ) -> Result<bool, ProtocolError> {
     // Loop over sender-side retries. On `FileVerified{ok: false}` the
     // sender restarts the file from offset 0; we read another FileStart
     // and re-run the receive logic.
+    let mut attempts: u32 = 0;
+    // The pre-built hasher is consumed on the first attempt. Retries
+    // (which restart from offset 0) create a fresh hasher.
+    let mut hasher = hasher;
     loop {
-        let verified = recv_file_once(reader, writer, entry, dest, progress).await?;
+        let h = hasher.take();
+        let verified = recv_file_once(reader, writer, entry, dest, h, progress).await?;
         if verified {
             return Ok(true);
         }
+        attempts += 1;
+        if attempts >= DEFAULT_MAX_RETRIES {
+            tracing::warn!(
+                id = entry.id,
+                attempts,
+                DEFAULT_MAX_RETRIES,
+                "max recv retries exhausted for file"
+            );
+            // Notify the sender so it can stop retrying. Without this
+            // the sender blocks forever on read_frame() waiting for a
+            // FileVerified that never arrives.
+            write_frame(
+                writer,
+                &ControlMsg::FileVerified {
+                    id: entry.id,
+                    ok: false,
+                },
+            )
+            .await?;
+            writer.flush().await?;
+            return Ok(false);
+        }
         // Tell the sender and let it retry. We will read another FileStart
         // in the next iteration.
-        write_frame(writer, &ControlMsg::FileVerified { id: entry.id, ok: false }).await?;
+        write_frame(
+            writer,
+            &ControlMsg::FileVerified {
+                id: entry.id,
+                ok: false,
+            },
+        )
+        .await?;
         writer.flush().await?;
         progress.file_done(entry.id, false);
         // Loop reads next FileStart.
@@ -151,7 +231,8 @@ async fn recv_file_once<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
     entry: &FileEntry,
-    dest: &PathBuf,
+    dest: &Path,
+    prebuilt_hasher: Option<IncrementalHasher>,
     progress: &dyn Progress,
 ) -> Result<bool, ProtocolError> {
     let start_msg = read_frame(reader).await?;
@@ -164,33 +245,39 @@ async fn recv_file_once<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let mut file = open_for_resume(dest, offset, entry.size).await?;
 
-    let mut hasher = IncrementalHasher::new();
-    if offset > 0 {
-        let mut f2: File = File::open(dest).await?;
-        f2.seek(std::io::SeekFrom::Start(0)).await?;
-        let mut buf = vec![0u8; entry.chunk_size as usize];
-        let mut left = offset;
-        while left > 0 {
-            let want = (left as usize).min(buf.len());
-            let n = f2.read_exact(&mut buf[..want]).await?;
-            hasher.update(&buf[..n]);
-            left -= n as u64;
+    // Use the pre-built hasher from the resume plan when available.
+    // The plan already fed the verified prefix into this hasher during
+    // offset computation, so we can skip the O(offset) re-hash entirely.
+    // On a fresh start (offset == 0) or retry, no pre-built hasher is
+    // available, so we create a new one.
+    let mut hasher = match prebuilt_hasher {
+        Some(h) => {
+            debug!(
+                id = entry.id,
+                offset, "using pre-built hasher from resume plan"
+            );
+            h
         }
-    }
+        None => IncrementalHasher::new(),
+    };
 
     let mut current = offset;
     let mut buf = vec![0u8; entry.chunk_size as usize];
     while current < entry.size {
         let header = read_frame(reader).await?;
         match header {
-            ControlMsg::ChunkHeader { id, offset: hdr_off, len } if id == entry.id => {
+            ControlMsg::ChunkHeader {
+                id,
+                offset: hdr_off,
+                len,
+            } if id == entry.id => {
                 if hdr_off != current {
                     return Err(ProtocolError::Unexpected(format!(
                         "chunk offset mismatch: expected {current} got {hdr_off}"
                     )));
                 }
                 if len as usize > buf.len() {
-                    return Err(ProtocolError::FrameTooLarge(len));
+                    return Err(ProtocolError::FrameTooLarge(len as u64));
                 }
                 reader.read_exact(&mut buf[..len as usize]).await?;
                 hasher.update(&buf[..len as usize]);
@@ -214,7 +301,14 @@ async fn recv_file_once<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let (local_hash, _) = hasher.finalize();
     let ok = local_hash == sender_hash;
     if ok {
-        write_frame(writer, &ControlMsg::FileVerified { id: entry.id, ok: true }).await?;
+        write_frame(
+            writer,
+            &ControlMsg::FileVerified {
+                id: entry.id,
+                ok: true,
+            },
+        )
+        .await?;
         writer.flush().await?;
         progress.file_done(entry.id, true);
     }

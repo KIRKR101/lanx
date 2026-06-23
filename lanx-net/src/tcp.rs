@@ -32,46 +32,41 @@ pub async fn listen() -> Result<(TcpListener, SocketAddr), TcpError> {
 /// window elapses, the next `accept` can still return a fresh stream.
 pub struct GracefulListener {
     inner: TcpListener,
-    grace: Duration,
-    closed: bool,
+    deadline: std::time::Instant,
+    backoff: Duration,
 }
 
 impl GracefulListener {
     pub fn new(inner: TcpListener, grace: Duration) -> Self {
         Self {
             inner,
-            grace,
-            closed: false,
+            deadline: std::time::Instant::now() + grace,
+            backoff: Duration::from_millis(10),
         }
     }
 
-    /// Close the listener. Subsequent `accept` calls return `Closed`
-    /// immediately.
-    pub fn close(&mut self) {
-        self.closed = true;
-    }
-
-    /// Accept one stream. Loops on transient errors until the grace
-    /// window has elapsed since construction; then returns `Closed`.
+    /// Accept one stream. Loops on transient errors with exponential
+    /// backoff until the grace window has elapsed since construction;
+    /// then returns `Closed`.
     pub async fn accept(&mut self) -> Result<TcpStream, TcpError> {
-        use std::time::Instant;
-        let deadline = Instant::now() + self.grace;
+        let max_backoff = Duration::from_millis(500);
         loop {
-            if self.closed {
+            let now = std::time::Instant::now();
+            if now >= self.deadline {
                 return Err(TcpError::Closed);
             }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(TcpError::Closed);
-            }
-            let remaining = deadline - now;
+            let remaining = self.deadline - now;
             match tokio::time::timeout(remaining, self.inner.accept()).await {
                 Ok(Ok((s, _addr))) => {
-                    s.set_nodelay(true).ok();
+                    if let Err(e) = s.set_nodelay(true) {
+                        tracing::debug!(?e, "TCP_NODELAY failed");
+                    }
+                    self.backoff = Duration::from_millis(10);
                     return Ok(s);
                 }
                 Ok(Err(_)) | Err(_) => {
-                    sleep(Duration::from_millis(50)).await;
+                    sleep(self.backoff).await;
+                    self.backoff = (self.backoff * 2).min(max_backoff);
                 }
             }
         }

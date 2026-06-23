@@ -45,6 +45,16 @@ struct FileState {
     rate: ui::Rate,
 }
 
+/// Transfer progress UI for both sender and receiver.
+///
+/// **Thread safety note:** This struct uses separate `Mutex`es for each
+/// field (`state`, `sizes`, `rel_paths`, etc.) rather than a single
+/// combined lock. This is safe because the wire protocol is strictly
+/// sequential — one file at a time, one event at a time — so there are
+/// no concurrent mutations across fields. If the protocol ever becomes
+/// parallel (e.g. multiple files streamed concurrently), these must be
+/// consolidated into a single `Mutex<RenderState>` or replaced with
+/// lock-free atomics.
 pub struct IndicatifProgress {
     verb: &'static str,
     /// Pre-computed list of rel_paths (for label rendering and
@@ -63,8 +73,6 @@ pub struct IndicatifProgress {
     bytes_sent: Mutex<u64>,
     /// Number of files in the manifest.
     file_count: Mutex<u64>,
-    /// Number of files that have completed (ok, failed, or skipped).
-    files_done: Mutex<u64>,
     /// Number of files verified successfully.
     verified: Mutex<u64>,
     /// Number of files that failed verification.
@@ -113,7 +121,6 @@ impl IndicatifProgress {
             total_bytes: Mutex::new(0),
             bytes_sent: Mutex::new(0),
             file_count: Mutex::new(0),
-            files_done: Mutex::new(0),
             verified: Mutex::new(0),
             failed: Mutex::new(0),
             skipped: Mutex::new(0),
@@ -161,7 +168,7 @@ impl IndicatifProgress {
                 rel,
                 entry.bytes,
                 total,
-                id + 1,
+                id.saturating_add(1),
                 file_count,
                 entry.done,
                 entry.ok,
@@ -317,22 +324,27 @@ impl Progress for IndicatifProgress {
 
         if !was_started {
             // No `started` preceded this → the file was skipped because
-            // the receiver already had it. Record a state entry so the
-            // skip line renders and the counts stay consistent.
+            // the receiver already had it, or it failed before starting.
+            // Record a state entry so the line renders and counts stay
+            // consistent. Use the caller's `ok` value rather than
+            // assuming skip = success.
             let total = self.sizes.lock().unwrap().get(&id).copied().unwrap_or(0);
             self.state.lock().unwrap().insert(
                 id,
                 FileState {
                     bytes: total,
                     done: true,
-                    ok: true,
-                    skipped: true,
+                    ok,
+                    skipped: ok,
                     rate: ui::Rate::new(total),
                 },
             );
-            *self.skipped.lock().unwrap() += 1;
+            if ok {
+                *self.skipped.lock().unwrap() += 1;
+            } else {
+                *self.failed.lock().unwrap() += 1;
+            }
             self.render_file(id, true);
-            *self.files_done.lock().unwrap() += 1;
             return;
         }
 
@@ -345,7 +357,6 @@ impl Progress for IndicatifProgress {
         } else {
             *self.failed.lock().unwrap() += 1;
         }
-        *self.files_done.lock().unwrap() += 1;
         // Final render of the file's line with the status symbol.
         self.render_file(id, false);
     }

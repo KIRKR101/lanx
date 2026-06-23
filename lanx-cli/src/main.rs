@@ -35,6 +35,9 @@ enum Command {
         /// the folder structure.
         #[arg(long)]
         zip: bool,
+        /// Port to listen on (default: random ephemeral port).
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Receive files.
     Recv {
@@ -54,7 +57,9 @@ enum Command {
 
 fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .try_init();
 
@@ -65,11 +70,26 @@ fn main() -> Result<()> {
         .context("build tokio runtime")?;
     runtime.block_on(async move {
         match cli.command {
-            Command::Send { paths, chunk_size, no_discovery, zip } => {
-                cmd::send::run(paths, chunk_size, no_discovery, zip).await
-            }
-            Command::Recv { target, out, retry_forever, discovery_timeout } => {
-                cmd::recv::run(target, out, retry_forever, Duration::from_secs(discovery_timeout)).await
+            Command::Send {
+                paths,
+                chunk_size,
+                no_discovery,
+                zip,
+                port,
+            } => cmd::send::run(paths, chunk_size, no_discovery, zip, port).await,
+            Command::Recv {
+                target,
+                out,
+                retry_forever,
+                discovery_timeout,
+            } => {
+                cmd::recv::run(
+                    target,
+                    out,
+                    retry_forever,
+                    Duration::from_secs(discovery_timeout),
+                )
+                .await
             }
         }
     })

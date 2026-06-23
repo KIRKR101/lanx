@@ -23,7 +23,7 @@ async fn pair() -> (tokio::task::JoinHandle<()>, TcpStream, TcpStream) {
     (handle, server, client)
 }
 
-fn sources_from_manifest(m: &Manifest, _dir: &std::path::Path) -> HashMap<FileId, PathBuf> {
+fn sources_from_manifest(m: &Manifest) -> HashMap<FileId, PathBuf> {
     // Reconstruct source paths from `source_root` + rel_path. The
     // forward-slash wire form needs to be converted back to a
     // platform-native PathBuf via rel_to_path so a folder name with a
@@ -48,14 +48,23 @@ async fn single_file_clean_transfer() {
     std::fs::write(src.join("a.bin"), &data).unwrap();
 
     let m = build_manifest_for(&src);
-    let sources = sources_from_manifest(&m, &src);
+    let sources = sources_from_manifest(&m);
     let dst_for_recv = dst.clone();
 
     let (_h, server, client) = pair().await;
     let m_send = m.clone();
     let sources_send = sources.clone();
     let sender_task = tokio::spawn(async move {
-        run_sender(server, &m_send, &sources_send, &NoopProgress, &SenderConfig::default()).await
+        let (mut sr, mut sw) = tokio::io::split(server);
+        run_sender(
+            &mut sr,
+            &mut sw,
+            &m_send,
+            &sources_send,
+            &NoopProgress,
+            &SenderConfig::default(),
+        )
+        .await
     });
     let receiver_task = tokio::spawn(async move {
         let (mut r, mut w) = client.into_split();
@@ -78,18 +87,31 @@ async fn multi_file_transfer() {
     std::fs::create_dir(&src).unwrap();
     for i in 0..3u32 {
         let p = src.join(format!("f{i}.bin"));
-        let data: Vec<u8> = (0..(50_000 + i * 10_000)).map(|j| ((j + i) & 0xFF) as u8).collect();
+        let data: Vec<u8> = (0..(50_000 + i * 10_000))
+            .map(|j| ((j + i) & 0xFF) as u8)
+            .collect();
         std::fs::write(p, &data).unwrap();
     }
     let m = build_manifest_for(&src);
-    let sources = sources_from_manifest(&m, &src);
+    let sources = sources_from_manifest(&m);
     let dst_for_recv = dst.clone();
 
     let (_h, server, client) = pair().await;
     let m_send = m.clone();
     let sources_send = sources.clone();
     let sender_task = tokio::spawn(async move {
-        run_sender(server, &m_send, &sources_send, &NoopProgress, &SenderConfig::default()).await
+        {
+            let (mut sr, mut sw) = tokio::io::split(server);
+            run_sender(
+                &mut sr,
+                &mut sw,
+                &m_send,
+                &sources_send,
+                &NoopProgress,
+                &SenderConfig::default(),
+            )
+            .await
+        }
     });
     let receiver_task = tokio::spawn(async move {
         let (mut r, mut w) = client.into_split();
@@ -117,7 +139,7 @@ async fn resume_after_corruption() {
     std::fs::write(src.join("a.bin"), &data).unwrap();
 
     let m = build_manifest_for(&src);
-    let sources = sources_from_manifest(&m, &src);
+    let sources = sources_from_manifest(&m);
     let dest_path = resolve_destinations(&m, &dst).unwrap().paths[&0].clone();
     if let Some(p) = dest_path.parent() {
         std::fs::create_dir_all(p).unwrap();
@@ -138,7 +160,18 @@ async fn resume_after_corruption() {
     let m_send = m.clone();
     let sources_send = sources.clone();
     let sender_task = tokio::spawn(async move {
-        run_sender(server, &m_send, &sources_send, &NoopProgress, &SenderConfig::default()).await
+        {
+            let (mut sr, mut sw) = tokio::io::split(server);
+            run_sender(
+                &mut sr,
+                &mut sw,
+                &m_send,
+                &sources_send,
+                &NoopProgress,
+                &SenderConfig::default(),
+            )
+            .await
+        }
     });
     let receiver_task = tokio::spawn(async move {
         let (mut r, mut w) = client.into_split();
@@ -161,7 +194,7 @@ async fn already_complete_files_are_skipped() {
     std::fs::write(src.join("a.bin"), &data).unwrap();
 
     let m = build_manifest_for(&src);
-    let sources = sources_from_manifest(&m, &src);
+    let sources = sources_from_manifest(&m);
     let dests = resolve_destinations(&m, &dst).unwrap();
     let dest_path = dests.paths[&0].clone();
     if let Some(p) = dest_path.parent() {
@@ -170,14 +203,25 @@ async fn already_complete_files_are_skipped() {
     std::fs::write(&dest_path, &data).unwrap();
 
     let plan = resume_plan(&m, &dests).unwrap();
-    assert!(plan.complete.contains_key(&0));
+    assert!(plan.complete.contains(&0));
 
     let dst_for_recv = dst.clone();
     let (_h, server, client) = pair().await;
     let m_send = m.clone();
     let sources_send = sources.clone();
     let sender_task = tokio::spawn(async move {
-        run_sender(server, &m_send, &sources_send, &NoopProgress, &SenderConfig::default()).await
+        {
+            let (mut sr, mut sw) = tokio::io::split(server);
+            run_sender(
+                &mut sr,
+                &mut sw,
+                &m_send,
+                &sources_send,
+                &NoopProgress,
+                &SenderConfig::default(),
+            )
+            .await
+        }
     });
     let receiver_task = tokio::spawn(async move {
         let (mut r, mut w) = client.into_split();
@@ -204,7 +248,7 @@ async fn directory_send_creates_folder_on_receiver() {
     std::fs::write(src.join("sub").join("b.bin"), &data2).unwrap();
 
     let m = build_manifest_for(&src);
-    let sources = sources_from_manifest(&m, &src);
+    let sources = sources_from_manifest(&m);
     let dst_for_recv = dst.clone();
 
     // The manifest's rel_paths should be prefixed with the directory
@@ -227,7 +271,18 @@ async fn directory_send_creates_folder_on_receiver() {
     let m_send = m.clone();
     let sources_send = sources.clone();
     let sender_task = tokio::spawn(async move {
-        run_sender(server, &m_send, &sources_send, &NoopProgress, &SenderConfig::default()).await
+        {
+            let (mut sr, mut sw) = tokio::io::split(server);
+            run_sender(
+                &mut sr,
+                &mut sw,
+                &m_send,
+                &sources_send,
+                &NoopProgress,
+                &SenderConfig::default(),
+            )
+            .await
+        }
     });
     let receiver_task = tokio::spawn(async move {
         let (mut r, mut w) = client.into_split();
@@ -239,7 +294,10 @@ async fn directory_send_creates_folder_on_receiver() {
     // The receiver should have written files into a folder named `myrepo`
     // inside the destination.
     let dest_root = dst.join("myrepo");
-    assert!(dest_root.is_dir(), "expected destination folder {dest_root:?}");
+    assert!(
+        dest_root.is_dir(),
+        "expected destination folder {dest_root:?}"
+    );
     let read1 = std::fs::read(dest_root.join("a.bin")).unwrap();
     assert_eq!(read1, data1);
     let read2 = std::fs::read(dest_root.join("sub").join("b.bin")).unwrap();
@@ -309,13 +367,24 @@ async fn folder_name_with_space_creates_nested_folders() {
 
     // End-to-end: send and receive, verify the on-disk tree is the
     // expected nested folder.
-    let sources = sources_from_manifest(&m, &src);
+    let sources = sources_from_manifest(&m);
     let dst_for_recv = dst.clone();
     let (_h, server, client) = pair().await;
     let m_send = m.clone();
     let sources_send = sources.clone();
     let sender_task = tokio::spawn(async move {
-        run_sender(server, &m_send, &sources_send, &NoopProgress, &SenderConfig::default()).await
+        {
+            let (mut sr, mut sw) = tokio::io::split(server);
+            run_sender(
+                &mut sr,
+                &mut sw,
+                &m_send,
+                &sources_send,
+                &NoopProgress,
+                &SenderConfig::default(),
+            )
+            .await
+        }
     });
     let receiver_task = tokio::spawn(async move {
         let (mut r, mut w) = client.into_split();
@@ -329,9 +398,7 @@ async fn folder_name_with_space_creates_nested_folders() {
     assert!(dst.join("Piete de Hooch").is_dir());
     let read_top = std::fs::read(dst.join("Piete de Hooch").join("readme.txt")).unwrap();
     assert_eq!(read_top, top_data);
-    let read_fig = std::fs::read(
-        dst.join("Piete de Hooch").join("figures").join("fig5.jpg"),
-    )
-    .unwrap();
+    let read_fig =
+        std::fs::read(dst.join("Piete de Hooch").join("figures").join("fig5.jpg")).unwrap();
     assert_eq!(read_fig, fig_data);
 }

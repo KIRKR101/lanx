@@ -12,6 +12,6 @@ postcard = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
-lanx-core = { path = "../lanx-core" }
+lanx-core.workspace = true
 blake3 = { workspace = true }
 if-addrs = { workspace = true }

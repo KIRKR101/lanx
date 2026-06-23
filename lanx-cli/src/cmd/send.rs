@@ -1,7 +1,6 @@
 //! `lanx send`: build manifest, listen for receiver, transfer.
 
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use lanx_core::manifest::{build, rel_to_path};
 use lanx_core::transfer::sender::{run_sender, SenderConfig};
 use lanx_net::discovery::{generate_code, start_broadcasting};
@@ -11,7 +10,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tracing::warn;
 use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
@@ -24,6 +22,7 @@ pub async fn run(
     chunk_size: u32,
     no_discovery: bool,
     zip: bool,
+    port: Option<u16>,
 ) -> Result<()> {
     // Optional zip mode (explicit `--zip`). When set, the input is
     // packaged into a single `.zip` file in a temp dir and that single
@@ -32,19 +31,19 @@ pub async fn run(
     // reconstructs the folder structure (Path B in lanx-core).
     ui::banner("send", "");
     let (_zip_cleanup, effective_paths) = if zip {
-        let (zip_path, dir) = zip_inputs(&paths)?;
+        let (zip_path, tmp) = zip_inputs(&paths)?;
         eprintln!(
             "  {} --zip {} {}",
             ui::dim("pack"),
             ui::arrow(),
             zip_path.display()
         );
-        (Some(ZipCleanup(dir)), vec![zip_path])
+        (Some(ZipCleanup(tmp)), vec![zip_path])
     } else {
         (None, paths)
     };
 
-    let hash_spinner = spinner(&format!("hashing files{}", ui::ellipsis()));
+    let hash_spinner = ui::spinner(&format!("hashing files{}", ui::ellipsis()));
     let manifest = tokio::task::spawn_blocking({
         let paths = effective_paths.clone();
         move || build(&paths, chunk_size)
@@ -53,7 +52,11 @@ pub async fn run(
     .context("hash task panicked")??;
     let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
     hash_spinner.finish_and_clear();
-    let file_word = if manifest.files.len() == 1 { "file" } else { "files" };
+    let file_word = if manifest.files.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
     eprintln!(
         "  {} {} {} {} ({} total)",
         ui::green(ui::ok_sym()),
@@ -88,14 +91,23 @@ pub async fn run(
         sources.insert(f.id, src_path);
     }
 
-    let (listener, addr) = listen().await?;
+    let (listener, addr) = match port {
+        Some(p) => {
+            let listener = tokio::net::TcpListener::bind(("0.0.0.0", p))
+                .await
+                .with_context(|| format!("bind to port {p}"))?;
+            let addr = listener.local_addr()?;
+            (listener, addr)
+        }
+        None => listen().await?,
+    };
     let mut listener = GracefulListener::new(listener, Duration::from_secs(60));
     let code = generate_code(addr.port());
 
     eprintln!();
     let label_w = 7;
     ui::kv("code", &ui::bold(&code), label_w);
-    let addrs = crate::iface::list_non_loopback_v4();
+    let addrs = crate::iface::list_non_loopback_v4().await;
     let indent = " ".repeat(label_w + 1);
     if addrs.is_empty() {
         ui::kv("listen", &format!("0.0.0.0:{}", addr.port()), label_w);
@@ -125,7 +137,7 @@ pub async fn run(
     };
 
     let progress: Arc<dyn lanx_core::progress::Progress> = IndicatifProgress::new("Sending");
-    let wait_spinner = spinner(&format!("waiting for receiver{}", ui::ellipsis()));
+    let wait_spinner = ui::spinner(&format!("waiting for receiver{}", ui::ellipsis()));
     let accept_result = listener.accept().await;
     wait_spinner.finish_and_clear();
     match accept_result {
@@ -135,9 +147,11 @@ pub async fn run(
                 ui::green(ui::ok_sym()),
                 ui::dim("receiver connected"),
             );
-            let stream = stream as TcpStream;
+            let (mut reader, writer) = tokio::io::split(stream);
+            let mut writer = tokio::io::BufWriter::new(writer);
             let session = run_sender(
-                stream,
+                &mut reader,
+                &mut writer,
                 &manifest,
                 &sources,
                 progress.as_ref(),
@@ -145,7 +159,7 @@ pub async fn run(
             )
             .await;
             if let Err(e) = session {
-                warn!(?e, "session ended with error");
+                return Err(anyhow::Error::new(e).context("transfer session"));
             }
         }
         Err(e) => {
@@ -179,29 +193,28 @@ pub async fn run(
         ui::human_bytes(total_bytes),
     );
 
-    let _ = progress;
     Ok(())
 }
 
-/// A small animated spinner with the lanx house style. Caller is
-/// responsible for `finish_and_clear()` / `finish_with_message(...)`.
-fn spinner(msg: &str) -> ProgressBar {
-    let bar = ProgressBar::new_spinner();
-    bar.set_style(
-        ProgressStyle::with_template("{spinner} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    bar.set_message(msg.to_string());
-    bar.enable_steady_tick(Duration::from_millis(80));
-    bar
-}
-
 /// RAII helper that removes a temp directory on drop.
-struct ZipCleanup(PathBuf);
+struct ZipCleanup(tempfile::TempDir);
 impl Drop for ZipCleanup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(self.0.path());
     }
+}
+
+/// Copy all bytes from `reader` into `writer` in 64 KiB chunks.
+fn copy_to_zip<W: Write>(reader: &mut std::fs::File, writer: &mut W) -> Result<()> {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+    }
+    Ok(())
 }
 
 /// Package the user's input into a single zip file in a temp directory.
@@ -218,15 +231,14 @@ impl Drop for ZipCleanup {
 ///   resulting zip is named `<basename>.zip`.
 /// - Multiple inputs: error (the --zip flag only makes sense for a single
 ///   directory or file to zip).
-fn zip_inputs(inputs: &[PathBuf]) -> Result<(PathBuf, PathBuf)> {
+fn zip_inputs(inputs: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir)> {
     anyhow::ensure!(
         inputs.len() == 1,
         "--zip requires exactly one input path (got {})",
         inputs.len()
     );
     let input = &inputs[0];
-    let meta = std::fs::symlink_metadata(input)
-        .with_context(|| format!("stat {input:?}"))?;
+    let meta = std::fs::symlink_metadata(input).with_context(|| format!("stat {input:?}"))?;
 
     let base_name = match meta.is_dir() {
         true => input
@@ -243,13 +255,12 @@ fn zip_inputs(inputs: &[PathBuf]) -> Result<(PathBuf, PathBuf)> {
         .prefix("lanx-zip-")
         .tempdir()
         .context("create temp dir")?;
-    // We can't keep `tempdir` because we need a stable path to return;
-    // persist the directory and clean it up via the returned `PathBuf`.
-    let tmp_path = tmp.keep();
-    let zip_path = tmp_path.join(format!("{}.zip", Path::new(&base_name).display()));
+    let zip_path = tmp
+        .path()
+        .join(format!("{}.zip", Path::new(&base_name).display()));
 
-    let file = std::fs::File::create(&zip_path)
-        .with_context(|| format!("create zip {zip_path:?}"))?;
+    let file =
+        std::fs::File::create(&zip_path).with_context(|| format!("create zip {zip_path:?}"))?;
     let mut writer = zip::ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
@@ -259,24 +270,13 @@ fn zip_inputs(inputs: &[PathBuf]) -> Result<(PathBuf, PathBuf)> {
         add_directory_to_zip(&mut writer, input, prefix, opts)?;
     } else {
         // Single file: store it under its own basename.
-        writer.start_file(
-            Path::new(&base_name).to_string_lossy(),
-            opts,
-        )?;
-        let mut f = std::fs::File::open(input)
-            .with_context(|| format!("open {input:?}"))?;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = f.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            writer.write_all(&buf[..n])?;
-        }
+        writer.start_file(Path::new(&base_name).to_string_lossy(), opts)?;
+        let mut f = std::fs::File::open(input).with_context(|| format!("open {input:?}"))?;
+        copy_to_zip(&mut f, &mut writer)?;
     }
 
     writer.finish().context("finalize zip")?;
-    Ok((zip_path, tmp_path))
+    Ok((zip_path, tmp))
 }
 
 fn add_directory_to_zip(
@@ -310,16 +310,8 @@ fn add_directory_to_zip(
             writer
                 .start_file(archive_path.to_string_lossy(), opts)
                 .with_context(|| format!("zip start_file {archive_path:?}"))?;
-            let mut f = std::fs::File::open(&path)
-                .with_context(|| format!("open {path:?}"))?;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                writer.write_all(&buf[..n])?;
-            }
+            let mut f = std::fs::File::open(&path).with_context(|| format!("open {path:?}"))?;
+            copy_to_zip(&mut f, writer)?;
         } else {
             warn!(path = %path.display(), "skipping special file");
         }

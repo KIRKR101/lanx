@@ -15,6 +15,7 @@ use thiserror::Error;
 pub const HASH_LEN: usize = 32;
 
 /// Streaming whole-file hasher.
+#[derive(Debug, Clone)]
 pub struct IncrementalHasher {
     inner: Hasher,
     bytes: u64,

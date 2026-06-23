@@ -6,9 +6,9 @@
 
 pub mod discovery;
 pub mod interfaces;
-pub mod tcp;
 pub mod pairing;
+pub mod tcp;
 
+pub use discovery::{code_to_hash, generate_code, DiscoveryHandle};
 pub use pairing::{resolve_target, Target};
-pub use tcp::{GracefulListener, listen, pick_port};
-pub use discovery::{generate_code, code_to_hash, DiscoveryHandle};
+pub use tcp::{listen, pick_port, GracefulListener};

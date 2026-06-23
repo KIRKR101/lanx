@@ -73,7 +73,7 @@ Splitting `core` from `net` lets you unit-test protocol logic without sockets, a
 |---|---|
 | Async runtime | `tokio` |
 | Hashing | `blake3` (fast, parallel, tree-hashing friendly for resume) |
-| Serialization (control messages) | `serde` + `bincode` or `postcard` (compact, no_std-friendly) |
+| Serialization (control messages) | `serde` + `postcard` (compact, no_std-friendly) |
 | CLI parsing | `clap` (derive) |
 | Progress bars | `indicatif` |
 | Discovery (optional nicety) | `mdns-sd` or simple UDP broadcast |

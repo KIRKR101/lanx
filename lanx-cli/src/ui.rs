@@ -13,6 +13,7 @@
 use std::time::{Duration, Instant};
 
 use console::{measure_text_width, style, Term};
+use indicatif::{ProgressBar, ProgressStyle};
 
 /// lazily-cached stderr terminal.
 fn term() -> Term {
@@ -277,4 +278,17 @@ impl Rate {
             0.0
         }
     }
+}
+
+/// A small animated spinner with the lanx house style. Caller is
+/// responsible for `finish_and_clear()` / `finish_with_message(...)`.
+pub fn spinner(msg: &str) -> ProgressBar {
+    let bar = ProgressBar::new_spinner();
+    bar.set_style(
+        ProgressStyle::with_template("{spinner} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    bar.set_message(msg.to_string());
+    bar.enable_steady_tick(Duration::from_millis(80));
+    bar
 }

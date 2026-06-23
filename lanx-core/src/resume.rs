@@ -3,8 +3,9 @@
 //! and skipped).
 
 use crate::destinations::Destinations;
+use crate::hashing::IncrementalHasher;
 use crate::manifest::{FileEntry, FileId, Manifest};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -18,11 +19,14 @@ pub struct ResumePlan {
     /// Files not present here are either skipped (fully present) or absent
     /// from `accepted`.
     pub offsets: HashMap<FileId, u64>,
-    /// `complete[id] = true` means the file already exists locally with
-    /// matching content — receiver will skip without contacting the sender
-    /// for that file. The sender still walks the manifest and sends an
-    /// empty `FileStart` (or we just don't put it in `accepted`).
-    pub complete: HashMap<FileId, ()>,
+    /// File IDs where the file already exists locally with matching
+    /// content — receiver will skip without contacting the sender for
+    /// that file.
+    pub complete: HashSet<FileId>,
+    /// Pre-built incremental hasher states at each resume point. The
+    /// receiver can continue from these states without re-hashing the
+    /// verified prefix, eliminating the O(offset) double-hash on resume.
+    pub hashers: HashMap<FileId, IncrementalHasher>,
 }
 
 #[derive(Debug, Error)]
@@ -33,6 +37,8 @@ pub enum ResumeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("destination missing for manifest entry {0}")]
+    MissingDestination(FileId),
 }
 
 /// Decide what to ask the sender for. Pure: the on-disk files are read but
@@ -40,32 +46,44 @@ pub enum ResumeError {
 pub fn plan(manifest: &Manifest, dests: &Destinations) -> Result<ResumePlan, ResumeError> {
     let mut accepted = Vec::with_capacity(manifest.files.len());
     let mut offsets = HashMap::new();
-    let mut complete = HashMap::new();
+    let mut complete = HashSet::new();
+    let mut hashers = HashMap::new();
 
     for entry in &manifest.files {
         let path = dests
             .paths
             .get(&entry.id)
-            .expect("destination missing for manifest entry");
-        let (offset, done) = compute_resume_point(entry, path)?;
+            .ok_or(ResumeError::MissingDestination(entry.id))?;
+        let (offset, done, hasher) = compute_resume_point(entry, path)?;
         if done {
-            complete.insert(entry.id, ());
+            complete.insert(entry.id);
         } else {
             accepted.push(entry.id);
             offsets.insert(entry.id, offset);
+            // The hasher state is pre-built at the resume point so the
+            // receiver can continue hashing without re-reading the prefix.
+            // For offset == 0 (fresh start), the hasher is still useful —
+            // it's empty and ready for new data.
+            hashers.insert(entry.id, hasher);
         }
     }
     Ok(ResumePlan {
         accepted,
         offsets,
         complete,
+        hashers,
     })
 }
 
-fn compute_resume_point(entry: &FileEntry, dest: &Path) -> Result<(u64, bool), ResumeError> {
+fn compute_resume_point(
+    entry: &FileEntry,
+    dest: &Path,
+) -> Result<(u64, bool, IncrementalHasher), ResumeError> {
     let meta = match std::fs::symlink_metadata(dest) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, false)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, false, IncrementalHasher::new()))
+        }
         Err(e) => {
             return Err(ResumeError::Io {
                 path: dest.display().to_string(),
@@ -74,17 +92,21 @@ fn compute_resume_point(entry: &FileEntry, dest: &Path) -> Result<(u64, bool), R
         }
     };
     if !meta.is_file() {
-        return Ok((0, false));
+        return Ok((0, false, IncrementalHasher::new()));
     }
     let size = meta.len();
     if size == entry.size && entry.chunk_hashes.is_empty() {
-        return Ok((0, true));
+        return Ok((0, true, IncrementalHasher::new()));
     }
 
     // Walk chunks; for each chunk:
     //   - if it fits in remaining bytes: hash, compare, advance.
     //   - if it doesn't: this is the resume chunk — its byte offset is the resume point.
     //   - if hashes mismatch: this is the resume point.
+    //
+    // We also build an IncrementalHasher alongside the per-chunk
+    // verification so the receiver can reuse it without re-hashing
+    // the prefix.
     let cs = entry.chunk_size as u64;
     let file = File::open(dest).map_err(|e| ResumeError::Io {
         path: dest.display().to_string(),
@@ -93,6 +115,7 @@ fn compute_resume_point(entry: &FileEntry, dest: &Path) -> Result<(u64, bool), R
     let mut reader = BufReader::with_capacity(entry.chunk_size as usize, file);
     let mut buf = vec![0u8; entry.chunk_size as usize];
     let mut bytes_read: u64 = 0;
+    let mut hasher = IncrementalHasher::new();
     for expected in &entry.chunk_hashes {
         if bytes_read >= entry.size {
             // Manifest has no more chunks to verify.
@@ -109,19 +132,26 @@ fn compute_resume_point(entry: &FileEntry, dest: &Path) -> Result<(u64, bool), R
         })?;
         if n < want {
             // Partial file is shorter than this chunk — resume from the
-            // actual file EOF.
-            return Ok((bytes_read + n as u64, false));
+            // actual file EOF. Feed the truncated bytes to the hasher so
+            // the state is correct for the receiver.
+            hasher.update(&buf[..n]);
+            return Ok((bytes_read + n as u64, false, hasher));
         }
         let actual = blake3::hash(&buf[..want]);
         if actual.as_bytes() != expected {
-            return Ok((bytes_read, false));
+            // Hash mismatch — resume from this chunk's start. The hasher
+            // has already been fed all previously verified chunks.
+            return Ok((bytes_read, false, hasher));
         }
+        // Feed verified bytes into the incremental hasher so the receiver
+        // can continue from this state without re-reading the prefix.
+        hasher.update(&buf[..want]);
         bytes_read += n as u64;
     }
     if bytes_read == entry.size && size == entry.size {
-        Ok((0, true))
+        Ok((0, true, hasher))
     } else {
-        Ok((bytes_read, false))
+        Ok((bytes_read, false, hasher))
     }
 }
 
@@ -167,7 +197,7 @@ mod tests {
         let d = resolve_destinations(&m, &dst).unwrap();
         let plan = plan(&m, &d).unwrap();
         assert_eq!(plan.offsets[&0], 0);
-        assert!(!plan.complete.contains_key(&0));
+        assert!(!plan.complete.contains(&0));
     }
 
     #[test]
@@ -184,7 +214,7 @@ mod tests {
         let p = d.paths[&0].clone();
         write(&p, &data);
         let plan = plan(&m, &d).unwrap();
-        assert!(plan.complete.contains_key(&0));
+        assert!(plan.complete.contains(&0));
         assert!(!plan.offsets.contains_key(&0));
     }
 
@@ -259,6 +289,6 @@ mod tests {
         let p = d.paths[&0].clone();
         write(&p, &[]);
         let plan = plan(&m, &d).unwrap();
-        assert!(plan.complete.contains_key(&0));
+        assert!(plan.complete.contains(&0));
     }
 }

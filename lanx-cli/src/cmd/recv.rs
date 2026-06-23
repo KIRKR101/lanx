@@ -1,7 +1,6 @@
 //! `lanx recv`: connect to sender, receive files.
 
 use anyhow::{bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use lanx_core::progress::Progress;
 use lanx_core::transfer::receiver::run_receiver;
 use lanx_net::pairing::{parse_target, resolve_target, Target};
@@ -27,7 +26,7 @@ pub async fn run(
     // avoid a pointless flicker.
     let needs_discovery = matches!(parsed, Target::Code(_));
     let addr = if needs_discovery {
-        let s = spinner(&format!("looking for sender{}", ui::ellipsis()));
+        let s = ui::spinner(&format!("looking for sender{}", ui::ellipsis()));
         let r = resolve_target(parsed, discovery_timeout).await;
         s.finish_and_clear();
         r.context("resolve target")?
@@ -68,7 +67,10 @@ pub async fn run(
                 );
                 if attempt >= max_attempts {
                     eprintln!("  {} {}", ui::red(ui::fail_sym()), ui::red("giving up"));
-                    return Err(e);
+                    return Err(e.context(format!(
+                        "failed after {} attempt(s)",
+                        attempt.saturating_sub(1)
+                    )));
                 }
                 let backoff = Duration::from_secs((1u64 << attempt.min(4)).min(8));
                 let max_label = if retry_forever {
@@ -100,22 +102,13 @@ async fn try_once(
     let stream = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connect {addr}"))?;
-    stream.set_nodelay(true).ok();
-    let (mut r, mut w) = stream.into_split();
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(?e, "TCP_NODELAY failed");
+    }
+    let (mut r, w) = stream.into_split();
+    let mut w = tokio::io::BufWriter::new(w);
     let report = run_receiver(&mut r, &mut w, out, progress.as_ref())
         .await
         .context("run_receiver")?;
     Ok(report)
-}
-
-/// A small animated spinner matching the lanx house style.
-fn spinner(msg: &str) -> ProgressBar {
-    let bar = ProgressBar::new_spinner();
-    bar.set_style(
-        ProgressStyle::with_template("{spinner} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    bar.set_message(msg.to_string());
-    bar.enable_steady_tick(Duration::from_millis(80));
-    bar
 }

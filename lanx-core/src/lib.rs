@@ -10,7 +10,7 @@ pub mod transfer;
 
 pub use destinations::{resolve_destinations, Destinations};
 pub use hashing::{chunk_hashes, IncrementalHasher};
-pub use manifest::{build, build_flat, FileEntry, FileId, Manifest};
+pub use manifest::{build, FileEntry, FileId, Manifest};
 pub use progress::{NoopProgress, Progress};
 pub use resume::ResumePlan;
 pub use transfer::{ControlMsg, HelloInfo, ProtocolError, PROTOCOL_VERSION};

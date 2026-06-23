@@ -8,14 +8,14 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.40", features = ["net", "io-util", "time", "rt-multi-thread", "fs", "sync", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.0", features = ["alloc"] }
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -23,12 +23,12 @@ clap = { version = "4.5", features = ["derive"] }
 indicatif = "0.17"
 console = "0.15"
 blake3 = { version = "1.5", features = ["rayon", "std"] }
-bytes = "1.7"
 rand = "0.8"
 tempfile = "3.10"
-futures = "0.3"
 if-addrs = "0.14"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+lanx-core = { path = "lanx-core" }
+lanx-net = { path = "lanx-net" }
 
 [profile.release]
 lto = "thin"

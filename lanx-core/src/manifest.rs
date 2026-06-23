@@ -11,6 +11,13 @@ pub type FileId = u32;
 /// Default chunk size when the user doesn't override.
 pub const DEFAULT_CHUNK_SIZE: u32 = 1024 * 1024;
 
+/// Maximum allowed chunk size to prevent excessive memory allocation.
+pub const MAX_CHUNK_SIZE: u32 = 32 * 1024 * 1024; // 32 MiB
+
+/// Maximum number of files allowed in a manifest to prevent DoS via
+/// resource exhaustion on the receiver.
+pub const MAX_MANIFEST_FILES: usize = 100_000;
+
 /// Convert a wire-form `rel_path` (forward-slash separated) back into a
 /// platform-native `PathBuf` for use in filesystem operations. Splitting
 /// on `/` and pushing each component is portable: on Windows, the
@@ -21,6 +28,12 @@ pub fn rel_to_path(rel: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for component in rel.split('/') {
         if component.is_empty() {
+            continue;
+        }
+        // Reject path-traversal components. A malicious sender could
+        // craft rel_path with ".." to write files outside the
+        // destination directory.
+        if component == "." || component == ".." {
             continue;
         }
         out.push(component);
@@ -48,9 +61,10 @@ pub struct Manifest {
     pub files: Vec<FileEntry>,
     pub chunk_size: u32,
     /// Canonicalized common ancestor of the input paths. Not serialized
-    /// over the wire — used by the sender to reconstruct the original
-    /// source paths from `rel_path` entries regardless of how the user
-    /// originally spelled them.
+    /// over the wire (`#[serde(skip)]`) — this field is sender-local only
+    /// and will be an empty `PathBuf` on the receiver. Used by the sender
+    /// to reconstruct the original source paths from `rel_path` entries
+    /// regardless of how the user originally spelled them.
     #[serde(skip)]
     pub source_root: PathBuf,
 }
@@ -65,6 +79,10 @@ pub enum ManifestError {
     Hash(#[from] crate::hashing::HashError),
     #[error("no input files resolved from the given paths")]
     Empty,
+    #[error("chunk_size {0} exceeds maximum {1}")]
+    ChunkSizeTooLarge(u32, u32),
+    #[error("manifest has {0} files, maximum is {1}")]
+    TooManyFiles(usize, usize),
 }
 
 /// Build a manifest from a list of user-supplied paths (files and/or dirs).
@@ -80,12 +98,6 @@ pub fn build(inputs: &[PathBuf], chunk_size: u32) -> Result<Manifest, ManifestEr
     build_inner(inputs, chunk_size, true)
 }
 
-/// Like `build`, but never preserves the single-directory root. Useful for
-/// tests and for callers that always want flat relative paths.
-pub fn build_flat(inputs: &[PathBuf], chunk_size: u32) -> Result<Manifest, ManifestError> {
-    build_inner(inputs, chunk_size, false)
-}
-
 fn build_inner(
     inputs: &[PathBuf],
     chunk_size: u32,
@@ -93,6 +105,9 @@ fn build_inner(
 ) -> Result<Manifest, ManifestError> {
     if inputs.is_empty() {
         return Err(ManifestError::Empty);
+    }
+    if chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE {
+        return Err(ManifestError::ChunkSizeTooLarge(chunk_size, MAX_CHUNK_SIZE));
     }
 
     // Detect the "single input" case: one input, that input is a file or
@@ -142,6 +157,13 @@ fn build_inner(
 
     if sources.is_empty() {
         return Err(ManifestError::Empty);
+    }
+
+    if sources.len() > MAX_MANIFEST_FILES {
+        return Err(ManifestError::TooManyFiles(
+            sources.len(),
+            MAX_MANIFEST_FILES,
+        ));
     }
 
     let mut files = Vec::with_capacity(sources.len());
@@ -289,11 +311,20 @@ fn rel_from(common: &Path, abs: &Path) -> String {
             // Fallback: try the file name. Path::components treats
             // both `/` and `\` as separators on Windows, which is
             // exactly what we want for the fallback path.
+            tracing::warn!(
+                abs = %abs.display(),
+                common = %common.display(),
+                "strip_prefix failed after canonicalize; using file name fallback"
+            );
             abs.file_name()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| abs.to_path_buf())
         }
     } else {
+        tracing::warn!(
+            path = %abs.display(),
+            "canonicalize failed; using file name fallback"
+        );
         abs.file_name()
             .map(PathBuf::from)
             .unwrap_or_else(|| abs.to_path_buf())
