@@ -1,10 +1,7 @@
 //! Receiver side. Reads from TCP, writes to disk; recomputes the whole-file
 //! hash incrementally.
 
-use super::{
-    read_frame, write_frame, ControlMsg, HelloInfo, ProtocolError, DEFAULT_MAX_RETRIES,
-    PROTOCOL_VERSION,
-};
+use super::{read_frame, write_frame, ControlMsg, HelloInfo, ProtocolError, PROTOCOL_VERSION};
 use crate::destinations::resolve_destinations;
 use crate::hashing::IncrementalHasher;
 use crate::manifest::{FileEntry, MAX_CHUNK_SIZE, MAX_MANIFEST_FILES};
@@ -14,11 +11,19 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
+/// Run the receiver side of a transfer session.
+///
+/// # Errors
+///
+/// Returns `ProtocolError` for I/O failures, unexpected or malformed
+/// messages, version mismatch, peer-reported errors, or if the manifest
+/// fails validation.
 pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
     out_dir: &Path,
     progress: &dyn Progress,
+    max_retries: u32,
 ) -> Result<ReceiverReport, ProtocolError> {
     // Hello handshake.
     let hello = read_frame(reader).await?;
@@ -123,7 +128,16 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
             .ok_or_else(|| ProtocolError::Unexpected(format!("no dest for {}", entry.id)))?
             .clone();
         let hasher = plan.hashers.remove(&entry.id);
-        let verified = recv_file(reader, writer, entry, &dest_path, hasher, progress).await?;
+        let verified = recv_file(
+            reader,
+            writer,
+            entry,
+            &dest_path,
+            hasher,
+            progress,
+            max_retries,
+        )
+        .await?;
         if verified {
             report.verified += 1;
         } else {
@@ -150,8 +164,10 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
 
 /// Error kinds that indicate a clean peer-side close after `Done` is
 /// expected, not a real failure. Anything else is propagated.
-fn is_benign_close(kind: std::io::ErrorKind) -> bool {
-    use std::io::ErrorKind::*;
+const fn is_benign_close(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
+    };
     matches!(
         kind,
         UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe | NotConnected
@@ -165,9 +181,10 @@ pub struct ReceiverReport {
     pub skipped: usize,
 }
 
-/// Maximum number of retries per file on hash mismatch before giving up.
-/// Matches the sender's `SenderConfig::max_retries` default; both are
-/// sourced from `DEFAULT_MAX_RETRIES` to stay in sync.
+/// Maximum number of total attempts per file is `max_retries + 1`:
+/// one initial attempt plus `max_retries` re-attempts after hash
+/// mismatches. This matches the sender's `SenderConfig::max_retries`
+/// semantics so both sides stop retrying at the same time.
 async fn recv_file<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
@@ -175,10 +192,12 @@ async fn recv_file<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     dest: &Path,
     hasher: Option<IncrementalHasher>,
     progress: &dyn Progress,
+    max_retries: u32,
 ) -> Result<bool, ProtocolError> {
     // Loop over sender-side retries. On `FileVerified{ok: false}` the
     // sender restarts the file from offset 0; we read another FileStart
     // and re-run the receive logic.
+    let max_attempts = max_retries.saturating_add(1);
     let mut attempts: u32 = 0;
     // The pre-built hasher is consumed on the first attempt. Retries
     // (which restart from offset 0) create a fresh hasher.
@@ -190,29 +209,9 @@ async fn recv_file<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             return Ok(true);
         }
         attempts += 1;
-        if attempts >= DEFAULT_MAX_RETRIES {
-            tracing::warn!(
-                id = entry.id,
-                attempts,
-                DEFAULT_MAX_RETRIES,
-                "max recv retries exhausted for file"
-            );
-            // Notify the sender so it can stop retrying. Without this
-            // the sender blocks forever on read_frame() waiting for a
-            // FileVerified that never arrives.
-            write_frame(
-                writer,
-                &ControlMsg::FileVerified {
-                    id: entry.id,
-                    ok: false,
-                },
-            )
-            .await?;
-            writer.flush().await?;
-            return Ok(false);
-        }
-        // Tell the sender and let it retry. We will read another FileStart
-        // in the next iteration.
+        // Tell the sender the attempt failed. If we have exhausted the
+        // allowed attempts, return false so the receiver moves on; the
+        // sender will also give up after the same number of failures.
         write_frame(
             writer,
             &ControlMsg::FileVerified {
@@ -222,6 +221,15 @@ async fn recv_file<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         )
         .await?;
         writer.flush().await?;
+        if attempts >= max_attempts {
+            tracing::warn!(
+                id = entry.id,
+                attempts,
+                max_retries,
+                "max recv retries exhausted for file"
+            );
+            return Ok(false);
+        }
         progress.file_done(entry.id, false);
         // Loop reads next FileStart.
     }
@@ -250,19 +258,18 @@ async fn recv_file_once<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // offset computation, so we can skip the O(offset) re-hash entirely.
     // On a fresh start (offset == 0) or retry, no pre-built hasher is
     // available, so we create a new one.
-    let mut hasher = match prebuilt_hasher {
-        Some(h) => {
-            debug!(
-                id = entry.id,
-                offset, "using pre-built hasher from resume plan"
-            );
-            h
-        }
-        None => IncrementalHasher::new(),
-    };
+    let mut hasher = prebuilt_hasher.map_or_else(IncrementalHasher::new, |h| {
+        debug!(
+            id = entry.id,
+            offset, "using pre-built hasher from resume plan"
+        );
+        h
+    });
 
     let mut current = offset;
-    let mut buf = vec![0u8; entry.chunk_size as usize];
+    let chunk_size = usize::try_from(entry.chunk_size)
+        .map_err(|_| ProtocolError::Unexpected("chunk_size does not fit in usize".to_string()))?;
+    let mut buf = vec![0u8; chunk_size];
     while current < entry.size {
         let header = read_frame(reader).await?;
         match header {
@@ -276,14 +283,16 @@ async fn recv_file_once<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         "chunk offset mismatch: expected {current} got {hdr_off}"
                     )));
                 }
-                if len as usize > buf.len() {
-                    return Err(ProtocolError::FrameTooLarge(len as u64));
+                let len_usize = usize::try_from(len)
+                    .map_err(|_| ProtocolError::FrameTooLarge(u64::from(len)))?;
+                if len_usize > buf.len() {
+                    return Err(ProtocolError::FrameTooLarge(u64::from(len)));
                 }
-                reader.read_exact(&mut buf[..len as usize]).await?;
-                hasher.update(&buf[..len as usize]);
-                file.write_all(&buf[..len as usize]).await?;
-                current += len as u64;
-                progress.chunk_done(entry.id, len as u64);
+                reader.read_exact(&mut buf[..len_usize]).await?;
+                hasher.update(&buf[..len_usize]);
+                file.write_all(&buf[..len_usize]).await?;
+                current += u64::from(len);
+                progress.chunk_done(entry.id, u64::from(len));
             }
             ControlMsg::Error { message } => return Err(ProtocolError::PeerError(message)),
             other => return Err(ProtocolError::Unexpected(format!("{other:?}"))),
@@ -342,6 +351,8 @@ async fn open_for_resume(
     // We deliberately do NOT set `.truncate(true)`: on a resume with
     // offset > 0 we want to preserve existing on-disk bytes. (We seek
     // past them below.) `create(true)` only creates the file if missing.
+    // We do truncate to the manifest size so a previously longer file
+    // does not leave stale trailing bytes after the transfer.
     #[allow(clippy::suspicious_open_options)]
     let mut f = OpenOptions::new()
         .read(true)
@@ -349,6 +360,7 @@ async fn open_for_resume(
         .create(true)
         .open(dest)
         .await?;
+    f.set_len(total).await?;
     f.seek(std::io::SeekFrom::Start(offset)).await?;
     Ok(f)
 }

@@ -3,6 +3,7 @@
 use anyhow::{bail, Context, Result};
 use lanx_core::progress::Progress;
 use lanx_core::transfer::receiver::run_receiver;
+use lanx_core::transfer::DEFAULT_MAX_RETRIES;
 use lanx_net::pairing::{parse_target, resolve_target, Target};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -107,7 +108,7 @@ async fn try_once(
     }
     let (mut r, w) = stream.into_split();
     let mut w = tokio::io::BufWriter::new(w);
-    let report = run_receiver(&mut r, &mut w, out, progress.as_ref())
+    let report = run_receiver(&mut r, &mut w, out, progress.as_ref(), DEFAULT_MAX_RETRIES)
         .await
         .context("run_receiver")?;
     Ok(report)

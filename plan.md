@@ -43,22 +43,22 @@ lanx/
 ├── Cargo.toml                 (workspace)
 ├── lanx-cli/                  # binary crate, arg parsing, UX
 │   └── src/main.rs
-├── lanx-core/                 # protocol-agnostic logic
+├── lanx-core/                 # protocol + business logic
 │   ├── src/
 │   │   ├── manifest.rs        # file manifest construction/parsing
 │   │   ├── hashing.rs         # BLAKE3 chunked hashing
+│   │   ├── resume.rs          # resume planning
 │   │   ├── transfer/
-│   │   │   ├── mod.rs
+│   │   │   ├── mod.rs         # wire format, framing, message enums
 │   │   │   ├── sender.rs
-│   │   │   ├── receiver.rs
-│   │   │   └── resume.rs      # resume-state persistence
-│   │   ├── protocol.rs        # wire format, message enums
+│   │   │   └── receiver.rs
 │   │   └── progress.rs        # progress event trait
 │   └── Cargo.toml
-└── lanx-net/                  # transport layer (TCP framing, discovery)
+└── lanx-net/                  # transport layer (TCP listener, discovery)
     ├── src/
-    │   ├── framing.rs
-    │   ├── discovery.rs        # mDNS / broadcast pairing code
+    │   ├── discovery.rs        # simple UDP broadcast pairing code
+    │   ├── pairing.rs          # code / explicit address resolution
+    │   ├── interfaces.rs       # local interface enumeration
     │   └── tcp.rs
     └── Cargo.toml
 ```
@@ -76,7 +76,7 @@ Splitting `core` from `net` lets you unit-test protocol logic without sockets, a
 | Serialization (control messages) | `serde` + `postcard` (compact, no_std-friendly) |
 | CLI parsing | `clap` (derive) |
 | Progress bars | `indicatif` |
-| Discovery (optional nicety) | `mdns-sd` or simple UDP broadcast |
+| Discovery (optional nicety) | simple UDP broadcast |
 | Random pairing codes | `rand` |
 | Error handling | `thiserror` (lib), `anyhow` (bin) |
 
@@ -92,7 +92,7 @@ For LAN-friendliness without typing IPs:
 
 Fallback: receiver can just supply `ip:port` directly (`lanx recv 192.168.1.5:9000`) — no discovery needed. This should be the primary supported path; discovery is a nicety layered on top.
 
-**Keep v1 dead simple:** support explicit `ip:port` first. Add broadcast discovery in v1.1 once the core protocol works.
+**Discovery in v1:** both explicit `ip:port` and UDP broadcast discovery are supported. The pairing code is a UX hint, not a security mechanism.
 
 ---
 

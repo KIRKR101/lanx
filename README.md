@@ -7,7 +7,7 @@ integrity verification, pairwise human-readable codes for discovery.
 
 ## Installation
 
-Requires Rust 1.75 or later.
+Requires Rust 1.85 or later.
 
 ```sh
 git clone https://github.com/user/lanx.git

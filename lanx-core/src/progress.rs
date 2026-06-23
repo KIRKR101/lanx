@@ -22,11 +22,12 @@ pub trait Progress: Send + Sync {
     fn summary(&self, _verified: usize, _failed: usize, _skipped: usize) {}
 }
 
-/// High-level description of what a transfer is moving. Computed from the
-/// sender's manifest and passed to `Progress::manifest_received` on the
-/// receiver. Lets the UI distinguish "sending a folder" from "sending a
-/// pile of unrelated files" from "sending a single file" before any
-/// progress bars start.
+/// High-level description of what a transfer is moving.
+///
+/// Computed from the sender's manifest and passed to
+/// `Progress::manifest_received` on the receiver. Lets the UI distinguish
+/// "sending a folder" from "sending a pile of unrelated files" from
+/// "sending a single file" before any progress bars start.
 #[derive(Debug, Clone)]
 pub struct TransferSummary {
     /// What the transfer is, computed from the manifest's path shape.
@@ -66,11 +67,12 @@ impl TransferSummary {
     /// `rel_path` has at least two components and they all share the same
     /// first component (the folder's name). A single file with no parent
     /// component is `SingleFile`. Everything else is `Files`.
+    #[must_use]
     pub fn from_manifest(m: &crate::manifest::Manifest) -> Self {
         let file_count = m.files.len();
         let total_bytes: u64 = m.files.iter().map(|f| f.size).sum();
         if file_count == 0 {
-            return TransferSummary {
+            return Self {
                 kind: TransferKind::Files,
                 file_count: 0,
                 total_bytes: 0,
@@ -82,10 +84,10 @@ impl TransferSummary {
             let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
             let (name, kind) = match parts.as_slice() {
                 [] => (String::new(), TransferKind::SingleFile),
-                [single] => (single.to_string(), TransferKind::SingleFile),
-                [first, ..] => (first.to_string(), TransferKind::Folder),
+                [single] => ((*single).to_string(), TransferKind::SingleFile),
+                [first, ..] => ((*first).to_string(), TransferKind::Folder),
             };
-            return TransferSummary {
+            return Self {
                 kind,
                 file_count,
                 total_bytes,
@@ -109,7 +111,7 @@ impl TransferSummary {
             let first_name = first_components[0];
             let same_name = first_components.iter().all(|c| *c == first_name);
             if all_dirs && same_name && !first_name.is_empty() {
-                return TransferSummary {
+                return Self {
                     kind: TransferKind::Folder,
                     file_count,
                     total_bytes,
@@ -117,7 +119,7 @@ impl TransferSummary {
                 };
             }
         }
-        TransferSummary {
+        Self {
             kind: TransferKind::Files,
             file_count,
             total_bytes,

@@ -34,7 +34,7 @@ pub enum ControlMsg {
         accepted: Vec<crate::manifest::FileId>,
         resume_offsets: std::collections::HashMap<crate::manifest::FileId, u64>,
     },
-    /// Beginning this file at `offset` (raw bytes follow per ChunkHeader).
+    /// Beginning this file at `offset` (raw bytes follow per `ChunkHeader`).
     FileStart {
         id: crate::manifest::FileId,
         offset: u64,
@@ -89,6 +89,13 @@ pub enum ProtocolError {
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Serialize `msg` to a length-prefixed postcard frame.
+///
+/// # Errors
+///
+/// Returns `ProtocolError::FrameTooLarge` if the serialized message
+/// exceeds 32 MiB, or `ProtocolError::Io` / `ProtocolError::Postcard`
+/// for serialization or write failures.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     msg: &ControlMsg,
@@ -99,21 +106,31 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
         .try_into()
         .map_err(|_| ProtocolError::FrameTooLarge(payload.len() as u64))?;
     if len > 32 * 1024 * 1024 {
-        return Err(ProtocolError::FrameTooLarge(len as u64));
+        return Err(ProtocolError::FrameTooLarge(u64::from(len)));
     }
     w.write_all(&len.to_be_bytes()).await?;
     w.write_all(&payload).await?;
     Ok(())
 }
 
+/// Read a length-prefixed postcard frame and deserialize it.
+///
+/// # Errors
+///
+/// Returns `ProtocolError::FrameTooLarge` if the declared length exceeds
+/// 32 MiB, `ProtocolError::Closed` on unexpected EOF, or
+/// `ProtocolError::Io` / `ProtocolError::Postcard` for read or
+/// deserialization failures.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<ControlMsg, ProtocolError> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes).await?;
     let len = u32::from_be_bytes(len_bytes);
     if len > 32 * 1024 * 1024 {
-        return Err(ProtocolError::FrameTooLarge(len as u64));
+        return Err(ProtocolError::FrameTooLarge(u64::from(len)));
     }
-    let mut payload = vec![0u8; len as usize];
+    let len_usize =
+        usize::try_from(len).map_err(|_| ProtocolError::FrameTooLarge(u64::from(len)))?;
+    let mut payload = vec![0u8; len_usize];
     r.read_exact(&mut payload).await?;
     Ok(postcard::from_bytes(&payload)?)
 }
@@ -306,6 +323,6 @@ mod tests {
         drop(w);
 
         let err = read_frame(&mut r).await.unwrap_err();
-        assert!(matches!(err, ProtocolError::FrameTooLarge(33554433)));
+        assert!(matches!(err, ProtocolError::FrameTooLarge(33_554_433)));
     }
 }

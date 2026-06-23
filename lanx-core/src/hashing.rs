@@ -22,6 +22,7 @@ pub struct IncrementalHasher {
 }
 
 impl IncrementalHasher {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Hasher::new(),
@@ -34,6 +35,7 @@ impl IncrementalHasher {
         self.bytes = self.bytes.saturating_add(chunk.len() as u64);
     }
 
+    #[must_use]
     pub fn finalize(self) -> ([u8; HASH_LEN], u64) {
         let hash = self.inner.finalize();
         let mut out = [0u8; HASH_LEN];
@@ -41,7 +43,8 @@ impl IncrementalHasher {
         (out, self.bytes)
     }
 
-    pub fn bytes_seen(&self) -> u64 {
+    #[must_use]
+    pub const fn bytes_seen(&self) -> u64 {
         self.bytes
     }
 }
@@ -62,6 +65,11 @@ pub enum HashError {
 
 /// Read a file in `chunk_size` pieces and return one BLAKE3 hash per chunk.
 /// Empty files return an empty vec.
+///
+/// # Errors
+///
+/// Returns `HashError::Io` if the file cannot be opened or read, or if
+/// `chunk_size` is zero.
 pub fn chunk_hashes(path: &Path, chunk_size: u32) -> Result<Vec<[u8; HASH_LEN]>, HashError> {
     if chunk_size == 0 {
         return Err(HashError::Io(std::io::Error::new(

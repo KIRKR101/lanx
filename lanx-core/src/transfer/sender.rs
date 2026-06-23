@@ -9,7 +9,7 @@ use super::{
 use crate::hashing::IncrementalHasher;
 use crate::manifest::{FileEntry, FileId, Manifest};
 use crate::progress::{Progress, TransferSummary};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -35,6 +35,13 @@ impl Default for SenderConfig {
     }
 }
 
+/// Run the sender side of a transfer session.
+///
+/// # Errors
+///
+/// Returns `ProtocolError` for I/O failures, unexpected or malformed
+/// messages, peer-reported errors, missing source paths, invalid resume
+/// offsets, or if retry attempts are exhausted.
 pub async fn run_sender<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -75,21 +82,24 @@ where
     writer.flush().await?;
 
     let ack = read_frame(reader).await?;
-    let resume_offsets: HashMap<FileId, u64> = match ack {
+    let (accepted, resume_offsets): (HashSet<FileId>, HashMap<FileId, u64>) = match ack {
         ControlMsg::ManifestAck {
             accepted,
             resume_offsets,
         } => {
             info!(?accepted, "receiver accepted");
-            resume_offsets
+            (accepted.into_iter().collect(), resume_offsets)
         }
         ControlMsg::Error { message } => return Err(ProtocolError::PeerError(message)),
         other => return Err(ProtocolError::Unexpected(format!("{other:?}"))),
     };
 
     for entry in &manifest.files {
-        if !resume_offsets.contains_key(&entry.id) {
-            debug!(id = entry.id, "skipping (receiver already has it)");
+        if !accepted.contains(&entry.id) {
+            debug!(
+                id = entry.id,
+                "skipping (receiver rejected or already has it)"
+            );
             // Tell the UI this file is done (it was a no-op for the
             // sender; the receiver already verified it). Without this,
             // pre-allocated bars would never get finalized on the
@@ -101,7 +111,7 @@ where
             reader,
             writer,
             entry,
-            &resume_offsets,
+            resume_offsets.get(&entry.id).copied().unwrap_or(0),
             sources,
             progress,
             cfg.max_retries,
@@ -117,7 +127,7 @@ async fn send_file<R, W>(
     reader: &mut R,
     writer: &mut W,
     entry: &FileEntry,
-    resume_offsets: &HashMap<FileId, u64>,
+    resume_offset: u64,
     sources: &HashMap<FileId, PathBuf>,
     progress: &dyn Progress,
     max_retries: u32,
@@ -131,9 +141,16 @@ where
         .ok_or_else(|| ProtocolError::Unexpected(format!("no source for id {}", entry.id)))?
         .clone();
 
+    if resume_offset > entry.size {
+        return Err(ProtocolError::Unexpected(format!(
+            "resume offset {resume_offset} exceeds file size {} for id {}",
+            entry.size, entry.id
+        )));
+    }
+
     // Loop: each iteration is one attempt. The receiver controls retries
     // by sending FileVerified{ok: false}; we then re-send from offset 0.
-    let mut current_offset = *resume_offsets.get(&entry.id).unwrap_or(&0);
+    let mut current_offset = resume_offset;
     let mut attempts: u32 = 0;
     loop {
         let verdict =
@@ -194,7 +211,9 @@ where
     let mut f = File::open(path).await?;
 
     let mut hasher = IncrementalHasher::new();
-    let mut buf = vec![0u8; CHUNK_BUF.min(entry.chunk_size as usize).max(1)];
+    let chunk_size = usize::try_from(entry.chunk_size)
+        .expect("chunk_size is bounded by MAX_CHUNK_SIZE and fits in usize");
+    let mut buf = vec![0u8; CHUNK_BUF.min(chunk_size).max(1)];
 
     // Re-hash the existing prefix (bytes 0..start_offset) so the
     // incremental hasher state matches what the receiver will compute.
@@ -205,37 +224,44 @@ where
         f.seek(std::io::SeekFrom::Start(0)).await?;
         let mut left = start_offset;
         while left > 0 {
-            let want = (left as usize).min(buf.len());
+            let want = usize::try_from(left).map_or(buf.len(), |l| l.min(buf.len()));
             let n = f.read(&mut buf[..want]).await?;
             if n == 0 {
                 return Err(ProtocolError::Closed);
             }
             hasher.update(&buf[..n]);
-            left -= n as u64;
+            let n_u64 = u64::try_from(n)
+                .map_err(|_| ProtocolError::Unexpected("read length overflows u64".to_string()))?;
+            left -= n_u64;
         }
     }
     f.seek(std::io::SeekFrom::Start(start_offset)).await?;
 
     let mut current_offset = start_offset;
     while current_offset < entry.size {
-        let want = ((entry.size - current_offset) as usize).min(buf.len());
+        let remaining = entry.size - current_offset;
+        let want = usize::try_from(remaining).map_or(buf.len(), |r| r.min(buf.len()));
         let n = f.read(&mut buf[..want]).await?;
         if n == 0 {
             return Err(ProtocolError::Closed);
         }
         hasher.update(&buf[..n]);
+        let n_u64 = u64::try_from(n)
+            .map_err(|_| ProtocolError::Unexpected("read length overflows u64".to_string()))?;
+        let n_u32 = u32::try_from(n)
+            .map_err(|_| ProtocolError::Unexpected("read length exceeds u32::MAX".to_string()))?;
         write_frame(
             writer,
             &ControlMsg::ChunkHeader {
                 id: entry.id,
                 offset: current_offset,
-                len: n as u32,
+                len: n_u32,
             },
         )
         .await?;
         writer.write_all(&buf[..n]).await?;
-        current_offset += n as u64;
-        progress.chunk_done(entry.id, n as u64);
+        current_offset += n_u64;
+        progress.chunk_done(entry.id, n_u64);
     }
     let (hash, _) = hasher.finalize();
     write_frame(writer, &ControlMsg::FileEnd { id: entry.id, hash }).await?;

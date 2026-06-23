@@ -2,9 +2,10 @@
 //!
 //! Wire format: on UDP port 53317, send a small postcard-encoded packet
 //! containing `{port: u16, code_hash: [u8; 32]}`.
-//! Receivers filter by `code_hash`. The pairing code embeds the port
-//! so a hostile broadcaster can't trivially redirect, but this is *not*
-//! security — it's a UX hint. Encryption is a v2 concern (plan §1).
+//! Receivers filter by `code_hash`. The pairing code embeds the last
+//! digit of the port as a lightweight UX hint, but this is *not*
+//! security — the full port is broadcast in the clear and the code is
+//! easily brute-forced. Encryption is a v2 concern (plan §1).
 
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,7 @@ const WORDS: &[&str] = &[
 
 /// Build a code of the form `digit-word-word`. The `digit` is derived
 /// from the port; the two words come from a small wordlist.
+#[must_use]
 pub fn generate_code(port: u16) -> String {
     let mut rng = rand::thread_rng();
     let digit = (port % 10).to_string();
@@ -73,10 +75,12 @@ pub fn generate_code(port: u16) -> String {
     format!("{digit}-{w1}-{w2}")
 }
 
-/// The hash receivers compare against announcements. We do BLAKE3 of the
-/// code string, then truncate to 32 bytes (BLAKE3 default). The sender
-/// announces the hash; the receiver hashes the entered code locally
-/// and compares.
+/// The hash receivers compare against announcements.
+///
+/// We do BLAKE3 of the code string, then truncate to 32 bytes (BLAKE3
+/// default). The sender announces the hash; the receiver hashes the
+/// entered code locally and compares.
+#[must_use]
 pub fn code_to_hash(code: &str) -> [u8; 32] {
     let h = blake3::hash(code.as_bytes());
     let mut out = [0u8; 32];
@@ -84,9 +88,8 @@ pub fn code_to_hash(code: &str) -> [u8; 32] {
     out
 }
 
-/// Start broadcasting on all non-loopback IPv4 interfaces. Returns a
-/// handle whose `stop` future completes when you drop it (or call
-/// `stop()`).
+/// Handle for an active broadcast. Dropping or calling `stop()` ends the
+/// broadcast task.
 pub struct DiscoveryHandle {
     stop: tokio::sync::watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
@@ -101,6 +104,13 @@ impl DiscoveryHandle {
     }
 }
 
+/// Start broadcasting on all non-loopback IPv4 interfaces. Returns a
+/// handle whose `stop` future completes when you drop it (or call
+/// `stop()`).
+///
+/// # Errors
+///
+/// Returns an I/O error if the UDP socket cannot be bound.
 pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<DiscoveryHandle> {
     let code_hash = code_to_hash(code);
     let (tx, mut rx) = tokio::sync::watch::channel(false);
@@ -149,7 +159,7 @@ pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<Discov
                 let _ = sock.send_to(&payload, target).await;
             }
             tokio::select! {
-                _ = tokio::time::sleep(ANNOUNCE_INTERVAL) => {}
+                () = tokio::time::sleep(ANNOUNCE_INTERVAL) => {}
                 _ = rx.changed() => return,
             }
         }
@@ -172,7 +182,13 @@ pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<Discov
     }
 }
 
-/// Listen for broadcasts matching `expected_hash` for at most `timeout`.
+/// Listen for broadcasts matching `expected_hash` for at most `dur`.
+///
+/// # Errors
+///
+/// Returns `DiscoveryError::Timeout` if no matching announcement arrives
+/// within the timeout, `DiscoveryError::Postcard` if an announcement is
+/// malformed, or `DiscoveryError::Io` for socket failures.
 pub async fn discover(
     expected_hash: &[u8; 32],
     dur: Duration,
@@ -190,7 +206,7 @@ pub async fn discover(
                     return Ok::<SocketAddr, std::io::Error>(SocketAddr::V4(SocketAddrV4::new(
                         match src.ip() {
                             std::net::IpAddr::V4(v4) => v4,
-                            _ => Ipv4Addr::UNSPECIFIED,
+                            std::net::IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
                         },
                         a.port,
                     )));
@@ -213,7 +229,7 @@ async fn broadcast_addrs() -> Vec<Ipv4Addr> {
         out.push(Ipv4Addr::BROADCAST);
     } else {
         for ip in addrs {
-            if let Some(bcast) = ipv4_broadcast(&ip) {
+            if let Some(bcast) = ipv4_broadcast(ip) {
                 out.push(bcast);
             } else {
                 out.push(Ipv4Addr::BROADCAST);
@@ -233,7 +249,7 @@ async fn broadcast_addrs() -> Vec<Ipv4Addr> {
 /// Note: This is best-effort for a LAN discovery tool. For exact subnet
 /// mask information, the OS routing table or netlink would be needed,
 /// which is out of scope for a zero-configuration pairing tool.
-fn ipv4_broadcast(host: &Ipv4Addr) -> Option<Ipv4Addr> {
+fn ipv4_broadcast(host: Ipv4Addr) -> Option<Ipv4Addr> {
     if host.is_loopback() {
         return None;
     }
@@ -269,29 +285,25 @@ mod tests {
     }
     #[test]
     fn broadcast_excludes_loopback() {
-        assert!(ipv4_broadcast(&Ipv4Addr::new(127, 0, 0, 1)).is_none());
-        assert!(ipv4_broadcast(&Ipv4Addr::new(192, 168, 1, 5)).is_some());
-    }
-    #[test]
-    fn broadcast_address_per_subnet() {
-        // 10.x.x.x → 10.255.255.255 (class A)
-        let b = ipv4_broadcast(&Ipv4Addr::new(10, 0, 1, 42)).unwrap();
+        assert!(ipv4_broadcast(Ipv4Addr::new(127, 0, 0, 1)).is_none());
+        assert!(ipv4_broadcast(Ipv4Addr::new(192, 168, 1, 5)).is_some());
+        let b = ipv4_broadcast(Ipv4Addr::new(10, 0, 1, 42)).unwrap();
         assert_eq!(b, Ipv4Addr::new(10, 255, 255, 255));
         // 172.16-31.x.x → 172.31.255.255 (class B private)
-        let b = ipv4_broadcast(&Ipv4Addr::new(172, 20, 3, 9)).unwrap();
+        let b = ipv4_broadcast(Ipv4Addr::new(172, 20, 3, 9)).unwrap();
         assert_eq!(b, Ipv4Addr::new(172, 31, 255, 255));
         // 192.168.x.x → 192.168.x.255 (class C)
-        let b = ipv4_broadcast(&Ipv4Addr::new(192, 168, 5, 100)).unwrap();
+        let b = ipv4_broadcast(Ipv4Addr::new(192, 168, 5, 100)).unwrap();
         assert_eq!(b, Ipv4Addr::new(192, 168, 5, 255));
         // Public IP → limited broadcast
-        let b = ipv4_broadcast(&Ipv4Addr::new(8, 8, 8, 8)).unwrap();
+        let b = ipv4_broadcast(Ipv4Addr::new(8, 8, 8, 8)).unwrap();
         assert_eq!(b, Ipv4Addr::BROADCAST);
     }
     #[test]
     fn wordlist_unique() {
         // Ensure no duplicate words in the wordlist (duplicates waste entropy).
         let mut words: Vec<&str> = WORDS.to_vec();
-        words.sort();
+        words.sort_unstable();
         words.dedup();
         assert_eq!(words.len(), WORDS.len(), "WORDLIST contains duplicates");
     }

@@ -43,6 +43,12 @@ pub enum ResumeError {
 
 /// Decide what to ask the sender for. Pure: the on-disk files are read but
 /// not modified.
+///
+/// # Errors
+///
+/// Returns `ResumeError::MissingDestination` if a manifest entry has no
+/// destination path, or `ResumeError::Io` if an on-disk file cannot be
+/// stat'd or read.
 pub fn plan(manifest: &Manifest, dests: &Destinations) -> Result<ResumePlan, ResumeError> {
     let mut accepted = Vec::with_capacity(manifest.files.len());
     let mut offsets = HashMap::new();
@@ -95,8 +101,14 @@ fn compute_resume_point(
         return Ok((0, false, IncrementalHasher::new()));
     }
     let size = meta.len();
-    if size == entry.size && entry.chunk_hashes.is_empty() {
+    if size == 0 && entry.size == 0 {
         return Ok((0, true, IncrementalHasher::new()));
+    }
+    if entry.chunk_hashes.is_empty() {
+        // A non-empty file must have chunk hashes to verify against;
+        // otherwise a malicious manifest could mark any same-sized file
+        // as complete without checking its contents.
+        return Ok((0, false, IncrementalHasher::new()));
     }
 
     // Walk chunks; for each chunk:
@@ -107,13 +119,20 @@ fn compute_resume_point(
     // We also build an IncrementalHasher alongside the per-chunk
     // verification so the receiver can reuse it without re-hashing
     // the prefix.
-    let cs = entry.chunk_size as u64;
+    let cs = u64::from(entry.chunk_size);
     let file = File::open(dest).map_err(|e| ResumeError::Io {
         path: dest.display().to_string(),
         source: e,
     })?;
-    let mut reader = BufReader::with_capacity(entry.chunk_size as usize, file);
-    let mut buf = vec![0u8; entry.chunk_size as usize];
+    let chunk_size_usize = usize::try_from(entry.chunk_size).map_err(|_| ResumeError::Io {
+        path: dest.display().to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "chunk_size does not fit in usize",
+        ),
+    })?;
+    let mut reader = BufReader::with_capacity(chunk_size_usize, file);
+    let mut buf = vec![0u8; chunk_size_usize];
     let mut bytes_read: u64 = 0;
     let mut hasher = IncrementalHasher::new();
     for expected in &entry.chunk_hashes {
@@ -125,7 +144,14 @@ fn compute_resume_point(
         // partial file's size. If the partial is shorter than `bytes_read +
         // want`, the read below will return fewer bytes and we'll fall
         // into the "truncated" branch.
-        let want = std::cmp::min(cs, entry.size - bytes_read) as usize;
+        let want_u64 = std::cmp::min(cs, entry.size - bytes_read);
+        let want = usize::try_from(want_u64).map_err(|_| ResumeError::Io {
+            path: dest.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "remaining chunk size does not fit in usize",
+            ),
+        })?;
         let n = read_fully(&mut reader, &mut buf[..want]).map_err(|e| ResumeError::Io {
             path: dest.display().to_string(),
             source: e,
@@ -135,7 +161,14 @@ fn compute_resume_point(
             // actual file EOF. Feed the truncated bytes to the hasher so
             // the state is correct for the receiver.
             hasher.update(&buf[..n]);
-            return Ok((bytes_read + n as u64, false, hasher));
+            let n_u64 = u64::try_from(n).map_err(|_| ResumeError::Io {
+                path: dest.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bytes read do not fit in u64",
+                ),
+            })?;
+            return Ok((bytes_read + n_u64, false, hasher));
         }
         let actual = blake3::hash(&buf[..want]);
         if actual.as_bytes() != expected {
@@ -146,7 +179,14 @@ fn compute_resume_point(
         // Feed verified bytes into the incremental hasher so the receiver
         // can continue from this state without re-reading the prefix.
         hasher.update(&buf[..want]);
-        bytes_read += n as u64;
+        let n_u64 = u64::try_from(n).map_err(|_| ResumeError::Io {
+            path: dest.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bytes read do not fit in u64",
+            ),
+        })?;
+        bytes_read += n_u64;
     }
     if bytes_read == entry.size && size == entry.size {
         Ok((0, true, hasher))
@@ -290,5 +330,28 @@ mod tests {
         write(&p, &[]);
         let plan = plan(&m, &d).unwrap();
         assert!(plan.complete.contains(&0));
+    }
+
+    #[test]
+    fn empty_chunk_hashes_on_non_empty_file_is_not_complete() {
+        // A malicious or malformed manifest could claim a non-empty file
+        // with no chunk hashes. The resume plan must not treat it as
+        // complete just because the sizes match.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir(&src).unwrap();
+        let f = src.join("a.bin");
+        let data = vec![7u8; 5000];
+        File::create(&f).unwrap().write_all(&data).unwrap();
+        let mut m = build(std::slice::from_ref(&src), 1024).unwrap();
+        // Strip chunk hashes without changing size.
+        m.files[0].chunk_hashes.clear();
+        let d = resolve_destinations(&m, &dst).unwrap();
+        let p = d.paths[&0].clone();
+        write(&p, &data);
+        let plan = plan(&m, &d).unwrap();
+        assert!(!plan.complete.contains(&0));
+        assert_eq!(plan.offsets[&0], 0);
     }
 }

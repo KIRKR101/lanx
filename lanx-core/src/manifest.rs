@@ -14,16 +14,18 @@ pub const DEFAULT_CHUNK_SIZE: u32 = 1024 * 1024;
 /// Maximum allowed chunk size to prevent excessive memory allocation.
 pub const MAX_CHUNK_SIZE: u32 = 32 * 1024 * 1024; // 32 MiB
 
-/// Maximum number of files allowed in a manifest to prevent DoS via
+/// Maximum number of files allowed in a manifest to prevent `DoS` via
 /// resource exhaustion on the receiver.
 pub const MAX_MANIFEST_FILES: usize = 100_000;
 
 /// Convert a wire-form `rel_path` (forward-slash separated) back into a
-/// platform-native `PathBuf` for use in filesystem operations. Splitting
-/// on `/` and pushing each component is portable: on Windows, the
-/// resulting `PathBuf` uses `\`; on Unix, it uses `/`. Either way,
+/// platform-native `PathBuf`.
+///
+/// Splitting on `/` and pushing each component is portable: on Windows,
+/// the resulting `PathBuf` uses `\`; on Unix, it uses `/`. Either way,
 /// `Path::join` on the receiver side won't get confused by embedded
 /// separators that came from a different platform.
+#[must_use]
 pub fn rel_to_path(rel: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for component in rel.split('/') {
@@ -94,6 +96,15 @@ pub enum ManifestError {
 /// will create a folder with the directory's name rather than dumping its
 /// contents into the destination. For all other input shapes, behavior is
 /// unchanged.
+///
+/// # Errors
+///
+/// Returns `ManifestError::Empty` if no input files are resolved,
+/// `ManifestError::NotFound` if an input path does not exist,
+/// `ManifestError::ChunkSizeTooLarge` if `chunk_size` is zero or exceeds
+/// `MAX_CHUNK_SIZE`, `ManifestError::TooManyFiles` if the resolved file
+/// count exceeds `MAX_MANIFEST_FILES`, or `ManifestError::Io` for other
+/// I/O failures.
 pub fn build(inputs: &[PathBuf], chunk_size: u32) -> Result<Manifest, ManifestError> {
     build_inner(inputs, chunk_size, true)
 }
@@ -116,7 +127,21 @@ fn build_inner(
     // the result at a sensible location. Without this, a single file's
     // rel_path would be empty (because the canonicalized file path equals
     // the canonicalized common root), which breaks destination resolution.
-    let single_input_basename: Option<String> = if preserve_single_input_root && inputs.len() == 1 {
+    // Symlinks are explicitly excluded: they are skipped elsewhere, and
+    // the single-input fast path must not accidentally follow them.
+    let single_meta: Option<std::fs::Metadata> = if preserve_single_input_root && inputs.len() == 1
+    {
+        Some(std::fs::symlink_metadata(&inputs[0])?)
+    } else {
+        None
+    };
+    if let Some(ref m) = single_meta {
+        if m.file_type().is_symlink() {
+            tracing::warn!(path = %inputs[0].display(), "skipping symlink");
+            return Err(ManifestError::Empty);
+        }
+    }
+    let single_input_basename: Option<String> = if single_meta.is_some() {
         inputs[0]
             .file_name()
             .and_then(|n| n.to_str())
@@ -124,17 +149,17 @@ fn build_inner(
     } else {
         None
     };
-    let single_input_is_dir: bool = if single_input_basename.is_some() {
-        std::fs::symlink_metadata(&inputs[0])?.is_dir()
-    } else {
-        false
-    };
+    let single_input_is_dir: bool = single_meta.is_some_and(|m| m.is_dir());
 
     // Compute the common root. If we're preserving a single input's root,
     // the common root becomes the parent of that input.
     let common = if single_input_basename.is_some() {
         let only = std::fs::canonicalize(&inputs[0])?;
-        only.parent().map(|p| p.to_path_buf()).unwrap_or(only)
+        if let Some(parent) = only.parent() {
+            parent.to_path_buf()
+        } else {
+            only
+        }
     } else {
         compute_common_root(inputs)?
     };
@@ -179,6 +204,8 @@ fn build_inner(
         } else {
             chunk_hashes(&abs, chunk_size)?
         };
+        // `sources.len()` is bounded by `MAX_MANIFEST_FILES`, which fits in `FileId`.
+        #[allow(clippy::cast_possible_truncation)]
         files.push(FileEntry {
             id: id as FileId,
             rel_path: rel,
@@ -191,7 +218,11 @@ fn build_inner(
     // Re-id after sort so FileId matches sorted order, and remains stable
     // for resume (rebuilds will produce identical ordering).
     for (i, f) in files.iter_mut().enumerate() {
-        f.id = i as FileId;
+        // Same bounded-count guarantee as above.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            f.id = i as FileId;
+        }
     }
     Ok(Manifest {
         files,
@@ -259,10 +290,10 @@ fn walk_dir(
     Ok(())
 }
 
-/// Like `walk_dir`, but every rel_path is prefixed with `archive_prefix`
+/// Like `walk_dir`, but every `rel_path` is prefixed with `archive_prefix`
 /// (e.g. the input directory's basename) so the receiver reconstructs
 /// files at `<out>/<archive_prefix>/<...>`. The prefix is forward-slash
-/// form; the resulting rel_path is also forward-slash form.
+/// form; the resulting `rel_path` is also forward-slash form.
 fn walk_dir_with_prefix(
     dir: &Path,
     archive_prefix: &str,
@@ -282,9 +313,8 @@ fn walk_dir_with_prefix(
             tracing::warn!(path = %path.display(), "skipping symlink");
             continue;
         }
-        let file_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
         };
         let child_prefix = format!("{archive_prefix}/{file_name}");
         if meta.is_file() {
@@ -298,7 +328,7 @@ fn walk_dir_with_prefix(
     Ok(())
 }
 
-/// Build a forward-slash-delimited rel_path from `common` to `abs`.
+/// Build a forward-slash-delimited `rel_path` from `common` to `abs`.
 /// `common` is a canonicalized prefix; `abs` may or may not be. The
 /// result has platform-portable separators (always `/`).
 fn rel_from(common: &Path, abs: &Path) -> String {
@@ -317,8 +347,7 @@ fn rel_from(common: &Path, abs: &Path) -> String {
                 "strip_prefix failed after canonicalize; using file name fallback"
             );
             abs.file_name()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| abs.to_path_buf())
+                .map_or_else(|| abs.to_path_buf(), PathBuf::from)
         }
     } else {
         tracing::warn!(
@@ -326,8 +355,7 @@ fn rel_from(common: &Path, abs: &Path) -> String {
             "canonicalize failed; using file name fallback"
         );
         abs.file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| abs.to_path_buf())
+            .map_or_else(|| abs.to_path_buf(), PathBuf::from)
     };
     pathbuf_to_rel_string(&stripped)
 }
@@ -373,8 +401,7 @@ fn longest_common_prefix(a: &Path, b: &Path) -> PathBuf {
         // Files at different roots (e.g. /a and /b): fall back to the first
         // path's parent so rel_path still works.
         a.parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| a.to_path_buf())
+            .map_or_else(|| a.to_path_buf(), |p| p.to_path_buf())
     } else {
         out
     }
@@ -531,6 +558,23 @@ mod tests {
         let rels: Vec<_> = m.files.iter().map(|f| f.rel_path.clone()).collect();
         assert!(rels.iter().any(|p| p.ends_with("real.txt")));
         assert!(!rels.iter().any(|p| p.ends_with("link.txt")));
+    }
+
+    #[test]
+    fn single_symlink_input_is_skipped() {
+        // The single-input fast path used to call `symlink_metadata` and
+        // then `canonicalize`, which followed a symlink-to-file. Ensure
+        // a lone symlink input is treated as empty.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.txt");
+        File::create(&target).unwrap().write_all(b"hi").unwrap();
+        let link = dir.path().join("link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        let r = build(std::slice::from_ref(&link), 1024);
+        assert!(matches!(r, Err(ManifestError::Empty)));
     }
 
     #[test]

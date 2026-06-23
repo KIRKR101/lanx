@@ -22,6 +22,14 @@ pub enum DestError {
     Empty,
 }
 
+/// Resolve the destination path for each manifest file.
+///
+/// # Errors
+///
+/// Returns `DestError::Empty` if the manifest has no files,
+/// `DestError::MultiFileOutIsFile` if multiple files are being received
+/// but `out` points to an existing file, or `DestError::Io` if a parent
+/// directory cannot be created.
 pub fn resolve_destinations(manifest: &Manifest, out: &Path) -> Result<Destinations, DestError> {
     if manifest.files.is_empty() {
         return Err(DestError::Empty);
@@ -98,7 +106,7 @@ mod tests {
     fn mfiles(n: usize) -> Manifest {
         let files = (0..n)
             .map(|i| FileEntry {
-                id: i as u32,
+                id: u32::try_from(i).expect("test file count fits in u32"),
                 rel_path: format!("f{i}.bin"),
                 size: 0,
                 chunk_size: 1024,

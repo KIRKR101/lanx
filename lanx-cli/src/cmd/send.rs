@@ -38,7 +38,7 @@ pub async fn run(
             ui::arrow(),
             zip_path.display()
         );
-        (Some(ZipCleanup(tmp)), vec![zip_path])
+        (Some(tmp), vec![zip_path])
     } else {
         (None, paths)
     };
@@ -77,17 +77,9 @@ pub async fn run(
     // input spellings.
     let mut sources: HashMap<_, _> = HashMap::new();
     for f in &manifest.files {
-        let src_path = if f.rel_path.is_empty() || f.rel_path == "." {
-            // Single file: rel_path is empty by build()'s convention
-            // for the single-file case; use source_root directly
-            // (avoid `Path::join("")` which adds a trailing separator
-            // on Windows).
-            manifest.source_root.clone()
-        } else {
-            // rel_path is forward-slash form on the wire; convert to a
-            // platform-native PathBuf before joining source_root.
-            manifest.source_root.join(rel_to_path(&f.rel_path))
-        };
+        // rel_path is forward-slash form on the wire; convert to a
+        // platform-native PathBuf before joining source_root.
+        let src_path = manifest.source_root.join(rel_to_path(&f.rel_path));
         sources.insert(f.id, src_path);
     }
 
@@ -178,7 +170,7 @@ pub async fn run(
     if let Some(h) = disc {
         h.stop().await;
     }
-    drop(_zip_cleanup);
+    // `_zip_cleanup` is dropped here; `TempDir` removes the temp directory.
 
     // Sender-side completion line. The receiver prints the authoritative
     // verified/failed/skipped summary; on the sender we surface a concise
@@ -194,14 +186,6 @@ pub async fn run(
     );
 
     Ok(())
-}
-
-/// RAII helper that removes a temp directory on drop.
-struct ZipCleanup(tempfile::TempDir);
-impl Drop for ZipCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(self.0.path());
-    }
 }
 
 /// Copy all bytes from `reader` into `writer` in 64 KiB chunks.

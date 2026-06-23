@@ -20,6 +20,12 @@ pub enum TargetError {
     Discovery(String),
 }
 
+/// Parse a CLI target into either an explicit address or a pairing code.
+///
+/// # Errors
+///
+/// Returns `TargetError::InvalidAddr` if `s` is not a valid `ip:port`
+/// and does not look like a pairing code.
 pub fn parse_target(s: &str) -> Result<Target, TargetError> {
     if let Ok(addr) = s.parse::<SocketAddr>() {
         return Ok(Target::Addr(addr));
@@ -43,6 +49,12 @@ fn looks_like_code(s: &str) -> bool {
         && parts[2].chars().all(|c| c.is_ascii_alphabetic())
 }
 
+/// Resolve a `Target` into a concrete `SocketAddr`.
+///
+/// # Errors
+///
+/// Returns `TargetError::Discovery` if UDP discovery fails to find a
+/// matching sender within the timeout.
 pub async fn resolve_target(
     target: Target,
     timeout: std::time::Duration,

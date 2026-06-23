@@ -57,10 +57,10 @@ struct FileState {
 /// lock-free atomics.
 pub struct IndicatifProgress {
     verb: &'static str,
-    /// Pre-computed list of rel_paths (for label rendering and
+    /// Pre-computed list of `rel_paths` (for label rendering and
     /// collision detection).
     rel_paths: Mutex<Vec<String>>,
-    /// Per-file state, keyed by FileId.
+    /// Per-file state, keyed by `FileId`.
     state: Mutex<HashMap<FileId, FileState>>,
     /// Per-file sizes, populated in `manifest_received` so we can render
     /// skip lines and finalize the byte count even when a file never
