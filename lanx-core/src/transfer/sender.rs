@@ -1,0 +1,178 @@
+//! Sender side of a transfer session. Reads from disk, writes to the TCP
+//! stream; recomputes the whole-file hash incrementally. The receiver
+//! controls the retry loop (verdict after each file).
+
+use super::{read_frame, write_frame, ControlMsg, HelloInfo, ProtocolError, PROTOCOL_VERSION};
+use crate::hashing::IncrementalHasher;
+use crate::manifest::{FileId, FileEntry, Manifest};
+use crate::progress::{Progress, TransferSummary};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tracing::{debug, info, warn};
+
+const CHUNK_BUF: usize = 1024 * 1024;
+
+pub struct SenderConfig {
+    pub chunk_size: u32,
+}
+
+impl Default for SenderConfig {
+    fn default() -> Self {
+        Self { chunk_size: crate::manifest::DEFAULT_CHUNK_SIZE }
+    }
+}
+
+pub async fn run_sender<S>(
+    mut stream: S,
+    manifest: &Manifest,
+    sources: &HashMap<FileId, PathBuf>,
+    progress: &dyn Progress,
+    cfg: &SenderConfig,
+) -> Result<(), ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(
+        &mut stream,
+        &ControlMsg::Hello(HelloInfo { version: PROTOCOL_VERSION, chunk_size: cfg.chunk_size }),
+    )
+    .await?;
+    stream.flush().await?;
+
+    // Notify the UI about the transfer shape (folder / files / single
+    // file) before the manifest is sent. This lets the UI pre-allocate
+    // per-file bars and (if it wants) print a header. The receiver
+    // fires the same event after it reads the manifest, so both sides
+    // see consistent previews.
+    let summary = TransferSummary::from_manifest(manifest);
+    progress.manifest_received(manifest, &summary);
+
+    let first = read_frame(&mut stream).await?;
+    match first {
+        ControlMsg::Hello(_) => {}
+        ControlMsg::Error { message } => return Err(ProtocolError::PeerError(message)),
+        other => return Err(ProtocolError::Unexpected(format!("{other:?}"))),
+    }
+    write_frame(&mut stream, &ControlMsg::Manifest(manifest.clone())).await?;
+    stream.flush().await?;
+
+    let ack = read_frame(&mut stream).await?;
+    let resume_offsets: HashMap<FileId, u64> = match ack {
+        ControlMsg::ManifestAck { accepted, resume_offsets } => {
+            info!(?accepted, "receiver accepted");
+            resume_offsets
+        }
+        ControlMsg::Error { message } => return Err(ProtocolError::PeerError(message)),
+        other => return Err(ProtocolError::Unexpected(format!("{other:?}"))),
+    };
+
+    for entry in &manifest.files {
+        if !resume_offsets.contains_key(&entry.id) {
+            debug!(id = entry.id, "skipping (receiver already has it)");
+            // Tell the UI this file is done (it was a no-op for the
+            // sender; the receiver already verified it). Without this,
+            // pre-allocated bars would never get finalized on the
+            // sender side.
+            progress.file_done(entry.id, true);
+            continue;
+        }
+        send_file(&mut stream, entry, &resume_offsets, sources, progress).await?;
+    }
+    write_frame(&mut stream, &ControlMsg::Done).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn send_file<S>(
+    stream: &mut S,
+    entry: &FileEntry,
+    resume_offsets: &HashMap<FileId, u64>,
+    sources: &HashMap<FileId, PathBuf>,
+    progress: &dyn Progress,
+) -> Result<(), ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let path = sources
+        .get(&entry.id)
+        .ok_or_else(|| ProtocolError::Unexpected(format!("no source for id {}", entry.id)))?
+        .clone();
+
+    // Loop: each iteration is one attempt. The receiver controls retries
+    // by sending FileVerified{ok: false}; we then re-send from offset 0.
+    let mut current_offset = *resume_offsets.get(&entry.id).unwrap_or(&0);
+    loop {
+        let verdict = send_file_attempt(stream, entry, &path, current_offset, progress).await?;
+        match verdict {
+            Verdict::Verified => {
+                progress.file_done(entry.id, true);
+                return Ok(());
+            }
+            Verdict::Failed => {
+                warn!(id = entry.id, "receiver reported verification failure; resending");
+                current_offset = 0;
+            }
+        }
+    }
+}
+
+enum Verdict {
+    Verified,
+    Failed,
+}
+
+async fn send_file_attempt<S>(
+    stream: &mut S,
+    entry: &FileEntry,
+    path: &std::path::Path,
+    start_offset: u64,
+    progress: &dyn Progress,
+) -> Result<Verdict, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    progress.started(entry.id, &entry.rel_path, entry.size, start_offset);
+
+    write_frame(
+        stream,
+        &ControlMsg::FileStart { id: entry.id, offset: start_offset },
+    )
+    .await?;
+    stream.flush().await?;
+
+    let mut f = File::open(path).await?;
+    f.seek(std::io::SeekFrom::Start(start_offset)).await?;
+
+    let mut hasher = IncrementalHasher::new();
+    let mut buf = vec![0u8; CHUNK_BUF.min(entry.chunk_size as usize).max(1)];
+    let mut current_offset = start_offset;
+    while current_offset < entry.size {
+        let want = ((entry.size - current_offset) as usize).min(buf.len());
+        let n = f.read(&mut buf[..want]).await?;
+        if n == 0 {
+            return Err(ProtocolError::Closed);
+        }
+        hasher.update(&buf[..n]);
+        write_frame(
+            stream,
+            &ControlMsg::ChunkHeader { id: entry.id, offset: current_offset, len: n as u32 },
+        )
+        .await?;
+        stream.write_all(&buf[..n]).await?;
+        current_offset += n as u64;
+        progress.chunk_done(entry.id, n as u64);
+    }
+    let (hash, _) = hasher.finalize();
+    write_frame(stream, &ControlMsg::FileEnd { id: entry.id, hash }).await?;
+    stream.flush().await?;
+
+    let resp = read_frame(stream).await?;
+    match resp {
+        ControlMsg::FileVerified { id, ok: true } if id == entry.id => Ok(Verdict::Verified),
+        ControlMsg::FileVerified { id, ok: false } if id == entry.id => Ok(Verdict::Failed),
+        ControlMsg::Error { message } => Err(ProtocolError::PeerError(message)),
+        other => Err(ProtocolError::Unexpected(format!("{other:?}"))),
+    }
+}

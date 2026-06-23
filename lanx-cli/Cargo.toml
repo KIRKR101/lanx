@@ -1,0 +1,25 @@
+[package]
+name = "lanx-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lanx"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+clap = { workspace = true }
+indicatif = { workspace = true }
+console = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+lanx-core = { path = "../lanx-core" }
+lanx-net = { path = "../lanx-net" }
+bytes = { workspace = true }
+rand = { workspace = true }
+zip = { workspace = true }
+tempfile = { workspace = true }
