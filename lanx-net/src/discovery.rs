@@ -77,12 +77,15 @@ pub fn generate_code(port: u16) -> String {
 
 /// The hash receivers compare against announcements.
 ///
-/// We do BLAKE3 of the code string, then truncate to 32 bytes (BLAKE3
-/// default). The sender announces the hash; the receiver hashes the
-/// entered code locally and compares.
+/// BLAKE3 hashes the code string to produce a 32-byte digest. The sender
+/// announces the hash; the receiver hashes the entered code locally and
+/// compares. The code is lowercased before hashing to ensure
+/// case-insensitive pairing (e.g. "7-Cobalt-Fox" and "7-cobalt-fox"
+/// produce the same hash).
 #[must_use]
 pub fn code_to_hash(code: &str) -> [u8; 32] {
-    let h = blake3::hash(code.as_bytes());
+    let lowered = code.to_lowercase();
+    let h = blake3::hash(lowered.as_bytes());
     let mut out = [0u8; 32];
     out.copy_from_slice(h.as_bytes());
     out
@@ -125,6 +128,8 @@ pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<Discov
             }
         };
         let _ = sock.set_broadcast(true);
+        // Best-effort: SO_BROADCAST failure means broadcast discovery may
+        // not work, but we continue anyway (unicast still functions).
         let payload = match postcard::to_allocvec(&Announce { port, code_hash }) {
             Ok(p) => p,
             Err(e) => {
@@ -156,7 +161,9 @@ pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<Discov
             };
             for addr in &addrs {
                 let target = SocketAddr::V4(SocketAddrV4::new(*addr, DISCOVERY_PORT));
-                let _ = sock.send_to(&payload, target).await;
+                if let Err(e) = sock.send_to(&payload, target).await {
+                    tracing::debug!(addr = %addr, error = %e, "discovery broadcast send failed");
+                }
             }
             tokio::select! {
                 () = tokio::time::sleep(ANNOUNCE_INTERVAL) => {}
@@ -193,7 +200,18 @@ pub async fn discover(
     expected_hash: &[u8; 32],
     dur: Duration,
 ) -> Result<SocketAddr, DiscoveryError> {
-    let sock = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await?;
+    let sock = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                port = DISCOVERY_PORT,
+                error = %e,
+                "failed to bind UDP port for discovery; \
+                 another instance may be running on this port"
+            );
+            return Err(e.into());
+        }
+    };
     if let Err(e) = sock.set_broadcast(true) {
         tracing::warn!(?e, "SO_BROADCAST failed; discovery may not work");
     }
@@ -203,12 +221,26 @@ pub async fn discover(
             let (n, src) = sock.recv_from(&mut buf).await?;
             if let Ok(a) = postcard::from_bytes::<Announce>(&buf[..n]) {
                 if &a.code_hash == expected_hash {
+                    let target_ip = match src.ip() {
+                        std::net::IpAddr::V4(v4) => v4,
+                        std::net::IpAddr::V6(v6) => {
+                            // Try to extract an IPv4-mapped address (e.g.
+                            // ::ffff:192.168.1.5 → 192.168.1.5). This handles
+                            // dual-stack hosts that send from IPv6-mapped IPv4.
+                            if let Some(v4) = v6.to_ipv4_mapped() {
+                                v4
+                            } else {
+                                tracing::warn!(
+                                    src = %v6,
+                                    "discovery response from non-mapped IPv6 address; \
+                                     cannot connect via IPv4"
+                                );
+                                Ipv4Addr::UNSPECIFIED
+                            }
+                        }
+                    };
                     return Ok::<SocketAddr, std::io::Error>(SocketAddr::V4(SocketAddrV4::new(
-                        match src.ip() {
-                            std::net::IpAddr::V4(v4) => v4,
-                            std::net::IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-                        },
-                        a.port,
+                        target_ip, a.port,
                     )));
                 }
             }
@@ -236,9 +268,6 @@ async fn broadcast_addrs() -> Vec<Ipv4Addr> {
             }
         }
     }
-    if out.is_empty() {
-        out.push(Ipv4Addr::BROADCAST);
-    }
     out
 }
 
@@ -255,9 +284,11 @@ fn ipv4_broadcast(host: Ipv4Addr) -> Option<Ipv4Addr> {
     }
     let o = host.octets();
     match o[0] {
-        // 10.0.0.0/8 — class A private range. Most deployments use /8
-        // or /16; using the class-A broadcast covers both.
-        10 => Some(Ipv4Addr::new(10, 255, 255, 255)),
+        // 10.0.0.0/8 — most real-world deployments use /24 subnets
+        // (e.g. 10.0.1.0/24). Using the third octet as the subnet
+        // address covers the common case. A /8 broadcast to
+        // 10.255.255.255 would not reach hosts on a /24 subnet.
+        10 => Some(Ipv4Addr::new(10, o[1], o[2], 255)),
         // 172.16.0.0/12 — class B private range, typically /12 or /16
         172 if (16..=31).contains(&o[1]) => Some(Ipv4Addr::new(172, 31, 255, 255)),
         // 192.168.0.0/16 — class C private range, most commonly /24
@@ -274,10 +305,14 @@ mod tests {
     use super::*;
     #[test]
     fn code_format() {
-        let c = generate_code(51234);
+        let port: u16 = 51234;
+        let c = generate_code(port);
         let parts: Vec<_> = c.split('-').collect();
         assert_eq!(parts.len(), 3);
-        assert!(parts[0].parse::<u32>().is_ok());
+        // Digit must be a single ASCII digit matching port % 10.
+        let expected_digit = (port % 10).to_string();
+        assert_eq!(parts[0], expected_digit);
+        assert!(parts[0].len() == 1 && parts[0].chars().next().unwrap().is_ascii_digit());
     }
     #[test]
     fn hash_stable() {
@@ -288,7 +323,7 @@ mod tests {
         assert!(ipv4_broadcast(Ipv4Addr::new(127, 0, 0, 1)).is_none());
         assert!(ipv4_broadcast(Ipv4Addr::new(192, 168, 1, 5)).is_some());
         let b = ipv4_broadcast(Ipv4Addr::new(10, 0, 1, 42)).unwrap();
-        assert_eq!(b, Ipv4Addr::new(10, 255, 255, 255));
+        assert_eq!(b, Ipv4Addr::new(10, 0, 1, 255));
         // 172.16-31.x.x → 172.31.255.255 (class B private)
         let b = ipv4_broadcast(Ipv4Addr::new(172, 20, 3, 9)).unwrap();
         assert_eq!(b, Ipv4Addr::new(172, 31, 255, 255));

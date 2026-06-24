@@ -3,13 +3,16 @@
 use anyhow::{Context, Result};
 use lanx_core::manifest::{build, rel_to_path};
 use lanx_core::transfer::sender::{run_sender, SenderConfig};
-use lanx_net::discovery::{generate_code, start_broadcasting};
+use lanx_core::transfer::DEFAULT_MAX_RETRIES;
+use lanx_net::discovery::{code_to_hash, generate_code, start_broadcasting};
+use lanx_net::relay::{send_relay_hello, RelayHello, RelayRole};
 use lanx_net::tcp::{listen, GracefulListener};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tracing::warn;
 use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
@@ -17,12 +20,63 @@ use zip::CompressionMethod;
 use crate::progress::IndicatifProgress;
 use crate::ui;
 
+fn spawn_stream(
+    set: &mut tokio::task::JoinSet<Result<(), lanx_core::transfer::ProtocolError>>,
+    stream: TcpStream,
+    manifest: lanx_core::manifest::Manifest,
+    sources: HashMap<lanx_core::manifest::FileId, PathBuf>,
+    progress: Arc<dyn lanx_core::progress::Progress>,
+    cfg: SenderConfig,
+) {
+    set.spawn(async move {
+        let enc = match tokio::time::timeout(
+            Duration::from_secs(10),
+            lanx_core::crypto::wrap_responder(stream),
+        )
+        .await
+        {
+            Ok(Ok(enc)) => enc,
+            Ok(Err(e)) => {
+                return Err(lanx_core::transfer::ProtocolError::Unexpected(format!(
+                    "noise handshake: {e}"
+                )));
+            }
+            Err(_) => {
+                return Err(lanx_core::transfer::ProtocolError::Unexpected(
+                    "noise handshake timed out".into(),
+                ));
+            }
+        };
+        let (mut reader, writer) = tokio::io::split(enc);
+        let mut writer = tokio::io::BufWriter::new(writer);
+        run_sender(
+            &mut reader,
+            &mut writer,
+            &manifest,
+            &sources,
+            progress.as_ref(),
+            &cfg,
+        )
+        .await
+    });
+}
+
+/// Run the `lanx send` subcommand. Builds a manifest from the given
+/// paths, listens for a receiver (with optional UDP discovery), and
+/// streams the files.
+///
+/// # Errors
+///
+/// Returns an error if manifest building fails, no receiver connects
+/// within the grace period, or the transfer encounters a protocol error.
 pub async fn run(
     paths: Vec<PathBuf>,
     chunk_size: u32,
     no_discovery: bool,
     zip: bool,
     port: Option<u16>,
+    parallel: u16,
+    relay: Option<String>,
 ) -> Result<()> {
     // Optional zip mode (explicit `--zip`). When set, the input is
     // packaged into a single `.zip` file in a temp dir and that single
@@ -31,7 +85,10 @@ pub async fn run(
     // reconstructs the folder structure (Path B in lanx-core).
     ui::banner("send", "");
     let (_zip_cleanup, effective_paths) = if zip {
-        let (zip_path, tmp) = zip_inputs(&paths)?;
+        let paths = paths.clone();
+        let (zip_path, tmp) = tokio::task::spawn_blocking(move || zip_inputs(&paths))
+            .await
+            .context("zip task panicked")??;
         eprintln!(
             "  {} --zip {} {}",
             ui::dim("pack"),
@@ -66,23 +123,19 @@ pub async fn run(
         ui::human_bytes(total_bytes),
     );
 
-    // (The "Sending folder X" header is printed once the receiver
-    // connects, by the progress UI's `manifest_received` handler.
-    // That way the sender and receiver both see the same header
-    // line at the same moment in the transfer.)
-
     // Reconstruct source paths from the manifest's canonicalized
     // `source_root`. This avoids the brittleness of computing
     // longest_common_prefix from the user's original (possibly non-canonical)
     // input spellings.
     let mut sources: HashMap<_, _> = HashMap::new();
     for f in &manifest.files {
-        // rel_path is forward-slash form on the wire; convert to a
-        // platform-native PathBuf before joining source_root.
         let src_path = manifest.source_root.join(rel_to_path(&f.rel_path));
         sources.insert(f.id, src_path);
     }
 
+    // Generate a pairing code from an ephemeral port. When using a relay,
+    // we still generate a code for display, but the actual connection goes
+    // through the relay.
     let (listener, addr) = match port {
         Some(p) => {
             let listener = tokio::net::TcpListener::bind(("0.0.0.0", p))
@@ -93,77 +146,201 @@ pub async fn run(
         }
         None => listen().await?,
     };
-    let mut listener = GracefulListener::new(listener, Duration::from_secs(60));
     let code = generate_code(addr.port());
+    let code_hash = code_to_hash(&code);
 
     eprintln!();
     let label_w = 7;
     ui::kv("code", &ui::bold(&code), label_w);
-    let addrs = crate::iface::list_non_loopback_v4().await;
-    let indent = " ".repeat(label_w + 1);
-    if addrs.is_empty() {
-        ui::kv("listen", &format!("0.0.0.0:{}", addr.port()), label_w);
-    } else {
-        ui::kv("listen", &format!("{}:{}", addrs[0], addr.port()), label_w);
-        for ip in &addrs[1..] {
-            eprintln!("{indent}{ip}:{}", addr.port());
-        }
-    }
-    eprintln!(
-        "{indent}127.0.0.1:{} {}",
-        addr.port(),
-        ui::dim("(loopback)"),
-    );
-    eprintln!();
 
-    let disc = if no_discovery {
-        None
-    } else {
-        match start_broadcasting(addr.port(), &code).await {
-            Ok(h) => Some(h),
-            Err(e) => {
-                warn!(?e, "discovery failed; continuing without broadcast");
-                None
-            }
-        }
+    let parallel = parallel.max(1);
+    crate::cmd::validate_parallel_relay(parallel, &relay)?;
+    let progress: Arc<dyn lanx_core::progress::Progress> = IndicatifProgress::new("Sending");
+
+    let mut disc = None;
+    let mut set = tokio::task::JoinSet::new();
+    let mut actual_parallel = 1;
+    let mut first_task_result = None;
+
+    let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cfg = SenderConfig {
+        chunk_size,
+        max_retries: DEFAULT_MAX_RETRIES,
+        max_parallel: parallel,
+        agreed_parallel_tx: Some(agreed_tx),
     };
 
-    let progress: Arc<dyn lanx_core::progress::Progress> = IndicatifProgress::new("Sending");
-    let wait_spinner = ui::spinner(&format!("waiting for receiver{}", ui::ellipsis()));
-    let accept_result = listener.accept().await;
-    wait_spinner.finish_and_clear();
-    match accept_result {
-        Ok(stream) => {
-            eprintln!(
-                "  {} {}",
-                ui::green(ui::ok_sym()),
-                ui::dim("receiver connected"),
-            );
-            let (mut reader, writer) = tokio::io::split(stream);
-            let mut writer = tokio::io::BufWriter::new(writer);
-            let session = run_sender(
-                &mut reader,
-                &mut writer,
-                &manifest,
-                &sources,
-                progress.as_ref(),
-                &SenderConfig::default(),
-            )
-            .await;
-            if let Err(e) = session {
-                return Err(anyhow::Error::new(e).context("transfer session"));
+    if let Some(ref relay_addr) = relay {
+        // Relay mode: connect to the relay server and register as a sender.
+        eprintln!(
+            "  {} {} {}",
+            ui::dim("relay"),
+            ui::arrow(),
+            ui::bold(relay_addr)
+        );
+        eprintln!();
+
+        let mut stream = TcpStream::connect(relay_addr)
+            .await
+            .with_context(|| format!("connect to relay {relay_addr}"))?;
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!(?e, "TCP_NODELAY failed");
+        }
+
+        // Send hello to register with the relay.
+        let hello = RelayHello {
+            role: RelayRole::Sender,
+            code_hash,
+        };
+        send_relay_hello(&mut stream, &hello).await?;
+
+        eprintln!(
+            "  {} {}",
+            ui::green(ui::ok_sym()),
+            ui::dim("registered with relay (waiting for receiver)")
+        );
+        eprintln!();
+
+        spawn_stream(
+            &mut set,
+            stream,
+            manifest.clone(),
+            sources.clone(),
+            progress.clone(),
+            cfg.clone(),
+        );
+    } else {
+        // Direct mode: listen for incoming connections.
+        let mut listener = GracefulListener::new(listener, Duration::from_secs(60));
+        let addrs = crate::iface::list_non_loopback_v4().await;
+        let indent = " ".repeat(label_w + 1);
+        if addrs.is_empty() {
+            ui::kv("listen", &format!("0.0.0.0:{}", addr.port()), label_w);
+        } else {
+            ui::kv("listen", &format!("{}:{}", addrs[0], addr.port()), label_w);
+            for ip in &addrs[1..] {
+                eprintln!("{indent}{ip}:{}", addr.port());
             }
         }
-        Err(e) => {
-            eprintln!(
-                "  {} {}",
-                ui::red(ui::fail_sym()),
-                ui::dim("no receiver connected"),
-            );
-            if let Some(h) = disc {
-                h.stop().await;
+        eprintln!(
+            "{indent}127.0.0.1:{} {}",
+            addr.port(),
+            ui::dim("(loopback)"),
+        );
+        eprintln!();
+
+        if !no_discovery {
+            match start_broadcasting(addr.port(), &code).await {
+                Ok(h) => disc = Some(h),
+                Err(e) => {
+                    warn!(?e, "discovery failed; continuing without broadcast");
+                }
             }
-            return Err(anyhow::Error::new(e).context("accept receiver"));
+        }
+
+        let wait_spinner = ui::spinner(&format!("waiting for receiver{}", ui::ellipsis()));
+        let stream0 = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                wait_spinner.finish_and_clear();
+                eprintln!(
+                    "  {} {}",
+                    ui::red(ui::fail_sym()),
+                    ui::dim("no receiver connected"),
+                );
+                if let Some(h) = disc {
+                    h.stop().await;
+                }
+                return Err(anyhow::Error::new(e).context("accept receiver"));
+            }
+        };
+        wait_spinner.finish_and_clear();
+
+        spawn_stream(
+            &mut set,
+            stream0,
+            manifest.clone(),
+            sources.clone(),
+            progress.clone(),
+            cfg.clone(),
+        );
+
+        // Wait to negotiate parallelism on connection 0. If it fails or exits early,
+        // we fallback to agreed_parallel = 1.
+        let agreed_parallel = tokio::select! {
+            Some(p) = agreed_rx.recv() => p,
+            res = set.join_next() => {
+                if let Some(r) = res {
+                    first_task_result = Some(r);
+                }
+                1
+            }
+        };
+        actual_parallel = agreed_parallel;
+
+        if agreed_parallel > 1 {
+            let extra_wait_spinner = ui::spinner(&format!(
+                "waiting for {} additional connection{} for parallel transfer{}",
+                agreed_parallel - 1,
+                if agreed_parallel == 2 { "" } else { "s" },
+                ui::ellipsis()
+            ));
+            for _ in 1..agreed_parallel {
+                match listener.accept().await {
+                    Ok(stream) => {
+                        spawn_stream(
+                            &mut set,
+                            stream,
+                            manifest.clone(),
+                            sources.clone(),
+                            progress.clone(),
+                            cfg.clone(),
+                        );
+                    }
+                    Err(e) => {
+                        extra_wait_spinner.finish_and_clear();
+                        tracing::warn!(error = %e, "failed to accept additional parallel connection");
+                        break;
+                    }
+                }
+            }
+            extra_wait_spinner.finish_and_clear();
+        }
+    }
+
+    eprintln!(
+        "  {} {} {}",
+        ui::green(ui::ok_sym()),
+        ui::dim("receiver connected"),
+        ui::dim(&format!(
+            "({} stream{})",
+            actual_parallel,
+            if actual_parallel == 1 { "" } else { "s" }
+        )),
+    );
+
+    // If connection 0 finished/failed during the select! above, check its result first.
+    if let Some(res) = first_task_result {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(anyhow::Error::new(e).context("transfer session"));
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context("transfer task"));
+            }
+        }
+    }
+
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(anyhow::Error::new(e).context("transfer session"));
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context("transfer task"));
+            }
         }
     }
 
@@ -224,16 +401,10 @@ fn zip_inputs(inputs: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir)> {
     let input = &inputs[0];
     let meta = std::fs::symlink_metadata(input).with_context(|| format!("stat {input:?}"))?;
 
-    let base_name = match meta.is_dir() {
-        true => input
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("input directory has no name: {input:?}"))?
-            .to_os_string(),
-        false => input
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("input file has no name: {input:?}"))?
-            .to_os_string(),
-    };
+    let base_name = input
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("input has no name: {input:?}"))?
+        .to_os_string();
 
     let tmp = tempfile::Builder::new()
         .prefix("lanx-zip-")

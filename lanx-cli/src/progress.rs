@@ -28,6 +28,33 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+/// All mutable progress state is held under a single mutex so the UI is
+/// safe when multiple TCP connections report events concurrently.
+struct RenderState {
+    /// Pre-computed list of `rel_paths` (for label rendering and
+    /// collision detection).
+    rel_paths: Vec<String>,
+    /// Per-file state, keyed by `FileId`.
+    state: HashMap<FileId, FileState>,
+    /// Per-file sizes, populated in `manifest_received` so we can render
+    /// skip lines and finalize the byte count even when a file never
+    /// fires `started`.
+    sizes: HashMap<FileId, u64>,
+    /// Total bytes expected across all files.
+    total_bytes: u64,
+    /// Running total of bytes confirmed at the file level (sum of
+    /// fully-completed file sizes).
+    bytes_sent: u64,
+    /// Number of files in the manifest.
+    file_count: u64,
+    /// Number of files verified successfully.
+    verified: u64,
+    /// Number of files that failed verification.
+    failed: u64,
+    /// Number of files skipped (already present).
+    skipped: u64,
+}
+
 /// Per-file state used to render a single line per file.
 #[derive(Clone)]
 struct FileState {
@@ -46,39 +73,9 @@ struct FileState {
 }
 
 /// Transfer progress UI for both sender and receiver.
-///
-/// **Thread safety note:** This struct uses separate `Mutex`es for each
-/// field (`state`, `sizes`, `rel_paths`, etc.) rather than a single
-/// combined lock. This is safe because the wire protocol is strictly
-/// sequential — one file at a time, one event at a time — so there are
-/// no concurrent mutations across fields. If the protocol ever becomes
-/// parallel (e.g. multiple files streamed concurrently), these must be
-/// consolidated into a single `Mutex<RenderState>` or replaced with
-/// lock-free atomics.
 pub struct IndicatifProgress {
     verb: &'static str,
-    /// Pre-computed list of `rel_paths` (for label rendering and
-    /// collision detection).
-    rel_paths: Mutex<Vec<String>>,
-    /// Per-file state, keyed by `FileId`.
-    state: Mutex<HashMap<FileId, FileState>>,
-    /// Per-file sizes, populated in `manifest_received` so we can render
-    /// skip lines and finalize the byte count even when a file never
-    /// fires `started`.
-    sizes: Mutex<HashMap<FileId, u64>>,
-    /// Total bytes expected across all files.
-    total_bytes: Mutex<u64>,
-    /// Running total of bytes confirmed at the file level (sum of
-    /// fully-completed file sizes).
-    bytes_sent: Mutex<u64>,
-    /// Number of files in the manifest.
-    file_count: Mutex<u64>,
-    /// Number of files verified successfully.
-    verified: Mutex<u64>,
-    /// Number of files that failed verification.
-    failed: Mutex<u64>,
-    /// Number of files skipped (already present).
-    skipped: Mutex<u64>,
+    state: Mutex<RenderState>,
 }
 
 /// Build the one-line transfer header used by both sides. The sender
@@ -115,15 +112,17 @@ impl IndicatifProgress {
     pub fn new(verb: &'static str) -> Arc<Self> {
         Arc::new(Self {
             verb,
-            rel_paths: Mutex::new(Vec::new()),
-            state: Mutex::new(HashMap::new()),
-            sizes: Mutex::new(HashMap::new()),
-            total_bytes: Mutex::new(0),
-            bytes_sent: Mutex::new(0),
-            file_count: Mutex::new(0),
-            verified: Mutex::new(0),
-            failed: Mutex::new(0),
-            skipped: Mutex::new(0),
+            state: Mutex::new(RenderState {
+                rel_paths: Vec::new(),
+                state: HashMap::new(),
+                sizes: HashMap::new(),
+                total_bytes: 0,
+                bytes_sent: 0,
+                file_count: 0,
+                verified: 0,
+                failed: 0,
+                skipped: 0,
+            }),
         })
     }
 
@@ -153,17 +152,19 @@ impl IndicatifProgress {
     /// is overwritten with a carriage return. The file's manifest index
     /// is used as the `[N/M]` counter.
     fn render_file(&self, id: FileId, fresh_line: bool) {
-        let (label, bytes, total, file_idx, file_count, done, ok, skipped, rate_bps) = {
-            let state = self.state.lock().unwrap();
-            let sizes = self.sizes.lock().unwrap();
-            let rels = self.rel_paths.lock().unwrap();
-            let entry = match state.get(&id) {
-                Some(s) => s,
+        let (label, bytes, total, file_idx, file_count, done, ok, skipped, rate_bps, rel_paths) = {
+            let st = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = match st.state.get(&id) {
+                Some(s) => s.clone(),
                 None => return,
             };
-            let total = sizes.get(&id).copied().unwrap_or(0);
-            let rel = rels.get(id as usize).cloned().unwrap_or_default();
-            let file_count = *self.file_count.lock().unwrap();
+            let total = st.sizes.get(&id).copied().unwrap_or(0);
+            let rel = st.rel_paths.get(id as usize).cloned().unwrap_or_default();
+            let file_count = st.file_count;
+            let rel_paths = st.rel_paths.clone();
             (
                 rel,
                 entry.bytes,
@@ -174,6 +175,7 @@ impl IndicatifProgress {
                 entry.ok,
                 entry.skipped,
                 entry.rate.bps(),
+                rel_paths,
             )
         };
 
@@ -184,7 +186,7 @@ impl IndicatifProgress {
         // Fixed cost outside the label: prefix + " X.XX MiB / Y.YY MiB  NN%" + spacing.
         let fixed = prefix.chars().count() + 23 + 6;
         let label_max = width.saturating_sub(fixed).clamp(16, 40);
-        let label = Self::label_for(&self.rel_paths.lock().unwrap(), &label, label_max);
+        let label = Self::label_for(&rel_paths, &label, label_max);
 
         let pct = ui::percent(bytes, total);
 
@@ -252,26 +254,33 @@ impl IndicatifProgress {
 
 impl Progress for IndicatifProgress {
     fn manifest_received(&self, manifest: &Manifest, summary: &TransferSummary) {
-        *self.rel_paths.lock().unwrap() =
-            manifest.files.iter().map(|f| f.rel_path.clone()).collect();
-        *self.total_bytes.lock().unwrap() = summary.total_bytes;
-        *self.file_count.lock().unwrap() = manifest.files.len() as u64;
-        // Pre-populate sizes so skip lines and final byte totals are
-        // available even for files that never fire `started`.
-        {
-            let mut sizes = self.sizes.lock().unwrap();
-            for f in &manifest.files {
-                sizes.insert(f.id, f.size);
-            }
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // With parallel connections, multiple `run_sender` instances
+        // call this with the same manifest. Only print the header once
+        // to avoid duplicate output.
+        if !st.rel_paths.is_empty() {
+            return;
         }
-
+        st.rel_paths = manifest.files.iter().map(|f| f.rel_path.clone()).collect();
+        st.total_bytes = summary.total_bytes;
+        st.file_count = manifest.files.len() as u64;
+        for f in &manifest.files {
+            st.sizes.insert(f.id, f.size);
+        }
         // Single-line header.
         eprintln!("{}", transfer_header(self.verb, manifest));
     }
 
     fn started(&self, id: FileId, _rel: &str, total: u64, offset: u64) {
-        self.sizes.lock().unwrap().insert(id, total);
-        self.state.lock().unwrap().insert(
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        st.sizes.insert(id, total);
+        st.state.insert(
             id,
             FileState {
                 bytes: offset,
@@ -281,18 +290,20 @@ impl Progress for IndicatifProgress {
                 rate: ui::Rate::new(offset),
             },
         );
-        // Fresh line for each new file. We rely on the protocol being
-        // sequential (one file at a time) so this only fires for the
-        // *next* file, not a retry of an existing one. If it does fire
-        // for a retry, the `\r ... done` will overwrite the previous
-        // line — fine.
+        // Fresh line for each new file. When multiple connections are
+        // active, files may start out of order; `fresh_line=true` prints
+        // each new file on its own line.
+        drop(st);
         self.render_file(id, true);
     }
 
     fn chunk_done(&self, id: FileId, bytes: u64) {
         {
-            let mut state = self.state.lock().unwrap();
-            if let Some(s) = state.get_mut(&id) {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(s) = st.state.get_mut(&id) {
                 s.bytes = s.bytes.saturating_add(bytes);
                 s.rate.observe(s.bytes);
             }
@@ -302,24 +313,20 @@ impl Progress for IndicatifProgress {
     }
 
     fn file_done(&self, id: FileId, ok: bool) {
-        let was_started = {
-            let mut state = self.state.lock().unwrap();
-            if let Some(s) = state.get_mut(&id) {
-                s.done = true;
-                s.ok = ok;
-                if ok {
-                    s.bytes = self
-                        .sizes
-                        .lock()
-                        .unwrap()
-                        .get(&id)
-                        .copied()
-                        .unwrap_or(s.bytes);
-                }
-                true
-            } else {
-                false
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let size_opt = st.sizes.get(&id).copied();
+        let was_started = if let Some(s) = st.state.get_mut(&id) {
+            s.done = true;
+            s.ok = ok;
+            if ok {
+                s.bytes = size_opt.unwrap_or(s.bytes);
             }
+            true
+        } else {
+            false
         };
 
         if !was_started {
@@ -328,8 +335,8 @@ impl Progress for IndicatifProgress {
             // Record a state entry so the line renders and counts stay
             // consistent. Use the caller's `ok` value rather than
             // assuming skip = success.
-            let total = self.sizes.lock().unwrap().get(&id).copied().unwrap_or(0);
-            self.state.lock().unwrap().insert(
+            let total = st.sizes.get(&id).copied().unwrap_or(0);
+            st.state.insert(
                 id,
                 FileState {
                     bytes: total,
@@ -340,23 +347,24 @@ impl Progress for IndicatifProgress {
                 },
             );
             if ok {
-                *self.skipped.lock().unwrap() += 1;
+                st.skipped += 1;
             } else {
-                *self.failed.lock().unwrap() += 1;
+                st.failed += 1;
             }
+            drop(st);
             self.render_file(id, true);
             return;
         }
 
         if ok {
-            if let Some(size) = self.sizes.lock().unwrap().get(&id).copied() {
-                let mut sent = self.bytes_sent.lock().unwrap();
-                *sent = sent.saturating_add(size);
+            if let Some(size) = st.sizes.get(&id).copied() {
+                st.bytes_sent = st.bytes_sent.saturating_add(size);
             }
-            *self.verified.lock().unwrap() += 1;
+            st.verified += 1;
         } else {
-            *self.failed.lock().unwrap() += 1;
+            st.failed += 1;
         }
+        drop(st);
         // Final render of the file's line with the status symbol.
         self.render_file(id, false);
     }
@@ -365,9 +373,13 @@ impl Progress for IndicatifProgress {
         // Trust the caller's counts (the receiver aggregates them
         // authoritatively) but also fold in any locally-tracked skips
         // so both sides agree when the caller passes zeros.
-        let skipped = skipped.max(*self.skipped.lock().unwrap() as usize);
-        let sent = *self.bytes_sent.lock().unwrap();
-        let total = *self.total_bytes.lock().unwrap();
+        let st = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let skipped = skipped.max(st.skipped as usize);
+        let sent = st.bytes_sent;
+        let total = st.total_bytes;
 
         let head = if failed == 0 {
             if ui::is_tty() {

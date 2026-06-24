@@ -36,7 +36,7 @@ impl IncrementalHasher {
     }
 
     #[must_use]
-    pub fn finalize(self) -> ([u8; HASH_LEN], u64) {
+    pub fn finalize(&self) -> ([u8; HASH_LEN], u64) {
         let hash = self.inner.finalize();
         let mut out = [0u8; HASH_LEN];
         out.copy_from_slice(hash.as_bytes());
@@ -59,8 +59,23 @@ impl Default for IncrementalHasher {
 pub enum HashError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("file size overflow")]
-    SizeOverflow,
+    #[error("invalid chunk size: {0}")]
+    InvalidChunkSize(u32),
+}
+
+/// Hash an entire file with BLAKE3.
+///
+/// # Errors
+///
+/// Returns `HashError::Io` if the file cannot be opened or read.
+pub fn hash_file(path: &Path) -> Result<[u8; HASH_LEN], HashError> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Hasher::new();
+    hasher.update_reader(&mut reader)?;
+    let mut out = [0u8; HASH_LEN];
+    out.copy_from_slice(hasher.finalize().as_bytes());
+    Ok(out)
 }
 
 /// Read a file in `chunk_size` pieces and return one BLAKE3 hash per chunk.
@@ -72,10 +87,7 @@ pub enum HashError {
 /// `chunk_size` is zero.
 pub fn chunk_hashes(path: &Path, chunk_size: u32) -> Result<Vec<[u8; HASH_LEN]>, HashError> {
     if chunk_size == 0 {
-        return Err(HashError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "chunk_size must be > 0",
-        )));
+        return Err(HashError::InvalidChunkSize(chunk_size));
     }
     let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(chunk_size as usize, file);
@@ -87,7 +99,14 @@ pub fn chunk_hashes(path: &Path, chunk_size: u32) -> Result<Vec<[u8; HASH_LEN]>,
             break;
         }
         let mut hasher = Hasher::new();
-        hasher.update_rayon(&buf[..n]);
+        // Use parallel hashing only for chunks large enough to benefit
+        // from it; small chunks (≤ 1 MiB) incur rayon spawn overhead
+        // that outweighs the parallelism gain.
+        if n >= 1024 * 1024 {
+            hasher.update_rayon(&buf[..n]);
+        } else {
+            hasher.update(&buf[..n]);
+        }
         let finalized = hasher.finalize();
         let mut h = [0u8; HASH_LEN];
         h.copy_from_slice(finalized.as_bytes());

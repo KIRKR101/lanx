@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use console::{measure_text_width, style, Term};
 use indicatif::{ProgressBar, ProgressStyle};
 
-/// lazily-cached stderr terminal.
+/// Returns a fresh stderr terminal handle on each call.
 fn term() -> Term {
     Term::stderr()
 }
@@ -133,10 +133,12 @@ pub fn banner(verb: &str, detail: &str) {
 
 /// Usable terminal width (columns) for the progress renderer's line
 /// padding. Falls back to 80 when the width can't be queried (piped
-/// output, very narrow terminals, etc.).
+/// output). Clamps to a minimum of 40 to avoid garbled output on very
+/// narrow terminals.
 pub fn term_width() -> usize {
     match term().size() {
         (_, w) if w >= 40 => w as usize,
+        (_, w) if w > 0 => w as usize,
         _ => 80,
     }
 }

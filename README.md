@@ -46,15 +46,20 @@ The receiver gets an exact copy of every file, verified by BLAKE3 hash.
 2. **Sender** picks a random free port, generates a pairing code (e.g.
    `7-cobalt-fox`), and optionally broadcasts it over UDP.
 3. **Receiver** connects via code (automatic discovery) or explicit `ip:port`.
-4. Both sides handshake with protocol version, then exchange the manifest.
-5. **Receiver** checks its destination directory for partial files. If a file
+4. Both sides handshake with protocol version and agree on a parallel
+   connection count, then the sender streams the manifest entry-by-entry.
+5. **Receiver** reviews the manifest and accepts or declines it. Use
+   `--accept` to skip the prompt.
+6. **Receiver** checks its destination directory for partial files. If a file
    exists, it re-hashes the existing chunks and sends the sender a resume
-   offset for each file. Fully-matching files are skipped.
-6. **Sender** streams each accepted file chunk-by-chunk. **Receiver** writes
+   offset for each file. Fully-matching files are skipped. A `.lanx-partial.json`
+   sidecar caches the verified chunk count to skip re-hashing on the next run.
+7. **Sender** streams each accepted file chunk-by-chunk. **Receiver** writes
    to disk while incrementally re-hashing.
-7. After each file, receiver verifies the whole-file BLAKE3 hash against the
-   sender's hash. On mismatch it requests re-transfer from offset 0.
-8. Sender sends `Done`, both sides report the final tally.
+8. After each file, receiver verifies the whole-file BLAKE3 hash against the
+   sender's hash. On mismatch the receiver identifies the corrupt chunks and
+   asks the sender to re-send only those ranges.
+9. Sender sends `Done`, both sides report the final tally.
 
 ## Commands
 
@@ -70,6 +75,8 @@ lanx send <PATHS>... [FLAGS]
 | `--chunk-size <BYTES>` | `1048576` (1 MiB) | Chunk size in bytes |
 | `--no-discovery` | off | Disable UDP-broadcast discovery; print only the explicit address |
 | `--zip` | off | Package a single input path into a `.zip` archive before sending |
+| `--parallel <N>` | `1` | Number of parallel TCP connections to use |
+| `--relay <ADDR>` | (none) | Connect to a relay server instead of listening directly. The argument is the relay's sender-bind address (e.g. `192.168.1.100:53318`) |
 
 Sender picks a random port, generates a code, and prints both:
 
@@ -109,14 +116,24 @@ lanx recv <TARGET> [FLAGS]
 |---|---|---|
 | `<TARGET>` | (required) | Pairing code (e.g. `7-cobalt-fox`) or `ip:port` |
 | `--out <DIR>` | `.` | Output directory or file |
+| `--accept` | off | Accept the incoming transfer automatically without prompting |
 | `--retry-forever` | off | Keep retrying on connection drop indefinitely (default: 5 attempts) |
 | `--discovery-timeout <SECS>` | `30` | Discovery timeout in seconds |
+| `--parallel <N>` | `1` | Number of parallel TCP connections to use |
+| `--relay <ADDR>` | (none) | Connect through a relay server instead of direct connection. The argument is the relay's receiver-bind address (e.g. `192.168.1.100:53319`) |
 
-Receiver output:
+Receiver output (interactive):
 
-```
+```text
 lanx · recv
   ✓ sender 192.168.1.42:51234
+  ? Incoming transfer from 192.168.1.42:51234:
+    17 files, 36.2 MiB, destination: .
+    1.2 KiB  myrepo/readme.txt
+    5.34 MiB myrepo/file.jpg
+    ... and 15 more
+
+    Accept? [y/N]: y
   Receiving folder `myrepo` (17 files, 36.2 MiB)
   [ 1/17]  file.jpg   5.34 MiB / 5.34 MiB  100% ✓
   [ 2/17]  data.csv   1.00 MiB / 2.50 MiB   40% ▕████▏    3.21 MiB/s
@@ -152,6 +169,43 @@ offset via chunk-hash comparison on re-handshake.
 
 Pass `--retry-forever` for unlimited retries.
 
+### `lanx relay`
+
+```
+lanx relay [FLAGS]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--sender-bind <ADDR>` | `0.0.0.0:53318` | Address to listen on for sender connections |
+| `--receiver-bind <ADDR>` | `0.0.0.0:53319` | Address to listen on for receiver connections |
+
+The relay server bridges sender and receiver connections when they cannot
+communicate directly (e.g. different networks, NAT). Both sender and receiver
+connect to the relay, which pairs them by the BLAKE3 hash of the pairing code
+and forwards bytes bidirectionally.
+
+**Example usage:**
+
+1. Start the relay on a public server:
+   ```sh
+   lanx relay --sender-bind 0.0.0.0:53318 --receiver-bind 0.0.0.0:53319
+   ```
+
+2. Sender connects through the relay:
+   ```sh
+   lanx send ~/photos/ --relay 198.51.100.1:53318
+   ```
+
+3. Receiver connects through the relay:
+   ```sh
+   lanx recv 7-cobalt-fox --relay 198.51.100.1:53319
+   ```
+
+The relay does not interpret the lanx protocol; it only forwards bytes between
+the two sockets once paired. Both sides still run the Noise handshake and the
+normal transfer state machine over the relayed stream.
+
 ## Resume & Integrity
 
 - **Sender pre-computes BLAKE3 hashes for every chunk** of every file before
@@ -166,10 +220,10 @@ Pass `--retry-forever` for unlimited retries.
   chunk hashes match), zero bytes are transferred.
 - **Corrupt chunk detection**: if a file on disk has a corrupt middle chunk,
   only the corrupt portion is re-fetched, not the entire file.
-
-No sidecar metadata files needed — the on-disk partial file is its own resume
-state. BLAKE3 runs at multiple GB/s per thread, so re-hashing on reconnect is
-fast enough for v1.
+- **Sidecar cache**: a `.lanx-partial.json` file per destination records the
+  number of verified chunks so the next resume can skip the chunk-by-chunk
+  re-hash. The sidecar is only a hint; the final whole-file BLAKE3 check is
+  always authoritative.
 
 ## Pairing Codes
 
@@ -212,7 +266,7 @@ lanx/
 ├── lanx-core/      Library: protocol-agnostic logic (manifest, hashing,
 │                   transfer state machine, resume planning, destinations)
 ├── lanx-net/       Library: transport layer (TCP helpers, UDP discovery,
-│                   pairing codes, interface enumeration)
+│                   pairing codes, interface enumeration, relay server)
 └── lanx-cli/       Binary: CLI parsing, terminal UI, progress rendering
 ```
 
@@ -220,7 +274,7 @@ The split between `core` and `net` lets you unit-test protocol logic without
 sockets, and swap the transport layer later (e.g. QUIC) without touching
 business logic.
 
-## Wire Protocol (v1)
+## Wire Protocol (v4)
 
 All control messages are length-prefixed on a single TCP stream:
 
@@ -230,27 +284,33 @@ All control messages are length-prefixed on a single TCP stream:
 
 | Message | Direction | Purpose |
 |---|---|---|
-| `Hello { version }` | Both | Handshake, version negotiation |
-| `Manifest` | Sender → Receiver | File list with per-chunk BLAKE3 hashes |
+| `Hello { version, chunk_size, parallel }` | Both | Handshake: version, chunk size, and requested max parallel connections |
+| `ManifestStart { total_files, total_bytes }` | Sender → Receiver | Start of streaming manifest |
+| `ManifestEntry(FileEntry)` | Sender → Receiver | One file in the streaming manifest |
+| `ManifestEnd { chunk_size }` | Sender → Receiver | End of streaming manifest |
 | `ManifestAck { accepted, resume_offsets }` | Receiver → Sender | Which files to transfer, from what offset |
+| `ManifestRejected { reason }` | Receiver → Sender | Receiver declined the manifest |
 | `FileStart { id, offset }` | Sender → Receiver | Begin transferring a file |
 | `ChunkHeader { id, offset, len }` | Sender → Receiver | Precedes `len` raw bytes on stream |
 | `FileEnd { id, hash }` | Sender → Receiver | Whole-file BLAKE3 hash for verification |
 | `FileVerified { id, ok }` | Receiver → Sender | Hash match result |
+| `FileChunkRequest { id, ranges }` | Receiver → Sender | Re-send specific byte ranges |
 | `Error { message }` | Either | Fatal error |
 | `Done` | Sender → Receiver | Transfer complete |
 
-Frame size limit: 32 MiB. Protocol version: `1`.
+Frame size limit: 32 MiB. Protocol version: `4`.
 
 ## Limitations & Future Work
 
-**Not in v1:**
-- Encryption (planned for v2 via noise protocol or TLS)
-- Parallel TCP connections for multi-file throughput
-- Chunk-level re-send on hash mismatch (currently retransmits the entire file)
-- Streaming manifest (all files are fully hashed before transfer starts)
-- NAT traversal / internet relay
-- Sidecar `.lanx-partial.json` to avoid re-hashing on resume
+**Implemented in v1.1:**
+- Streaming manifest transmission
+- Chunk-level re-send on hash mismatch
+- `.lanx-partial.json` sidecar resume cache
+- Parallel TCP connections for multi-file throughput (`--parallel N`)
+
+**Implemented in v2:**
+- Encryption via Noise protocol (`Noise_NN_25519_ChaChaPoly_BLAKE2s`)
+- NAT traversal / internet relay via TURN-like relay server
 
 ## License
 

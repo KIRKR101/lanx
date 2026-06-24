@@ -7,6 +7,7 @@
 pub mod discovery;
 pub mod interfaces;
 pub mod pairing;
+pub mod relay;
 pub mod tcp;
 
 pub use discovery::{code_to_hash, generate_code, DiscoveryHandle};

@@ -38,7 +38,10 @@ pub fn list_non_loopback_v4_sync() -> Vec<Ipv4Addr> {
 pub async fn list_non_loopback_v4() -> Vec<Ipv4Addr> {
     tokio::task::spawn_blocking(list_non_loopback_v4_sync)
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "interface enumeration task panicked");
+            Vec::new()
+        })
 }
 
 #[cfg(test)]

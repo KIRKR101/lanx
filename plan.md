@@ -113,13 +113,19 @@ Payload is either a serialized control message (postcard/bincode) or raw file-ch
 ```rust
 #[derive(Serialize, Deserialize)]
 enum ControlMsg {
-    Hello { version: u16 },
-    Manifest(Manifest),               // sender -> receiver: what's on offer
+    Hello { version: u16, chunk_size: u32, parallel: u16 },
+    /// Legacy single-frame manifest (kept for enum-level compatibility).
+    Manifest(Manifest),
+    ManifestStart { total_files: u64, total_bytes: u64 }, // sender -> receiver: start streaming manifest
+    ManifestEntry(FileEntry),                             // sender -> receiver: one file entry
+    ManifestEnd { chunk_size: u32 },                      // sender -> receiver: end streaming manifest
     ManifestAck { accepted: Vec<FileId>, resume_offsets: HashMap<FileId, u64> },
+    ManifestRejected { reason: String }, // receiver -> sender: declined before transfer
     FileStart { id: FileId, offset: u64 }, // sender -> receiver: beginning this file at offset
     ChunkHeader { id: FileId, offset: u64, len: u32 }, // precedes raw bytes
     FileEnd { id: FileId, hash: [u8; 32] },   // BLAKE3 of full file, for final verification
     FileVerified { id: FileId, ok: bool },
+    FileChunkRequest { id: FileId, ranges: Vec<(u64, u32)> }, // receiver -> sender: re-send specific ranges
     Error { message: String },
     Done,
 }
@@ -143,19 +149,31 @@ struct FileEntry {
 
 Precomputing **per-chunk hashes** (not just whole-file) is the key resume nicety: on resume, receiver can verify which chunks it already has match, rather than trusting byte-offset alone (protects against partial/corrupt writes).
 
+The manifest is sent as a **streaming sequence**: `ManifestStart`, zero or more `ManifestEntry` messages, then `ManifestEnd`. This keeps each wire frame small and lets the receiver start processing entries without buffering the entire manifest.
+
 ---
 
 ## 7. Transfer Flow
 
 ### 7.1 Handshake
 
-1. Receiver connects, sends `Hello`.
-2. Sender replies `Hello`, then sends `Manifest` (built by walking sender's file args, hashing chunks — see §9 for hashing strategy/cost).
-3. Receiver checks its destination directory for partial files matching `rel_path`:
+1. Receiver connects, sends `Hello { version, chunk_size, parallel }` where
+   `parallel` is the number of TCP connections it wants to use.
+2. Sender replies `Hello { version, chunk_size, parallel }` with the agreed
+   parallelism (capped to the sender's maximum), then streams the manifest as
+   `ManifestStart`, `ManifestEntry` ... `ManifestEnd`.
+3. The receiver opens the agreed number of TCP connections; on each connection
+   the handshake is repeated and files are assigned by `file_id % parallel`.
+4. Receiver reviews the manifest and prompts for acceptance (or auto-accepts
+   when `--accept` is used). If declined, receiver sends `ManifestRejected`
+   and the session ends cleanly.
+5. Receiver checks its destination directory for partial files matching `rel_path`:
    - If a file exists with matching name: hash existing chunks, compare against `chunk_hashes` from manifest.
    - Build `resume_offsets`: first chunk index where hash mismatches (or file ends) = resume point.
    - Files fully matching and complete → mark "already have, skip."
-4. Receiver sends `ManifestAck` with accepted file list + resume offsets.
+   - A valid `.lanx-partial.json` sidecar can short-circuit the chunk-by-chunk
+     re-hash; the final whole-file hash remains the correctness authority.
+6. Receiver sends `ManifestAck` with accepted file list + resume offsets.
 
 ### 7.2 Data Transfer
 
@@ -165,10 +183,15 @@ For each accepted file, sender:
 3. Sends `FileEnd { id, hash }` with whole-file BLAKE3 hash.
 
 Receiver:
-1. Opens destination file in append/write-at-offset mode (`O_APPEND` won't work well with seek-based resume — use explicit `seek` + `write_all` instead, via `tokio::fs::File` + `seek`/`write_at`).
-2. Writes each chunk, **also incrementally hashing** as it writes (using BLAKE3's incremental hasher, fed from the resume point — meaning if resuming, you need to either re-hash existing prefix once at startup, or store the hasher state — see §9).
-3. On `FileEnd`, finalizes hash, compares to sender's, sends `FileVerified`.
-4. If mismatch → request re-transfer of that file from offset 0 (simplest fallback) or specific bad chunks (better, v1.1).
+1. Accepts the manifest (interactive prompt or `--accept`).
+2. Opens destination file in append/write-at-offset mode (`O_APPEND` won't work well with seek-based resume — use explicit `seek` + `write_all` instead, via `tokio::fs::File` + `seek`/`write_at`).
+3. Writes each chunk, **also incrementally hashing** as it writes (using BLAKE3's incremental hasher, fed from the resume point — meaning if resuming, you need to either re-hash existing prefix once at startup, or store the hasher state — see §9).
+4. On `FileEnd`, finalizes hash, compares to sender's, sends `FileVerified { ok: true }`.
+5. If mismatch → scan the destination file to find the bad byte ranges, send
+   `FileChunkRequest { id, ranges }`, receive the repaired chunks, re-hash the
+   whole file from disk, and send `FileVerified { ok: true }` on success. If the
+   bad ranges cannot be identified, fall back to requesting a full re-send from
+   offset 0.
 
 ### 7.3 Completion
 
@@ -185,8 +208,8 @@ Two resume scenarios:
 - On reconnect, re-run the handshake (§7.1) — partial file on disk is naturally detected via chunk-hash comparison. No separate resume-file needed for this case; the destination file *is* the resume state.
 
 **B. Process killed / restarted later:**
-- Same mechanism works as long as the partial file is still on disk with correct partial content. Chunk-hash re-verification on reconnect handles it — no extra metadata file required for v1.
-- Optional v1.1: write a small sidecar `.lanx-partial.json` per file caching `{manifest_id, verified_chunk_count}` so you don't need to re-hash the whole partial file on every resume (re-hashing a 4 GiB partial file before resuming is wasteful). Trade-off: extra complexity vs. re-hash cost. **Recommendation: skip sidecar in v1**, add only if re-hash cost proves annoying in practice — BLAKE3 is fast enough (multiple GB/s single-threaded) that re-hashing on resume is likely a non-issue.
+- Same mechanism works as long as the partial file is still on disk with correct partial content. Chunk-hash re-verification on reconnect handles it.
+- A `.lanx-partial.json` sidecar per destination file caches `{rel_path, size, chunk_size, verified_chunks}`. On resume, a valid sidecar lets the receiver skip the chunk-by-chunk re-hash and resume from `verified_chunks * chunk_size`. The sidecar is deleted once the file verifies; if it is stale or missing, the receiver falls back to full chunk-hash re-verification.
 
 ---
 
@@ -203,9 +226,15 @@ Two resume scenarios:
 
 ## 10. Concurrency Model
 
-- Single TCP stream, sequential message flow, per **transfer session** (one sender↔receiver pair). Keep it simple — no parallel chunk streams in v1; one stream avoids ordering/reassembly complexity.
-- Multiple files in one manifest are sent **sequentially**, not interleaved — simplest correct mental model, easy to reason about and resume.
-- v1.1 nicety: optional `--parallel N` opening N TCP connections, each handling a disjoint subset of files, for better throughput on multi-file sends. Not needed for correctness, purely a speed optimization — defer until the simple path works.
+- One or more TCP streams per transfer session. By default a single stream is
+  used with sequential message flow; files are sent **sequentially** on each
+  stream, not interleaved — simplest correct mental model, easy to reason about
+  and resume.
+- With `--parallel N` the receiver opens N TCP connections; each connection
+  handles a disjoint subset of files (`file_id % N`), allowing multi-file
+  transfers to saturate more bandwidth. The handshake and manifest are repeated
+  on every connection; the receiver shares the approval decision across
+  connections so the user is prompted at most once.
 - Use `tokio::io::BufWriter`/`BufReader` around the TCP stream to avoid syscall-per-chunk overhead.
 
 ---
@@ -216,7 +245,7 @@ Two resume scenarios:
 |---|---|
 | Connection drop mid-file | Receiver auto-reconnect loop (bounded retries, exponential backoff); resume via chunk-hash diff |
 | Disk full on receiver | Abort cleanly, surface clear error, leave partial file for future resume |
-| Hash mismatch on `FileEnd` | Receiver requests full re-send of that file (v1); chunk-level re-send (v1.1) |
+| Hash mismatch on `FileEnd` | Receiver identifies corrupt chunks and requests a `FileChunkRequest` re-send; falls back to full re-send if ranges cannot be determined |
 | Sender file changes during transfer | Detect via final hash mismatch; report to user rather than silently accepting |
 | Duplicate filenames in manifest (different dirs) | Use `rel_path` preserving relative directory structure from the common root the user specified, not just basename |
 | Receiver already has identical file | Skip entirely (zero bytes transferred), report "skipped (already present)" |
@@ -243,8 +272,8 @@ lanx recv 7-cobalt-fox
 
 Flags:
 ```
-lanx send <paths...> [--port N] [--no-discovery] [--chunk-size 1M]
-lanx recv <code|ip:port> [--out DIR] [--retry-forever]
+lanx send <paths...> [--no-discovery] [--chunk-size 1M] [--parallel N] [--zip] [--relay ADDR]
+lanx recv <code|ip:port> [--out DIR] [--accept] [--retry-forever] [--parallel N] [--relay ADDR]
 ```
 
 ---
@@ -268,7 +297,81 @@ lanx recv <code|ip:port> [--out DIR] [--retry-forever]
 4. Add multi-file manifest support.
 5. Add resume (chunk-hash diffing + reconnect loop).
 6. Add `indicatif` progress UX.
-7. Add discovery (pairing codes + UDP broadcast) as a convenience layer on top of the working `ip:port` path.
-8. (v2) Add encryption — wrap the TCP stream in `tokio-rustls` or a Noise handshake (`snow` crate) before any control messages are sent.
 
-This order means you have a genuinely useful, testable tool after step 3-4, and each subsequent step is additive rather than requiring rearchitecture.
+---
+
+## 15. Relay Server
+
+The relay server (`lanx relay`) enables NAT traversal and internet relay by
+bridging sender and receiver connections through a central server.
+
+### 15.1 Protocol
+
+1. Sender connects to relay's sender port (default 53318).
+2. Receiver connects to relay's receiver port (default 53319).
+3. Both send a `RelayHello { role, code_hash }` message (length-prefixed postcard).
+4. Relay pairs sender and receiver by matching `code_hash` values.
+5. Once paired, relay spawns bidirectional byte-copy between the two streams.
+
+### 15.2 Messages
+
+```rust
+enum RelayRole {
+    Sender,
+    Receiver,
+}
+
+struct RelayHello {
+    role: RelayRole,
+    code_hash: [u8; 32],  // BLAKE3 hash of the pairing code
+}
+```
+
+### 15.3 CLI Usage
+
+```sh
+# Start relay on a public server
+lanx relay --sender-bind 0.0.0.0:53318 --receiver-bind 0.0.0.0:53319
+
+# Sender connects through relay
+lanx send ~/photos/ --relay 198.51.100.1:53318
+
+# Receiver connects through relay
+lanx recv 7-cobalt-fox --relay 198.51.100.1:53319
+```
+
+### 15.4 Design Notes
+
+- The relay does not interpret the lanx protocol; it only forwards bytes.
+- Both sides still run the Noise handshake and normal transfer state machine.
+- The relay pairs connections by code hash, so a hostile broadcaster cannot
+  trivially spoof connections.
+- For simplicity, if no sender is waiting when a receiver connects, the receiver
+  gets an error and must retry. A production relay could queue receivers.
+- Parallel connections through a relay are not yet supported; each sender/receiver
+  pair uses a single connection.
+
+---
+
+## 16. Encryption (Noise Protocol)
+
+All lanx traffic is encrypted using the Noise framework:
+
+- **Pattern**: `Noise_NN_25519_ChaChaPoly_BLAKE2s`
+- **Handshake**: 2-message NN pattern (initiator sends ephemeral key, responder responds)
+- **Transport**: ChaChaPoly symmetric encryption after handshake
+
+### 16.1 Implementation
+
+The encryption layer wraps the TCP stream before any lanx control messages:
+
+```rust
+// Sender (responder in Noise NN)
+let encrypted = lanx_core::crypto::wrap_responder(stream).await?;
+
+// Receiver (initiator in Noise NN)
+let encrypted = lanx_core::crypto::wrap_initiator(stream).await?;
+```
+
+The encrypted stream is then split into reader/writer for the normal transfer
+protocol. A pump task handles the Noise frame encoding/decoding transparently.

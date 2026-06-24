@@ -111,6 +111,26 @@ fn compute_resume_point(
         return Ok((0, false, IncrementalHasher::new()));
     }
 
+    // If a valid sidecar exists, trust the verified-chunk count and
+    // rebuild the incremental hasher for the prefix in one read pass.
+    if let Some(sidecar) = crate::sidecar::read(dest) {
+        if sidecar.is_valid_for(&entry.rel_path, entry.size, entry.chunk_size, size) {
+            let verified_bytes = u64::from(sidecar.verified_chunks) * u64::from(entry.chunk_size);
+            let prefix_bytes = verified_bytes.min(entry.size).min(size);
+            if let Some((offset, hasher)) =
+                hash_prefix(dest, prefix_bytes).map_err(|e| ResumeError::Io {
+                    path: dest.display().to_string(),
+                    source: e,
+                })?
+            {
+                if offset == entry.size && size == entry.size {
+                    return Ok((0, true, hasher));
+                }
+                return Ok((offset, false, hasher));
+            }
+        }
+    }
+
     // Walk chunks; for each chunk:
     //   - if it fits in remaining bytes: hash, compare, advance.
     //   - if it doesn't: this is the resume chunk — its byte offset is the resume point.
@@ -158,17 +178,10 @@ fn compute_resume_point(
         })?;
         if n < want {
             // Partial file is shorter than this chunk — resume from the
-            // actual file EOF. Feed the truncated bytes to the hasher so
-            // the state is correct for the receiver.
-            hasher.update(&buf[..n]);
-            let n_u64 = u64::try_from(n).map_err(|_| ResumeError::Io {
-                path: dest.display().to_string(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bytes read do not fit in u64",
-                ),
-            })?;
-            return Ok((bytes_read + n_u64, false, hasher));
+            // start of this chunk so the sender re-transmits the full
+            // chunk. The truncated bytes are not fed into the hasher;
+            // the receiver will re-receive this chunk and hash it then.
+            return Ok((bytes_read, false, hasher));
         }
         let actual = blake3::hash(&buf[..want]);
         if actual.as_bytes() != expected {
@@ -193,6 +206,38 @@ fn compute_resume_point(
     } else {
         Ok((bytes_read, false, hasher))
     }
+}
+
+/// Hash the first `prefix_bytes` of `dest` and return the resulting byte
+/// offset and hasher state. Returns `None` if `prefix_bytes` is 0.
+fn hash_prefix(
+    dest: &Path,
+    prefix_bytes: u64,
+) -> std::io::Result<Option<(u64, IncrementalHasher)>> {
+    if prefix_bytes == 0 {
+        return Ok(None);
+    }
+    let file = File::open(dest)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = IncrementalHasher::new();
+    let mut remaining = prefix_bytes;
+    let mut buf = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let n = read_fully(&mut reader, &mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        remaining -= u64::try_from(n).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bytes read do not fit in u64",
+            )
+        })?;
+    }
+    let hashed = prefix_bytes - remaining;
+    Ok(Some((hashed, hasher)))
 }
 
 fn read_fully<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -300,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_file_resumes_at_eof() {
+    fn truncated_file_resumes_at_chunk_start() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         let dst = dir.path().join("dst");
@@ -313,7 +358,10 @@ mod tests {
         let p = d.paths[&0].clone();
         write(&p, &data[..2500]);
         let plan = plan(&m, &d).unwrap();
-        assert_eq!(plan.offsets[&0], 2500);
+        // 2500 bytes: chunks 0..1 are complete (2048 bytes), chunk 2 is
+        // truncated. Resume from the start of chunk 2 (byte 2048) so the
+        // full chunk is re-transmitted and verified.
+        assert_eq!(plan.offsets[&0], 2048);
     }
 
     #[test]

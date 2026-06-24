@@ -38,6 +38,13 @@ enum Command {
         /// Port to listen on (default: random ephemeral port).
         #[arg(long)]
         port: Option<u16>,
+        /// Number of parallel TCP connections to use.
+        #[arg(long, default_value_t = 1)]
+        parallel: u16,
+        /// Connect to a relay server instead of listening directly.
+        /// The argument is the relay's sender-bind address (e.g. "192.168.1.100:53318").
+        #[arg(long)]
+        relay: Option<String>,
     },
     /// Receive files.
     Recv {
@@ -46,12 +53,31 @@ enum Command {
         /// Output directory or file (see README for resolution rules).
         #[arg(long, default_value = ".")]
         out: PathBuf,
+        /// Accept the incoming transfer automatically without prompting.
+        #[arg(long)]
+        accept: bool,
         /// Retry forever on connection drop.
         #[arg(long)]
         retry_forever: bool,
         /// Discovery timeout in seconds.
         #[arg(long, default_value_t = 30)]
         discovery_timeout: u64,
+        /// Number of parallel TCP connections to use.
+        #[arg(long, default_value_t = 1)]
+        parallel: u16,
+        /// Connect through a relay server instead of direct connection.
+        /// The argument is the relay's receiver-bind address (e.g. "192.168.1.100:53319").
+        #[arg(long)]
+        relay: Option<String>,
+    },
+    /// Run a relay server that bridges sender and receiver connections.
+    Relay {
+        /// Address to listen on for sender connections.
+        #[arg(long, default_value = "0.0.0.0:53318")]
+        sender_bind: String,
+        /// Address to listen on for receiver connections.
+        #[arg(long, default_value = "0.0.0.0:53319")]
+        receiver_bind: String,
     },
 }
 
@@ -76,21 +102,33 @@ fn main() -> Result<()> {
                 no_discovery,
                 zip,
                 port,
-            } => cmd::send::run(paths, chunk_size, no_discovery, zip, port).await,
+                parallel,
+                relay,
+            } => cmd::send::run(paths, chunk_size, no_discovery, zip, port, parallel, relay).await,
             Command::Recv {
                 target,
                 out,
+                accept,
                 retry_forever,
                 discovery_timeout,
+                parallel,
+                relay,
             } => {
                 cmd::recv::run(
                     target,
                     out,
+                    accept,
                     retry_forever,
                     Duration::from_secs(discovery_timeout),
+                    parallel,
+                    relay,
                 )
                 .await
             }
+            Command::Relay {
+                sender_bind,
+                receiver_bind,
+            } => cmd::relay::run(sender_bind, receiver_bind).await,
         }
     })
 }

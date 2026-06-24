@@ -42,9 +42,16 @@ fn looks_like_code(s: &str) -> bool {
     if parts.len() != 3 {
         return false;
     }
-    if parts[0].parse::<u32>().is_err() {
+    // Digit must be a single ASCII digit (0-9), matching the format
+    // `port % 10` used by generate_code.
+    if parts[0].len() != 1 || !parts[0].chars().next().unwrap().is_ascii_digit() {
         return false;
     }
+    // Validate that words are alphabetic. We do NOT enforce wordlist
+    // membership here because generate_code produces codes from the
+    // wordlist, but a user may mistype or use a future expanded list.
+    // If the code doesn't match any sender, discovery will time out
+    // with a clear message.
     parts[1].chars().all(|c| c.is_ascii_alphabetic())
         && parts[2].chars().all(|c| c.is_ascii_alphabetic())
 }
@@ -68,5 +75,54 @@ pub async fn resolve_target(
                 .map_err(|e| TargetError::Discovery(e.to_string()))?;
             Ok(addr)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_code_accepted() {
+        assert!(matches!(parse_target("7-cobalt-fox"), Ok(Target::Code(_))));
+    }
+
+    #[test]
+    fn multi_digit_number_rejected() {
+        // Only single-digit prefixes (0-9) are valid per the code format.
+        assert!(matches!(
+            parse_target("99-cobalt-fox"),
+            Err(TargetError::InvalidAddr(_))
+        ));
+    }
+
+    #[test]
+    fn non_numeric_prefix_rejected() {
+        assert!(matches!(
+            parse_target("a-cobalt-fox"),
+            Err(TargetError::InvalidAddr(_))
+        ));
+    }
+
+    #[test]
+    fn ip_port_accepted() {
+        assert!(matches!(
+            parse_target("192.168.1.1:51234"),
+            Ok(Target::Addr(_))
+        ));
+    }
+
+    #[test]
+    fn case_insensitive_code_accepted() {
+        // Case normalization in code_to_hash ensures "7-Cobalt-Fox" and
+        // "7-cobalt-fox" produce the same hash.
+        assert!(matches!(parse_target("7-Cobalt-Fox"), Ok(Target::Code(_))));
+    }
+
+    #[test]
+    fn non_wordlist_code_accepted() {
+        // looks_like_code intentionally validates format only, not wordlist
+        // membership. Discovery will time out if no sender matches.
+        assert!(matches!(parse_target("7-hello-world"), Ok(Target::Code(_))));
     }
 }

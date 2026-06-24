@@ -18,6 +18,12 @@ pub const MAX_CHUNK_SIZE: u32 = 32 * 1024 * 1024; // 32 MiB
 /// resource exhaustion on the receiver.
 pub const MAX_MANIFEST_FILES: usize = 100_000;
 
+// Compile-time guarantee that MAX_MANIFEST_FILES fits in FileId (u32).
+const _: () = assert!(
+    MAX_MANIFEST_FILES <= u32::MAX as usize,
+    "MAX_MANIFEST_FILES must fit in FileId (u32)"
+);
+
 /// Convert a wire-form `rel_path` (forward-slash separated) back into a
 /// platform-native `PathBuf`.
 ///
@@ -36,6 +42,10 @@ pub fn rel_to_path(rel: &str) -> PathBuf {
         // craft rel_path with ".." to write files outside the
         // destination directory.
         if component == "." || component == ".." {
+            tracing::warn!(
+                component = component,
+                "stripping path-traversal component from rel_path"
+            );
             continue;
         }
         out.push(component);
@@ -265,29 +275,7 @@ fn walk_dir(
     common: &Path,
     out: &mut Vec<(PathBuf, String)>,
 ) -> Result<(), ManifestError> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping");
-                continue;
-            }
-        };
-        if meta.file_type().is_symlink() {
-            tracing::warn!(path = %path.display(), "skipping symlink");
-            continue;
-        }
-        if meta.is_file() {
-            out.push((path.clone(), rel_from(common, &path)));
-        } else if meta.is_dir() {
-            walk_dir(&path, common, out)?;
-        } else {
-            tracing::warn!(path = %path.display(), "skipping special file");
-        }
-    }
-    Ok(())
+    walk_dir_inner(dir, common, None, out)
 }
 
 /// Like `walk_dir`, but every `rel_path` is prefixed with `archive_prefix`
@@ -297,6 +285,15 @@ fn walk_dir(
 fn walk_dir_with_prefix(
     dir: &Path,
     archive_prefix: &str,
+    out: &mut Vec<(PathBuf, String)>,
+) -> Result<(), ManifestError> {
+    walk_dir_inner(dir, Path::new(""), Some(archive_prefix), out)
+}
+
+fn walk_dir_inner(
+    dir: &Path,
+    common: &Path,
+    archive_prefix: Option<&str>,
     out: &mut Vec<(PathBuf, String)>,
 ) -> Result<(), ManifestError> {
     for entry in std::fs::read_dir(dir)? {
@@ -313,14 +310,28 @@ fn walk_dir_with_prefix(
             tracing::warn!(path = %path.display(), "skipping symlink");
             continue;
         }
-        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let child_prefix = format!("{archive_prefix}/{file_name}");
         if meta.is_file() {
-            out.push((path.clone(), child_prefix));
+            let rel = if let Some(prefix) = archive_prefix {
+                let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                format!("{prefix}/{file_name}")
+            } else {
+                rel_from(common, &path)
+            };
+            out.push((path.clone(), rel));
         } else if meta.is_dir() {
-            walk_dir_with_prefix(&path, &child_prefix, out)?;
+            if let Some(prefix) = archive_prefix {
+                let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let child_prefix = format!("{prefix}/{file_name}");
+                walk_dir_inner(&path, common, Some(&child_prefix), out)?;
+            } else {
+                walk_dir_inner(&path, common, None, out)?;
+            }
         } else {
             tracing::warn!(path = %path.display(), "skipping special file");
         }

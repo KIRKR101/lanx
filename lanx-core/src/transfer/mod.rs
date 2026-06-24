@@ -10,7 +10,7 @@ pub mod sender;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Default maximum number of retries per file on hash mismatch. Both
 /// sender and receiver use this value so they agree on when to give up.
@@ -20,19 +20,44 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 pub struct HelloInfo {
     pub version: u16,
     pub chunk_size: u32,
+    /// Number of parallel TCP connections requested by the peer. The
+    /// receiver proposes a value; the sender replies with the value it
+    /// is willing to honor (capped by its own maximum). A value of 0 or
+    /// 1 means no parallelism.
+    pub parallel: u16,
 }
 
 /// Control-plane message. See `plan.md` §6.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMsg {
     Hello(HelloInfo),
+    /// Legacy single-frame manifest. Kept for backwards compatibility at
+    /// the enum level; current protocol uses streaming manifest messages.
     Manifest(crate::manifest::Manifest),
+    /// First message of a streaming manifest. `total_files` and
+    /// `total_bytes` let the receiver pre-allocate UI state.
+    ManifestStart {
+        total_files: u64,
+        total_bytes: u64,
+    },
+    /// One file entry in a streaming manifest. Sent between `ManifestStart`
+    /// and `ManifestEnd`.
+    ManifestEntry(crate::manifest::FileEntry),
+    /// Final message of a streaming manifest. Carries the shared
+    /// `chunk_size` that applies to all entries.
+    ManifestEnd {
+        chunk_size: u32,
+    },
     /// `accepted` is the list of file IDs the receiver wants.
     /// `resume_offsets[id]` is the byte offset the sender must start at
     /// (0 if absent / starting fresh).
     ManifestAck {
         accepted: Vec<crate::manifest::FileId>,
         resume_offsets: std::collections::HashMap<crate::manifest::FileId, u64>,
+    },
+    /// Receiver declined the manifest before any file data was sent.
+    ManifestRejected {
+        reason: String,
     },
     /// Beginning this file at `offset` (raw bytes follow per `ChunkHeader`).
     FileStart {
@@ -52,10 +77,18 @@ pub enum ControlMsg {
         hash: [u8; 32],
     },
     /// Receiver's verdict after `FileEnd`. `ok=false` triggers a re-send
-    /// from offset 0 (v1) on the same connection.
+    /// from offset 0 on the same connection.
     FileVerified {
         id: crate::manifest::FileId,
         ok: bool,
+    },
+    /// Receiver asks the sender to re-send specific byte ranges of a file.
+    /// Sent after `FileEnd` when the whole-file hash mismatches but the
+    /// receiver can identify which chunks are corrupt.
+    FileChunkRequest {
+        id: crate::manifest::FileId,
+        /// (offset, len) pairs. Must be non-overlapping and in ascending order.
+        ranges: Vec<(u64, u32)>,
     },
     Error {
         message: String,
@@ -73,8 +106,6 @@ pub enum ProtocolError {
     Unexpected(String),
     #[error("peer reported error: {0}")]
     PeerError(String),
-    #[error("hash mismatch on file {0}")]
-    HashMismatch(crate::manifest::FileId),
     #[error("postcard: {0}")]
     Postcard(#[from] postcard::Error),
     #[error("frame too large: {0} bytes")]
@@ -83,6 +114,8 @@ pub enum ProtocolError {
     Closed,
     #[error("max retries ({0}) exhausted for file {1}")]
     MaxRetries(u32, crate::manifest::FileId),
+    #[error("receiver declined transfer: {0}")]
+    ManifestRejected(String),
 }
 
 // ---- framing ----
@@ -160,6 +193,7 @@ mod tests {
         let msg = ControlMsg::Hello(HelloInfo {
             version: 1,
             chunk_size: 1024,
+            parallel: 4,
         });
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();
@@ -176,6 +210,55 @@ mod tests {
             assert_eq!(m.files[0].rel_path, "test.bin");
         } else {
             panic!("expected Manifest variant");
+        }
+    }
+
+    #[test]
+    fn manifest_start_round_trip() {
+        let msg = ControlMsg::ManifestStart {
+            total_files: 42,
+            total_bytes: 123_456,
+        };
+        let encoded = postcard::to_allocvec(&msg).unwrap();
+        let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(format!("{msg:?}"), format!("{decoded:?}"));
+    }
+
+    #[test]
+    fn manifest_entry_round_trip() {
+        let msg = ControlMsg::ManifestEntry(crate::manifest::FileEntry {
+            id: 5,
+            rel_path: "sub/file.bin".into(),
+            size: 4096,
+            chunk_size: 1024,
+            chunk_hashes: vec![[1; 32], [2; 32], [3; 32], [4; 32]],
+        });
+        let encoded = postcard::to_allocvec(&msg).unwrap();
+        let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(format!("{msg:?}"), format!("{decoded:?}"));
+    }
+
+    #[test]
+    fn manifest_end_round_trip() {
+        let msg = ControlMsg::ManifestEnd {
+            chunk_size: 1024 * 1024,
+        };
+        let encoded = postcard::to_allocvec(&msg).unwrap();
+        let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(format!("{msg:?}"), format!("{decoded:?}"));
+    }
+
+    #[test]
+    fn manifest_rejected_round_trip() {
+        let msg = ControlMsg::ManifestRejected {
+            reason: "user declined".into(),
+        };
+        let encoded = postcard::to_allocvec(&msg).unwrap();
+        let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();
+        if let ControlMsg::ManifestRejected { reason } = decoded {
+            assert_eq!(reason, "user declined");
+        } else {
+            panic!("expected ManifestRejected variant");
         }
     }
 
@@ -244,6 +327,17 @@ mod tests {
     }
 
     #[test]
+    fn file_chunk_request_round_trip() {
+        let msg = ControlMsg::FileChunkRequest {
+            id: 7,
+            ranges: vec![(0, 1024), (2048, 512)],
+        };
+        let encoded = postcard::to_allocvec(&msg).unwrap();
+        let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(format!("{msg:?}"), format!("{decoded:?}"));
+    }
+
+    #[test]
     fn error_msg_round_trip() {
         let msg = ControlMsg::Error {
             message: "something went wrong".into(),
@@ -268,6 +362,7 @@ mod tests {
         let msg = ControlMsg::Hello(HelloInfo {
             version: 1,
             chunk_size: 2048,
+            parallel: 1,
         });
         write_frame(&mut w, &msg).await.unwrap();
         drop(w);
@@ -284,6 +379,7 @@ mod tests {
             ControlMsg::Hello(HelloInfo {
                 version: 1,
                 chunk_size: 1024,
+                parallel: 1,
             }),
             ControlMsg::FileStart { id: 0, offset: 0 },
             ControlMsg::ChunkHeader {
