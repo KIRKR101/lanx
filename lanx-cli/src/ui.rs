@@ -165,6 +165,39 @@ pub fn strip_ansi(s: &str) -> String {
     console::strip_ansi_codes(s).to_string()
 }
 
+/// Truncate `s` so its *visible* width (ignoring ANSI escapes) never
+/// exceeds `width`. Escape sequences are copied through whole. A line
+/// longer than the terminal wraps when written, and once it wraps a
+/// trailing `\r` only returns to the start of the wrapped fragment,
+/// so every in-place update renders as a new line. Clamping the line
+/// to the measured width prevents that.
+pub fn truncate_visible(s: &str, width: usize) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with('\u{1b}') {
+            // Copy the whole escape sequence (runs to the first
+            // alphabetic terminator, e.g. `m` in SGR).
+            let end = rest
+                .find(|ch: char| ch.is_ascii_alphabetic())
+                .map(|p| p + 1)
+                .unwrap_or(rest.len());
+            out.push_str(&rest[..end]);
+            i += end;
+            continue;
+        }
+        let c = rest.chars().next().unwrap();
+        let w = console::measure_text_width(&c.to_string());
+        if w + console::measure_text_width(&out) > width {
+            break;
+        }
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
 /// Format a byte count with a human-friendly suffix (binary units).
 pub fn human_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB"];

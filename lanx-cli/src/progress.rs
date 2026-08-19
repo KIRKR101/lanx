@@ -238,17 +238,31 @@ impl IndicatifProgress {
             }
         }
 
-        // Pad to terminal width with spaces (visible-width-aware) so the
-        // previous, longer line is fully cleared before we move on.
+        // Clamp to the terminal width so the line never wraps (a
+        // wrapped line breaks the in-place `\r` update into stacked
+        // lines), then pad to the full width so the previous, longer
+        // line is fully cleared before we move on.
+        let line = ui::truncate_visible(&line, width);
         let line = ui::pad_visible(&line, width);
 
         let stderr = std::io::stderr();
         let mut handle = stderr.lock();
-        if !fresh_line {
-            let _ = handle.write_all(b"\r");
+        if ui::is_tty() {
+            // Erase the previous render before writing the new one.
+            // `\r` alone leaves stale characters when the line shrank;
+            // ESC[2K clears from the cursor to end of line.
+            if !fresh_line {
+                let _ = handle.write_all(b"\r");
+                let _ = handle.write_all(b"\x1b[2K");
+            }
+            let _ = write!(handle, "{line}");
+            let _ = handle.flush();
+        } else {
+            // Not a terminal (redirected/piped output): print each
+            // state as its own plain line. No carriage returns, no
+            // padding, no ANSI - keeps logs greppable.
+            let _ = writeln!(handle, "{}", ui::strip_ansi(&line).trim_end());
         }
-        let _ = write!(handle, "{line}");
-        let _ = handle.flush();
     }
 }
 
