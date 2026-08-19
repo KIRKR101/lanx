@@ -47,7 +47,25 @@ jobs:
             zip)   tar -a -c -f "${name}.zip" "$bin" ;;
             tar.gz) tar -czf "${name}.tar.gz" "$bin" ;;
           esac
+
+      - name: Checksum (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd target/release
+          bin="lanx${{ matrix.suffix }}"
+          name="lanx-${{ github.ref_name }}-${{ matrix.target }}"
           shasum -a 256 "$bin" > "${name}.sha256"
+
+      - name: Checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/release
+          $bin = "lanx${{ matrix.suffix }}"
+          $name = "lanx-${{ github.ref_name }}-${{ matrix.target }}"
+          (Get-FileHash -Algorithm SHA256 $bin).Hash.ToLower() + "  $bin" | Set-Content "${name}.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
