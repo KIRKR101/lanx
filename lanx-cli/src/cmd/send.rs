@@ -179,209 +179,209 @@ pub async fn run(
         let mut first_task_result = None;
 
         if let Some(ref relay_addr) = relay {
-        // Relay mode: connect to the relay server and register as a sender.
+            // Relay mode: connect to the relay server and register as a sender.
+            eprintln!(
+                "  {} {} {}",
+                ui::dim("relay"),
+                ui::arrow(),
+                ui::bold(relay_addr)
+            );
+            eprintln!();
+
+            let mut stream = TcpStream::connect(relay_addr)
+                .await
+                .with_context(|| format!("connect to relay {relay_addr}"))?;
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::debug!(?e, "TCP_NODELAY failed");
+            }
+
+            // Send hello to register with the relay.
+            let hello = RelayHello {
+                role: RelayRole::Sender,
+                code_hash,
+            };
+            send_relay_hello(&mut stream, &hello).await?;
+
+            eprintln!(
+                "  {} {}",
+                ui::green(ui::ok_sym()),
+                ui::dim("registered with relay (waiting for receiver)")
+            );
+            eprintln!();
+
+            spawn_stream(
+                &mut set,
+                stream,
+                manifest.clone(),
+                sources.clone(),
+                progress.clone(),
+                cfg.clone(),
+            );
+        } else {
+            // Direct mode: listen for incoming connections.
+            let addrs = crate::iface::list_non_loopback_v4().await;
+            let indent = " ".repeat(label_w + 1);
+            if addrs.is_empty() {
+                ui::kv("listen", &format!("0.0.0.0:{}", addr.port()), label_w);
+            } else {
+                ui::kv("listen", &format!("{}:{}", addrs[0], addr.port()), label_w);
+                for ip in &addrs[1..] {
+                    eprintln!("{indent}{ip}:{}", addr.port());
+                }
+            }
+            eprintln!(
+                "{indent}127.0.0.1:{} {}",
+                addr.port(),
+                ui::dim("(loopback)"),
+            );
+            eprintln!();
+
+            if !no_discovery {
+                match start_broadcasting(addr.port(), &code).await {
+                    Ok(h) => disc = Some(h),
+                    Err(e) => {
+                        warn!(?e, "discovery failed; continuing without broadcast");
+                    }
+                }
+            }
+
+            // Fresh grace window for this round: after a failed session the
+            // receiver's retry loop reconnects and resumes (plan.md §8 A).
+            listener.reset();
+            let wait_msg = if had_session {
+                format!("waiting for receiver reconnection{}", ui::ellipsis())
+            } else {
+                format!("waiting for receiver{}", ui::ellipsis())
+            };
+            let wait_spinner = ui::spinner(&wait_msg);
+            let stream0 = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    wait_spinner.finish_and_clear();
+                    eprintln!(
+                        "  {} {}",
+                        ui::red(ui::fail_sym()),
+                        ui::dim(if had_session {
+                            "no reconnection within grace period (giving up)"
+                        } else {
+                            "no receiver connected"
+                        }),
+                    );
+                    if let Some(h) = disc {
+                        h.stop().await;
+                    }
+                    return Err(anyhow::Error::new(e).context("accept receiver"));
+                }
+            };
+            wait_spinner.finish_and_clear();
+            had_session = true;
+
+            spawn_stream(
+                &mut set,
+                stream0,
+                manifest.clone(),
+                sources.clone(),
+                progress.clone(),
+                cfg.clone(),
+            );
+
+            // Wait to negotiate parallelism on connection 0. If it fails or exits early,
+            // we fallback to agreed_parallel = 1.
+            let agreed_parallel = tokio::select! {
+                Some(p) = agreed_rx.recv() => p,
+                res = set.join_next() => {
+                    if let Some(r) = res {
+                        first_task_result = Some(r);
+                    }
+                    1
+                }
+            };
+            actual_parallel = agreed_parallel;
+
+            if agreed_parallel > 1 {
+                let extra_wait_spinner = ui::spinner(&format!(
+                    "waiting for {} additional connection{} for parallel transfer{}",
+                    agreed_parallel - 1,
+                    if agreed_parallel == 2 { "" } else { "s" },
+                    ui::ellipsis()
+                ));
+                for _ in 1..agreed_parallel {
+                    match listener.accept().await {
+                        Ok(stream) => {
+                            spawn_stream(
+                                &mut set,
+                                stream,
+                                manifest.clone(),
+                                sources.clone(),
+                                progress.clone(),
+                                cfg.clone(),
+                            );
+                        }
+                        Err(e) => {
+                            extra_wait_spinner.finish_and_clear();
+                            tracing::warn!(error = %e, "failed to accept additional parallel connection");
+                            break;
+                        }
+                    }
+                }
+                extra_wait_spinner.finish_and_clear();
+            }
+        }
+
         eprintln!(
             "  {} {} {}",
-            ui::dim("relay"),
-            ui::arrow(),
-            ui::bold(relay_addr)
-        );
-        eprintln!();
-
-        let mut stream = TcpStream::connect(relay_addr)
-            .await
-            .with_context(|| format!("connect to relay {relay_addr}"))?;
-        if let Err(e) = stream.set_nodelay(true) {
-            tracing::debug!(?e, "TCP_NODELAY failed");
-        }
-
-        // Send hello to register with the relay.
-        let hello = RelayHello {
-            role: RelayRole::Sender,
-            code_hash,
-        };
-        send_relay_hello(&mut stream, &hello).await?;
-
-        eprintln!(
-            "  {} {}",
             ui::green(ui::ok_sym()),
-            ui::dim("registered with relay (waiting for receiver)")
+            ui::dim("receiver connected"),
+            ui::dim(&format!(
+                "({} stream{})",
+                actual_parallel,
+                if actual_parallel == 1 { "" } else { "s" }
+            )),
         );
-        eprintln!();
 
-        spawn_stream(
-            &mut set,
-            stream,
-            manifest.clone(),
-            sources.clone(),
-            progress.clone(),
-            cfg.clone(),
-        );
-    } else {
-        // Direct mode: listen for incoming connections.
-        let addrs = crate::iface::list_non_loopback_v4().await;
-        let indent = " ".repeat(label_w + 1);
-        if addrs.is_empty() {
-            ui::kv("listen", &format!("0.0.0.0:{}", addr.port()), label_w);
-        } else {
-            ui::kv("listen", &format!("{}:{}", addrs[0], addr.port()), label_w);
-            for ip in &addrs[1..] {
-                eprintln!("{indent}{ip}:{}", addr.port());
-            }
-        }
-        eprintln!(
-            "{indent}127.0.0.1:{} {}",
-            addr.port(),
-            ui::dim("(loopback)"),
-        );
-        eprintln!();
-
-        if !no_discovery {
-            match start_broadcasting(addr.port(), &code).await {
-                Ok(h) => disc = Some(h),
-                Err(e) => {
-                    warn!(?e, "discovery failed; continuing without broadcast");
-                }
-            }
-        }
-
-        // Fresh grace window for this round: after a failed session the
-        // receiver's retry loop reconnects and resumes (plan.md §8 A).
-        listener.reset();
-        let wait_msg = if had_session {
-            format!("waiting for receiver reconnection{}", ui::ellipsis())
-        } else {
-            format!("waiting for receiver{}", ui::ellipsis())
+        // If connection 0 finished/failed during the select! above, fold its
+        // result into the round's error handling below instead of bailing:
+        // in direct mode a failed session must retry, not exit.
+        let mut round_error: Option<anyhow::Error> = match first_task_result {
+            Some(Ok(Ok(()))) => None,
+            Some(Ok(Err(e))) => Some(anyhow::Error::new(e).context("transfer session")),
+            Some(Err(e)) => Some(anyhow::Error::new(e).context("transfer task")),
+            None => None,
         };
-        let wait_spinner = ui::spinner(&wait_msg);
-        let stream0 = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                wait_spinner.finish_and_clear();
+
+        while round_error.is_none() {
+            match set.join_next().await {
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => {
+                    round_error = Some(anyhow::Error::new(e).context("transfer session"));
+                    break;
+                }
+                Some(Err(e)) => {
+                    round_error = Some(anyhow::Error::new(e).context("transfer task"));
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        match round_error {
+            None => completed = true,
+            Some(e) => {
+                if relay.is_some() {
+                    return Err(e);
+                }
+                // Direct mode: failed session — keep the port open and let
+                // the receiver's retry loop reconnect and resume.
+                warn!(?e, "session ended with error; waiting for reconnection");
                 eprintln!(
-                    "  {} {}",
+                    "  {} {} {} {}",
                     ui::red(ui::fail_sym()),
-                    ui::dim(if had_session {
-                        "no reconnection within grace period (giving up)"
-                    } else {
-                        "no receiver connected"
-                    }),
+                    ui::dim("session failed:"),
+                    ui::red(&format!("{e}")),
+                    ui::dim("(keeping the port open for reconnection)"),
                 );
-                if let Some(h) = disc {
-                    h.stop().await;
-                }
-                return Err(anyhow::Error::new(e).context("accept receiver"));
             }
-        };
-        wait_spinner.finish_and_clear();
-        had_session = true;
-
-        spawn_stream(
-            &mut set,
-            stream0,
-            manifest.clone(),
-            sources.clone(),
-            progress.clone(),
-            cfg.clone(),
-        );
-
-        // Wait to negotiate parallelism on connection 0. If it fails or exits early,
-        // we fallback to agreed_parallel = 1.
-        let agreed_parallel = tokio::select! {
-            Some(p) = agreed_rx.recv() => p,
-            res = set.join_next() => {
-                if let Some(r) = res {
-                    first_task_result = Some(r);
-                }
-                1
-            }
-        };
-        actual_parallel = agreed_parallel;
-
-        if agreed_parallel > 1 {
-            let extra_wait_spinner = ui::spinner(&format!(
-                "waiting for {} additional connection{} for parallel transfer{}",
-                agreed_parallel - 1,
-                if agreed_parallel == 2 { "" } else { "s" },
-                ui::ellipsis()
-            ));
-            for _ in 1..agreed_parallel {
-                match listener.accept().await {
-                    Ok(stream) => {
-                        spawn_stream(
-                            &mut set,
-                            stream,
-                            manifest.clone(),
-                            sources.clone(),
-                            progress.clone(),
-                            cfg.clone(),
-                        );
-                    }
-                    Err(e) => {
-                        extra_wait_spinner.finish_and_clear();
-                        tracing::warn!(error = %e, "failed to accept additional parallel connection");
-                        break;
-                    }
-                }
-            }
-            extra_wait_spinner.finish_and_clear();
         }
-    }
-
-    eprintln!(
-        "  {} {} {}",
-        ui::green(ui::ok_sym()),
-        ui::dim("receiver connected"),
-        ui::dim(&format!(
-            "({} stream{})",
-            actual_parallel,
-            if actual_parallel == 1 { "" } else { "s" }
-        )),
-    );
-
-    // If connection 0 finished/failed during the select! above, fold its
-    // result into the round's error handling below instead of bailing:
-    // in direct mode a failed session must retry, not exit.
-    let mut round_error: Option<anyhow::Error> = match first_task_result {
-        Some(Ok(Ok(()))) => None,
-        Some(Ok(Err(e))) => Some(anyhow::Error::new(e).context("transfer session")),
-        Some(Err(e)) => Some(anyhow::Error::new(e).context("transfer task")),
-        None => None,
-    };
-
-    while round_error.is_none() {
-        match set.join_next().await {
-            Some(Ok(Ok(()))) => {}
-            Some(Ok(Err(e))) => {
-                round_error = Some(anyhow::Error::new(e).context("transfer session"));
-                break;
-            }
-            Some(Err(e)) => {
-                round_error = Some(anyhow::Error::new(e).context("transfer task"));
-                break;
-            }
-            None => break,
-        }
-    }
-
-    match round_error {
-        None => completed = true,
-        Some(e) => {
-            if relay.is_some() {
-                return Err(e);
-            }
-            // Direct mode: failed session — keep the port open and let
-            // the receiver's retry loop reconnect and resume.
-            warn!(?e, "session ended with error; waiting for reconnection");
-            eprintln!(
-                "  {} {} {} {}",
-                ui::red(ui::fail_sym()),
-                ui::dim("session failed:"),
-                ui::red(&format!("{e}")),
-                ui::dim("(keeping the port open for reconnection)"),
-            );
-        }
-    }
     }
 
     if let Some(h) = disc {
