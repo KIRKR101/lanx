@@ -43,6 +43,7 @@ pub async fn listen() -> Result<(TcpListener, SocketAddr), TcpError> {
 /// fresh stream.
 pub struct GracefulListener {
     inner: TcpListener,
+    grace: Duration,
     deadline: std::time::Instant,
     backoff: Duration,
 }
@@ -51,9 +52,18 @@ impl GracefulListener {
     pub fn new(inner: TcpListener, grace: Duration) -> Self {
         Self {
             inner,
+            grace,
             deadline: std::time::Instant::now() + grace,
             backoff: Duration::from_millis(10),
         }
+    }
+
+    /// Refresh the grace window. Call after a session fails so the next
+    /// `accept` gives a full grace period instead of the deadline
+    /// captured at construction, which a long session may have outlived.
+    pub fn reset(&mut self) {
+        self.deadline = std::time::Instant::now() + self.grace;
+        self.backoff = Duration::from_millis(10);
     }
 
     /// Accept one stream. Loops on transient errors with exponential

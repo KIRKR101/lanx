@@ -158,19 +158,27 @@ pub async fn run(
     let progress: Arc<dyn lanx_core::progress::Progress> = IndicatifProgress::new("Sending");
 
     let mut disc = None;
-    let mut set = tokio::task::JoinSet::new();
-    let mut actual_parallel = 1;
-    let mut first_task_result = None;
 
-    let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
-    let cfg = SenderConfig {
-        chunk_size,
-        max_retries: DEFAULT_MAX_RETRIES,
-        max_parallel: parallel,
-        agreed_parallel_tx: Some(agreed_tx),
-    };
+    let mut listener = GracefulListener::new(listener, Duration::from_secs(60));
+    let mut had_session = false;
+    let mut completed = false;
 
-    if let Some(ref relay_addr) = relay {
+    while !completed {
+        // Fresh parallelism-negotiation channel per round: streams of one
+        // round report into this round's receiver only.
+        let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = SenderConfig {
+            chunk_size,
+            max_retries: DEFAULT_MAX_RETRIES,
+            max_parallel: parallel,
+            agreed_parallel_tx: Some(agreed_tx),
+        };
+
+        let mut set = tokio::task::JoinSet::new();
+        let mut actual_parallel = 1;
+        let mut first_task_result = None;
+
+        if let Some(ref relay_addr) = relay {
         // Relay mode: connect to the relay server and register as a sender.
         eprintln!(
             "  {} {} {}",
@@ -211,7 +219,6 @@ pub async fn run(
         );
     } else {
         // Direct mode: listen for incoming connections.
-        let mut listener = GracefulListener::new(listener, Duration::from_secs(60));
         let addrs = crate::iface::list_non_loopback_v4().await;
         let indent = " ".repeat(label_w + 1);
         if addrs.is_empty() {
@@ -238,7 +245,15 @@ pub async fn run(
             }
         }
 
-        let wait_spinner = ui::spinner(&format!("waiting for receiver{}", ui::ellipsis()));
+        // Fresh grace window for this round: after a failed session the
+        // receiver's retry loop reconnects and resumes (plan.md §8 A).
+        listener.reset();
+        let wait_msg = if had_session {
+            format!("waiting for receiver reconnection{}", ui::ellipsis())
+        } else {
+            format!("waiting for receiver{}", ui::ellipsis())
+        };
+        let wait_spinner = ui::spinner(&wait_msg);
         let stream0 = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
@@ -246,7 +261,11 @@ pub async fn run(
                 eprintln!(
                     "  {} {}",
                     ui::red(ui::fail_sym()),
-                    ui::dim("no receiver connected"),
+                    ui::dim(if had_session {
+                        "no reconnection within grace period (giving up)"
+                    } else {
+                        "no receiver connected"
+                    }),
                 );
                 if let Some(h) = disc {
                     h.stop().await;
@@ -255,6 +274,7 @@ pub async fn run(
             }
         };
         wait_spinner.finish_and_clear();
+        had_session = true;
 
         spawn_stream(
             &mut set,
@@ -319,29 +339,49 @@ pub async fn run(
         )),
     );
 
-    // If connection 0 finished/failed during the select! above, check its result first.
-    if let Some(res) = first_task_result {
-        match res {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                return Err(anyhow::Error::new(e).context("transfer session"));
+    // If connection 0 finished/failed during the select! above, fold its
+    // result into the round's error handling below instead of bailing:
+    // in direct mode a failed session must retry, not exit.
+    let mut round_error: Option<anyhow::Error> = match first_task_result {
+        Some(Ok(Ok(()))) => None,
+        Some(Ok(Err(e))) => Some(anyhow::Error::new(e).context("transfer session")),
+        Some(Err(e)) => Some(anyhow::Error::new(e).context("transfer task")),
+        None => None,
+    };
+
+    while round_error.is_none() {
+        match set.join_next().await {
+            Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(e))) => {
+                round_error = Some(anyhow::Error::new(e).context("transfer session"));
+                break;
             }
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context("transfer task"));
+            Some(Err(e)) => {
+                round_error = Some(anyhow::Error::new(e).context("transfer task"));
+                break;
             }
+            None => break,
         }
     }
 
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                return Err(anyhow::Error::new(e).context("transfer session"));
+    match round_error {
+        None => completed = true,
+        Some(e) => {
+            if relay.is_some() {
+                return Err(e);
             }
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context("transfer task"));
-            }
+            // Direct mode: failed session — keep the port open and let
+            // the receiver's retry loop reconnect and resume.
+            warn!(?e, "session ended with error; waiting for reconnection");
+            eprintln!(
+                "  {} {} {} {}",
+                ui::red(ui::fail_sym()),
+                ui::dim("session failed:"),
+                ui::red(&format!("{e}")),
+                ui::dim("(keeping the port open for reconnection)"),
+            );
         }
+    }
     }
 
     if let Some(h) = disc {
