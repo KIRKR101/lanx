@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: ".exe"
+            archive: zip
+          - os: macos-14
+            target: aarch64-apple-darwin
+            suffix: ""
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd target/release
+          bin="lanx${{ matrix.suffix }}"
+          name="lanx-${{ github.ref_name }}-${{ matrix.target }}"
+          case "${{ matrix.archive }}" in
+            zip)   tar -a -c -f "${name}.zip" "$bin" ;;
+            tar.gz) tar -czf "${name}.tar.gz" "$bin" ;;
+          esac
+          shasum -a 256 "$bin" > "${name}.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanx-${{ matrix.target }}
+          path: |
+            target/release/lanx-${{ github.ref_name }}-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz, artifacts/**/*.zip, artifacts/**/*.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
