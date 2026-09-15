@@ -34,7 +34,7 @@ pub enum DiscoveryError {
     Postcard(#[from] postcard::Error),
 }
 
-/// Short wordlist — kept inline to avoid an extra build step.
+/// Short wordlist (kept inline to avoid an extra build step)
 /// 197 unique words, ~7.6 bits of entropy per word.
 /// (10 digits × 197 × 197 = 388,090 possible codes, ~18.6 bits total.)
 const WORDS: &[&str] = &[
