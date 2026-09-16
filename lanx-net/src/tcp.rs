@@ -1,4 +1,4 @@
-//! TCP listener and dial helpers. `listen` picks an ephemeral port and
+//! TCP listener and dial helpers. `pick_port` picks an ephemeral port and
 //! returns the listener plus its bound address. `listen_default` tries
 //! the stable service port first so firewall rules stay writable,
 //! falling back to an ephemeral port only on `AddrInUse`.
@@ -9,12 +9,15 @@ use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
-/// Stable sender port: IANA User Ports range (1024–49151), below the
-/// Linux default ephemeral floor (32768) and outside IANA Dynamic/Private
-/// (49152–65535). Verified unassigned for TCP+UDP in the IANA registry
-/// (no neighbours assigned in 29315–29325) and absent from
-/// `/etc/services`. Discovery stays on UDP 53317; relay binds stay on
-/// 53318/53319 (compat — not renumbered here).
+/// Stable sender port: IANA User Ports range (1024-49151) per RFC6335,
+/// below the Linux default ephemeral floor (32768) and outside the IANA
+/// Dynamic range (49152-65535). Checked against
+/// https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.txt
+/// (2026-09-11): no entry for 29320 and none in 29315-29325; nearest
+/// assigned are 29169 and 29999. Unassigned is not a reservation, so the
+/// bind still falls back to ephemeral on `AddrInUse`.
+/// Discovery stays on UDP 53317; relay binds stay on 53318/53319
+/// (compat — not renumbered here).
 pub const DEFAULT_SEND_PORT: u16 = 29320;
 
 #[derive(Debug, Error)]
@@ -34,15 +37,6 @@ pub async fn pick_port() -> Result<(TcpListener, SocketAddr), TcpError> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let addr = listener.local_addr()?;
     Ok((listener, addr))
-}
-
-/// Shorthand for `pick_port()`.
-///
-/// # Errors
-///
-/// Returns `TcpError::Io` if the listener cannot be bound.
-pub async fn listen() -> Result<(TcpListener, SocketAddr), TcpError> {
-    pick_port().await
 }
 
 /// Try `port` on the wildcard interface; on `AddrInUse` fall back to an

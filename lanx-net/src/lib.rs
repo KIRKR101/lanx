@@ -12,6 +12,4 @@ pub mod tcp;
 
 pub use discovery::{code_to_hash, generate_code, DiscoveryHandle};
 pub use pairing::{resolve_target, Target};
-pub use tcp::{
-    listen, listen_default, listen_preferred, pick_port, GracefulListener, DEFAULT_SEND_PORT,
-};
+pub use tcp::{listen_default, listen_preferred, pick_port, GracefulListener, DEFAULT_SEND_PORT};
