@@ -24,6 +24,10 @@ use crate::ui;
 const MANIFEST_PREVIEW_LIMIT: usize = 20;
 const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Cap for re-resolving a pairing code between retries. The first resolve
+/// uses the full discovery timeout; retries use the smaller of the two so
+/// five attempts cannot stall for minutes on discovery alone.
+const RERESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Configuration for one receiver connection in a retry attempt.
 
@@ -152,20 +156,18 @@ pub async fn run(
         parallel,
         agreed_parallel_tx: Some(agreed_tx),
     };
-    let mut first_iteration = true;
     loop {
-        if !retry_forever {
-            attempt += 1;
-        }
+        attempt += 1;
 
         // Re-resolve pairing codes before retries (not before the first
         // attempt, which already resolved above). Direct mode only; relay
         // mode has a fixed relay address. On re-resolve failure keep the
         // last address so a transient discovery gap doesn't abort retries.
-        if !first_iteration {
+        if attempt > 1 {
             if let (Some(code), None) = (&code_for_rediscovery, &relay_addr) {
                 let s = ui::spinner(&format!("re-resolving sender{}", ui::ellipsis()));
-                let r = resolve_target(Target::Code(code.clone()), discovery_timeout).await;
+                let reresolve_timeout = discovery_timeout.min(RERESOLVE_TIMEOUT);
+                let r = resolve_target(Target::Code(code.clone()), reresolve_timeout).await;
                 s.finish_and_clear();
                 match r {
                     Ok(new_addr) => {
@@ -202,7 +204,6 @@ pub async fn run(
                 }
             }
         }
-        first_iteration = false;
         let mut set = tokio::task::JoinSet::new();
         // Spawn connection 0
         {
@@ -264,10 +265,7 @@ pub async fn run(
                 );
                 if attempt >= max_attempts {
                     eprintln!("  {} {}", ui::red(ui::fail_sym()), ui::red("giving up"));
-                    return Err(e.context(format!(
-                        "failed after {} attempt(s)",
-                        attempt.saturating_sub(1)
-                    )));
+                    return Err(e.context(format!("failed after {attempt} attempt(s)")));
                 }
                 let backoff = Duration::from_secs((1u64 << attempt.min(4)).min(8));
                 let max_label = if retry_forever {
