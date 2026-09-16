@@ -44,6 +44,70 @@ pub async fn list_non_loopback_v4() -> Vec<Ipv4Addr> {
         })
 }
 
+/// Enumerate directed-broadcast addresses for all usable IPv4 interfaces.
+///
+/// Uses the OS-provided broadcast address from `getifaddrs` when
+/// available, falling back to `ip | !netmask` when the OS does not
+/// report one. Loopback, unspecified, down, and link-local interfaces
+/// are skipped. The returned list never contains duplicates.
+pub fn broadcast_addrs_sync() -> Vec<Ipv4Addr> {
+    let res = if_addrs::get_if_addrs();
+    let Ok(ifaces) = res else {
+        tracing::warn!(error = ?res.err(), "interface enumeration failed");
+        return vec![Ipv4Addr::BROADCAST];
+    };
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for iface in ifaces {
+        let if_addrs::IfAddr::V4(v4) = &iface.addr else {
+            continue;
+        };
+        if v4.ip.is_loopback() || v4.ip.is_unspecified() || v4.ip.is_link_local() {
+            continue;
+        }
+        if iface.oper_status != if_addrs::IfOperStatus::Up
+            && iface.oper_status != if_addrs::IfOperStatus::Unknown
+        {
+            continue;
+        }
+        if let Some(bcast) = v4.broadcast {
+            if !bcast.is_unspecified() && !bcast.is_loopback() {
+                out.push(bcast);
+                continue;
+            }
+        }
+        // Fallback: compute from netmask (ip | !mask). A zero netmask
+        // means the OS gave us nothing usable — skip it.
+        let mask = u32::from(v4.netmask);
+        if mask == 0 {
+            continue;
+        }
+        let bcast = Ipv4Addr::from(u32::from(v4.ip) | !mask);
+        if !bcast.is_unspecified() && !bcast.is_loopback() {
+            out.push(bcast);
+        }
+    }
+    out.sort();
+    out.dedup();
+    // Always include limited broadcast as a last resort: it reaches the
+    // local link even when our netmask/broadcast computation is wrong
+    // (VPNs, odd masks, AP isolation quirks), and it is what makes
+    // same-host testing work.
+    if !out.contains(&Ipv4Addr::BROADCAST) {
+        out.push(Ipv4Addr::BROADCAST);
+    }
+    out
+}
+
+/// Async wrapper: runs `broadcast_addrs_sync` on the blocking pool.
+pub async fn broadcast_addrs() -> Vec<Ipv4Addr> {
+    tokio::task::spawn_blocking(broadcast_addrs_sync)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "interface enumeration task panicked");
+            vec![Ipv4Addr::BROADCAST]
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +121,29 @@ mod tests {
             assert!(!ip.is_loopback(), "loopback leaked: {ip}");
             assert!(!ip.is_unspecified(), "unspecified leaked: {ip}");
         }
+    }
+
+    #[test]
+    fn broadcast_targets_always_include_limited_broadcast() {
+        // Regression: discovery used to send only to heuristic directed
+        // broadcasts and omitted 255.255.255.255, breaking Linux↔Mac
+        // pairing when the heuristic guessed the wrong subnet.
+        let addrs = broadcast_addrs_sync();
+        assert!(
+            addrs.contains(&Ipv4Addr::BROADCAST),
+            "limited broadcast missing: {addrs:?}"
+        );
+        for ip in &addrs {
+            assert!(!ip.is_loopback(), "loopback leaked: {ip}");
+            assert!(!ip.is_unspecified(), "unspecified leaked: {ip}");
+        }
+        let mut sorted = addrs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, {
+            let mut a = addrs.clone();
+            a.sort();
+            a
+        });
     }
 }

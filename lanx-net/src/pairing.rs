@@ -27,6 +27,7 @@ pub enum TargetError {
 /// Returns `TargetError::InvalidAddr` if `s` is not a valid `ip:port`
 /// and does not look like a pairing code.
 pub fn parse_target(s: &str) -> Result<Target, TargetError> {
+    let s = s.trim();
     if let Ok(addr) = s.parse::<SocketAddr>() {
         return Ok(Target::Addr(addr));
     }
@@ -37,7 +38,9 @@ pub fn parse_target(s: &str) -> Result<Target, TargetError> {
 }
 
 fn looks_like_code(s: &str) -> bool {
+    // Trimmed by caller; also trim here defensively for direct callers.
     // Format: digit-word-word (3 dash-separated segments, last two are words).
+    let s = s.trim();
     let parts: Vec<_> = s.split('-').collect();
     if parts.len() != 3 {
         return false;
@@ -124,5 +127,17 @@ mod tests {
         // looks_like_code intentionally validates format only, not wordlist
         // membership. Discovery will time out if no sender matches.
         assert!(matches!(parse_target("7-hello-world"), Ok(Target::Code(_))));
+    }
+
+    #[test]
+    fn surrounding_whitespace_trimmed() {
+        assert!(matches!(
+            parse_target("  7-cobalt-fox\n"),
+            Ok(Target::Code(_))
+        ));
+        assert!(matches!(
+            parse_target("  192.168.1.1:51234  "),
+            Ok(Target::Addr(_))
+        ));
     }
 }

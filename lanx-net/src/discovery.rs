@@ -28,7 +28,11 @@ struct Announce {
 pub enum DiscoveryError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("timed out waiting for sender")]
+    #[error(
+        "timed out waiting for sender (no matching broadcast on UDP port {DISCOVERY_PORT}); \
+         make sure both machines are on the same network, check firewalls for UDP {DISCOVERY_PORT}, \
+         or connect directly with `lanx recv <ip:port>` shown on the sender"
+    )]
     Timeout,
     #[error("postcard: {0}")]
     Postcard(#[from] postcard::Error),
@@ -75,17 +79,24 @@ pub fn generate_code(port: u16) -> String {
     format!("{digit}-{w1}-{w2}")
 }
 
+/// Normalize a pairing code before hashing: trim surrounding
+/// whitespace (copy-paste artifacts) and lowercase for
+/// case-insensitive pairing.
+fn normalize_code(code: &str) -> String {
+    code.trim().to_lowercase()
+}
+
 /// The hash receivers compare against announcements.
 ///
-/// BLAKE3 hashes the code string to produce a 32-byte digest. The sender
-/// announces the hash; the receiver hashes the entered code locally and
-/// compares. The code is lowercased before hashing to ensure
-/// case-insensitive pairing (e.g. "7-Cobalt-Fox" and "7-cobalt-fox"
-/// produce the same hash).
+/// BLAKE3 hashes the normalized code string to produce a 32-byte
+/// digest. The sender announces the hash; the receiver hashes the
+/// entered code locally and compares. Normalization (trim +
+/// lowercase) ensures case-insensitive pairing (e.g. "7-Cobalt-Fox"
+/// and "  7-cobalt-fox\n" produce the same hash).
 #[must_use]
 pub fn code_to_hash(code: &str) -> [u8; 32] {
-    let lowered = code.to_lowercase();
-    let h = blake3::hash(lowered.as_bytes());
+    let normalized = normalize_code(code);
+    let h = blake3::hash(normalized.as_bytes());
     let mut out = [0u8; 32];
     out.copy_from_slice(h.as_bytes());
     out
@@ -252,52 +263,11 @@ pub async fn discover(
 }
 
 async fn broadcast_addrs() -> Vec<Ipv4Addr> {
-    // Best-effort: get all interface IPv4 addrs and form broadcast addrs
-    // by setting the host portion. If we can't enumerate, fall back to
-    // limited broadcast.
-    let mut out = Vec::new();
-    let addrs = crate::interfaces::list_non_loopback_v4().await;
-    if addrs.is_empty() {
-        out.push(Ipv4Addr::BROADCAST);
-    } else {
-        for ip in addrs {
-            if let Some(bcast) = ipv4_broadcast(ip) {
-                out.push(bcast);
-            } else {
-                out.push(Ipv4Addr::BROADCAST);
-            }
-        }
-    }
-    out
-}
-
-/// Compute a broadcast address for a host IP. Uses the most common
-/// private-range subnet masks rather than assuming /24. Falls back to
-/// limited broadcast (255.255.255.255) for public or unrecognized ranges.
-///
-/// Note: This is best-effort for a LAN discovery tool. For exact subnet
-/// mask information, the OS routing table or netlink would be needed,
-/// which is out of scope for a zero-configuration pairing tool.
-fn ipv4_broadcast(host: Ipv4Addr) -> Option<Ipv4Addr> {
-    if host.is_loopback() {
-        return None;
-    }
-    let o = host.octets();
-    match o[0] {
-        // 10.0.0.0/8 — most real-world deployments use /24 subnets
-        // (e.g. 10.0.1.0/24). Using the third octet as the subnet
-        // address covers the common case. A /8 broadcast to
-        // 10.255.255.255 would not reach hosts on a /24 subnet.
-        10 => Some(Ipv4Addr::new(10, o[1], o[2], 255)),
-        // 172.16.0.0/12 — class B private range, typically /12 or /16
-        172 if (16..=31).contains(&o[1]) => Some(Ipv4Addr::new(172, 31, 255, 255)),
-        // 192.168.0.0/16 — class C private range, most commonly /24
-        192 if o[1] == 168 => Some(Ipv4Addr::new(192, 168, o[2], 255)),
-        // 169.254.0.0/16 — link-local, typically /16
-        169 if o[1] == 254 => Some(Ipv4Addr::new(169, 254, 255, 255)),
-        // Public or unrecognized: use limited broadcast as fallback.
-        _ => Some(Ipv4Addr::BROADCAST),
-    }
+    // Use OS-reported directed broadcasts (via getifaddrs netmask) plus
+    // limited broadcast. The old class-based heuristic guessed wrong
+    // subnets (e.g. 172.20.x.x → 172.31.255.255) and omitted
+    // 255.255.255.255, which broke Linux↔Mac discovery.
+    crate::interfaces::broadcast_addrs().await
 }
 
 #[cfg(test)]
@@ -319,20 +289,12 @@ mod tests {
         assert_eq!(code_to_hash("7-cobalt-fox"), code_to_hash("7-cobalt-fox"));
     }
     #[test]
-    fn broadcast_excludes_loopback() {
-        assert!(ipv4_broadcast(Ipv4Addr::new(127, 0, 0, 1)).is_none());
-        assert!(ipv4_broadcast(Ipv4Addr::new(192, 168, 1, 5)).is_some());
-        let b = ipv4_broadcast(Ipv4Addr::new(10, 0, 1, 42)).unwrap();
-        assert_eq!(b, Ipv4Addr::new(10, 0, 1, 255));
-        // 172.16-31.x.x → 172.31.255.255 (class B private)
-        let b = ipv4_broadcast(Ipv4Addr::new(172, 20, 3, 9)).unwrap();
-        assert_eq!(b, Ipv4Addr::new(172, 31, 255, 255));
-        // 192.168.x.x → 192.168.x.255 (class C)
-        let b = ipv4_broadcast(Ipv4Addr::new(192, 168, 5, 100)).unwrap();
-        assert_eq!(b, Ipv4Addr::new(192, 168, 5, 255));
-        // Public IP → limited broadcast
-        let b = ipv4_broadcast(Ipv4Addr::new(8, 8, 8, 8)).unwrap();
-        assert_eq!(b, Ipv4Addr::BROADCAST);
+    fn hash_normalizes_case_and_whitespace() {
+        assert_eq!(code_to_hash("7-cobalt-fox"), code_to_hash("7-Cobalt-Fox"));
+        assert_eq!(
+            code_to_hash("7-cobalt-fox"),
+            code_to_hash("  7-cobalt-fox\n")
+        );
     }
     #[test]
     fn wordlist_unique() {
