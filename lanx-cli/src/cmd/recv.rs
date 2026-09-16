@@ -291,34 +291,38 @@ pub async fn run(
     }
 }
 
+/// Hint shown when a TCP connect times out. Kept in one place so the
+/// `ufw` text cannot drift from the README.
+fn firewall_hint(cfg: &TryOnceConfig) -> String {
+    if cfg.relay_addr.is_none() && cfg.addr.port() != DEFAULT_SEND_PORT {
+        format!(
+            "connect {} timed out: the sender is listening on {} for this transfer \
+             (not the default port {DEFAULT_SEND_PORT}, so the stable firewall rule \
+             does not cover it) — on the sender, allow that TCP port \
+             (e.g. `sudo ufw allow {}/tcp`), or restart the sender on the default port \
+             and retry",
+            cfg.addr,
+            cfg.addr.port(),
+            cfg.addr.port(),
+        )
+    } else {
+        format!(
+            "connect {} timed out: the sender is not accepting TCP (host firewall?) — \
+             on the sender, allow the port (e.g. `sudo ufw allow {}/tcp`), \
+             or pin it with `lanx send --port N` and allow that",
+            cfg.addr,
+            cfg.addr.port(),
+        )
+    }
+}
+
 async fn try_once(
     cfg: &TryOnceConfig,
     connection_index: u16,
 ) -> Result<lanx_core::transfer::receiver::ReceiverReport> {
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&cfg.addr))
         .await
-        .with_context(|| {
-            if cfg.relay_addr.is_none() && cfg.addr.port() != DEFAULT_SEND_PORT {
-                format!(
-                    "connect {} timed out: the sender is listening on {} for this transfer \
-                     (not the default port {DEFAULT_SEND_PORT}, so the stable firewall rule \
-                     does not cover it) — on the sender, allow that TCP port \
-                     (e.g. `sudo ufw allow {}/tcp`), or restart the sender on the default port \
-                     and retry",
-                    cfg.addr,
-                    cfg.addr.port(),
-                    cfg.addr.port(),
-                )
-            } else {
-                format!(
-                    "connect {} timed out: the sender is not accepting TCP (host firewall?) — \
-                     on the sender, allow the port (e.g. `sudo ufw allow {}/tcp`), \
-                     or pin it with `lanx send --port N` and allow that",
-                    cfg.addr,
-                    cfg.addr.port(),
-                )
-            }
-        })?
+        .with_context(|| firewall_hint(cfg))?
         .with_context(|| format!("connect {}", cfg.addr))?;
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(?e, "TCP_NODELAY failed");

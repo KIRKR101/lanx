@@ -160,8 +160,10 @@ pub async fn run(
             ui::yellow("!"),
             ui::yellow(&format!(
                 "default port {DEFAULT_SEND_PORT} busy; using ephemeral {} — \
-                 the stable firewall rule does not cover this run",
-                addr.port()
+                 run `sudo ufw allow {}/tcp` on this machine or free \
+                 {DEFAULT_SEND_PORT} and retry",
+                addr.port(),
+                addr.port(),
             )),
         );
     }
@@ -246,7 +248,8 @@ pub async fn run(
                 for ip in &addrs[1..] {
                     eprintln!("{indent}{ip}:{}", addr.port());
                 }
-                // Copy-pasteable receiver command per reachable interface.
+                // Copy-pasteable receiver command per reachable interface,
+                // plus loopback so every listen address has a recv match.
                 ui::kv(
                     "recv",
                     &format!("lanx recv {}:{}", addrs[0], addr.port()),
@@ -255,12 +258,12 @@ pub async fn run(
                 for ip in &addrs[1..] {
                     eprintln!("{indent}lanx recv {ip}:{}", addr.port());
                 }
+                eprintln!(
+                    "{indent}lanx recv 127.0.0.1:{} {}",
+                    addr.port(),
+                    ui::dim("(loopback)"),
+                );
             }
-            eprintln!(
-                "{indent}127.0.0.1:{} {}",
-                addr.port(),
-                ui::dim("(loopback)"),
-            );
             eprintln!();
 
             if !no_discovery {
