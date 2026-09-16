@@ -35,7 +35,8 @@ enum Command {
         /// the folder structure.
         #[arg(long)]
         zip: bool,
-        /// Port to listen on (default: random ephemeral port).
+        /// Port to listen on (default: stable 29320; falls back to an
+        /// ephemeral port if busy; explicit values fail if taken).
         #[arg(long)]
         port: Option<u16>,
         /// Number of parallel TCP connections to use.

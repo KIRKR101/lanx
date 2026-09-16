@@ -2,10 +2,12 @@
 //!
 //! Wire format: on UDP port 53317, send a small postcard-encoded packet
 //! containing `{port: u16, code_hash: [u8; 32]}`.
-//! Receivers filter by `code_hash`. The pairing code embeds the last
-//! digit of the port as a lightweight UX hint, but this is *not*
-//! security — the full port is broadcast in the clear and the code is
-//! easily brute-forced. Encryption is a v2 concern (plan §1).
+//! Receivers filter by `code_hash`. The pairing code starts with a random
+//! cosmetic digit (diagnostic discriminator only) followed by two words;
+//! this is *not* security — the full port is broadcast in the clear and
+//! the code is easily brute-forced. Encryption is a v2 concern (plan §1).
+//! The digit is intentionally decoupled from the port so a stable service
+//! port does not pin every code to the same leading digit.
 
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -64,12 +66,15 @@ const WORDS: &[&str] = &[
     "vale", "vole", "wasp",
 ];
 
-/// Build a code of the form `digit-word-word`. The `digit` is derived
-/// from the port; the two words come from a small wordlist.
+/// Build a code of the form `digit-word-word`. The `digit` is a random
+/// 0–9 discriminator (preserves the established format; old port-derived
+/// codes still parse because any single ASCII digit validates). The two
+/// words come from a small wordlist.
 #[must_use]
-pub fn generate_code(port: u16) -> String {
+pub fn generate_code() -> String {
+    use rand::Rng;
     let mut rng = rand::thread_rng();
-    let digit = (port % 10).to_string();
+    let digit: u8 = rng.gen_range(0..10);
     let w1 = WORDS
         .choose(&mut rng)
         .expect("WORDS is non-empty (compile-time const)");
@@ -192,8 +197,7 @@ pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<Discov
         }
         Err(_) => {
             // Task panicked during startup.
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "discovery task failed during startup",
             ))
         }
@@ -275,14 +279,13 @@ mod tests {
     use super::*;
     #[test]
     fn code_format() {
-        let port: u16 = 51234;
-        let c = generate_code(port);
+        let c = generate_code();
         let parts: Vec<_> = c.split('-').collect();
         assert_eq!(parts.len(), 3);
-        // Digit must be a single ASCII digit matching port % 10.
-        let expected_digit = (port % 10).to_string();
-        assert_eq!(parts[0], expected_digit);
-        assert!(parts[0].len() == 1 && parts[0].chars().next().unwrap().is_ascii_digit());
+        // Digit is a random single ASCII digit (format only, not port-derived).
+        assert_eq!(parts[0].len(), 1);
+        assert!(parts[0].chars().next().unwrap().is_ascii_digit());
+        assert!(!parts[1].is_empty() && !parts[2].is_empty());
     }
     #[test]
     fn hash_stable() {

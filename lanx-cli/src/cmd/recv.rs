@@ -11,6 +11,7 @@ use lanx_core::transfer::DEFAULT_MAX_RETRIES;
 use lanx_net::discovery::code_to_hash;
 use lanx_net::pairing::{parse_target, resolve_target, Target};
 use lanx_net::relay::{send_relay_hello, RelayHello, RelayRole};
+use lanx_net::tcp::DEFAULT_SEND_PORT;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use crate::ui;
 
 const MANIFEST_PREVIEW_LIMIT: usize = 20;
 const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Configuration for one receiver connection in a retry attempt.
 
@@ -73,6 +75,16 @@ pub async fn run(
     }
     let code_hash = match &parsed {
         Target::Code(code) => Some(code_to_hash(code)),
+        _ => None,
+    };
+
+    // Keep the code for re-resolution on retries: a sender can restart
+    // onto another port (stable port occupied, --port changed), which
+    // would otherwise leave the retry loop chasing a stale SocketAddr
+    // forever. Target::Addr retries the same address; Target::Code
+    // re-resolves before each retry after the first.
+    let code_for_rediscovery: Option<String> = match &parsed {
+        Target::Code(code) => Some(code.clone()),
         _ => None,
     };
 
@@ -130,21 +142,67 @@ pub async fn run(
     let max_attempts: u32 = if retry_forever { u32::MAX } else { 5 };
     let mut attempt: u32 = 0;
     let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
-    let try_cfg = TryOnceConfig {
+    let mut try_cfg = TryOnceConfig {
         addr,
         relay_addr: relay_addr.clone(),
         code_hash,
-        out,
+        out: out.clone(),
         approver,
         progress: progress.clone(),
         parallel,
         agreed_parallel_tx: Some(agreed_tx),
     };
+    let mut first_iteration = true;
     loop {
         if !retry_forever {
             attempt += 1;
         }
 
+        // Re-resolve pairing codes before retries (not before the first
+        // attempt, which already resolved above). Direct mode only; relay
+        // mode has a fixed relay address. On re-resolve failure keep the
+        // last address so a transient discovery gap doesn't abort retries.
+        if !first_iteration {
+            if let (Some(code), None) = (&code_for_rediscovery, &relay_addr) {
+                let s = ui::spinner(&format!("re-resolving sender{}", ui::ellipsis()));
+                let r = resolve_target(Target::Code(code.clone()), discovery_timeout).await;
+                s.finish_and_clear();
+                match r {
+                    Ok(new_addr) => {
+                        if new_addr != try_cfg.addr {
+                            eprintln!(
+                                "  {} sender {}",
+                                ui::dim("update"),
+                                ui::bold(&new_addr.to_string()),
+                            );
+                            try_cfg.addr = new_addr;
+                            // Refresh the prompt label to the new address.
+                            if !accept {
+                                let base: Arc<dyn ManifestApprover> = Arc::new(StdinApprover {
+                                    sender: new_addr.to_string(),
+                                    out_dir: out.clone(),
+                                });
+                                try_cfg.approver = if parallel > 1 {
+                                    SharedApprover::new(base)
+                                } else {
+                                    base
+                                };
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  {} {} ({}; retrying {})",
+                            ui::yellow(ui::retry_sym()),
+                            ui::dim("re-discovery failed"),
+                            e,
+                            try_cfg.addr,
+                        );
+                    }
+                }
+            }
+        }
+        first_iteration = false;
         let mut set = tokio::task::JoinSet::new();
         // Spawn connection 0
         {
@@ -237,8 +295,30 @@ async fn try_once(
     cfg: &TryOnceConfig,
     connection_index: u16,
 ) -> Result<lanx_core::transfer::receiver::ReceiverReport> {
-    let mut stream = TcpStream::connect(&cfg.addr)
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&cfg.addr))
         .await
+        .with_context(|| {
+            if cfg.relay_addr.is_none() && cfg.addr.port() != DEFAULT_SEND_PORT {
+                format!(
+                    "connect {} timed out: the sender is listening on {} for this transfer \
+                     (not the default port {DEFAULT_SEND_PORT}, so the stable firewall rule \
+                     does not cover it) — on the sender, allow that TCP port \
+                     (e.g. `sudo ufw allow {}/tcp`), or restart the sender on the default port \
+                     and retry",
+                    cfg.addr,
+                    cfg.addr.port(),
+                    cfg.addr.port(),
+                )
+            } else {
+                format!(
+                    "connect {} timed out: the sender is not accepting TCP (host firewall?) — \
+                     on the sender, allow the port (e.g. `sudo ufw allow {}/tcp`), \
+                     or pin it with `lanx send --port N` and allow that",
+                    cfg.addr,
+                    cfg.addr.port(),
+                )
+            }
+        })?
         .with_context(|| format!("connect {}", cfg.addr))?;
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(?e, "TCP_NODELAY failed");

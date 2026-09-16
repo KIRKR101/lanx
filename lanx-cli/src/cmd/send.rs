@@ -6,7 +6,7 @@ use lanx_core::transfer::sender::{run_sender, SenderConfig};
 use lanx_core::transfer::DEFAULT_MAX_RETRIES;
 use lanx_net::discovery::{code_to_hash, generate_code, start_broadcasting};
 use lanx_net::relay::{send_relay_hello, RelayHello, RelayRole};
-use lanx_net::tcp::{listen, GracefulListener};
+use lanx_net::tcp::{listen_default, GracefulListener, DEFAULT_SEND_PORT};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -133,25 +133,38 @@ pub async fn run(
         sources.insert(f.id, src_path);
     }
 
-    // Generate a pairing code from an ephemeral port. When using a relay,
-    // we still generate a code for display, but the actual connection goes
-    // through the relay.
-    let (listener, addr) = match port {
+    // Bind the sender port. Default: stable service port so firewall
+    // rules stay writable; fall back to ephemeral only on AddrInUse.
+    // Explicit --port pins hard (fails if taken). When using a relay,
+    // we still generate a code for display, but the actual connection
+    // goes through the relay.
+    let (listener, addr, fell_back) = match port {
         Some(p) => {
             let listener = tokio::net::TcpListener::bind(("0.0.0.0", p))
                 .await
                 .with_context(|| format!("bind to port {p}"))?;
             let addr = listener.local_addr()?;
-            (listener, addr)
+            (listener, addr, false)
         }
-        None => listen().await?,
+        None => listen_default().await?,
     };
-    let code = generate_code(addr.port());
+    let code = generate_code();
     let code_hash = code_to_hash(&code);
 
     eprintln!();
     let label_w = 7;
     ui::kv("code", &ui::bold(&code), label_w);
+    if fell_back && relay.is_none() {
+        eprintln!(
+            "  {} {}",
+            ui::yellow("!"),
+            ui::yellow(&format!(
+                "default port {DEFAULT_SEND_PORT} busy; using ephemeral {} — \
+                 the stable firewall rule does not cover this run",
+                addr.port()
+            )),
+        );
+    }
 
     let parallel = parallel.max(1);
     crate::cmd::validate_parallel_relay(parallel, &relay)?;
@@ -223,10 +236,24 @@ pub async fn run(
             let indent = " ".repeat(label_w + 1);
             if addrs.is_empty() {
                 ui::kv("listen", &format!("0.0.0.0:{}", addr.port()), label_w);
+                ui::kv(
+                    "recv",
+                    &format!("lanx recv 127.0.0.1:{}", addr.port()),
+                    label_w,
+                );
             } else {
                 ui::kv("listen", &format!("{}:{}", addrs[0], addr.port()), label_w);
                 for ip in &addrs[1..] {
                     eprintln!("{indent}{ip}:{}", addr.port());
+                }
+                // Copy-pasteable receiver command per reachable interface.
+                ui::kv(
+                    "recv",
+                    &format!("lanx recv {}:{}", addrs[0], addr.port()),
+                    label_w,
+                );
+                for ip in &addrs[1..] {
+                    eprintln!("{indent}lanx recv {ip}:{}", addr.port());
                 }
             }
             eprintln!(

@@ -45,8 +45,9 @@ fn looks_like_code(s: &str) -> bool {
     if parts.len() != 3 {
         return false;
     }
-    // Digit must be a single ASCII digit (0-9), matching the format
-    // `port % 10` used by generate_code.
+    // Digit must be a single ASCII digit (0-9). Historically derived
+    // from `port % 10`; now a random discriminator — any digit validates
+    // so old codes keep working.
     if parts[0].len() != 1 || !parts[0].chars().next().unwrap().is_ascii_digit() {
         return false;
     }
