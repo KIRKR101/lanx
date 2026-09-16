@@ -27,6 +27,7 @@ use lanx_core::progress::{Progress, TransferKind, TransferSummary};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// All mutable progress state is held under a single mutex so the UI is
 /// safe when multiple TCP connections report events concurrently.
@@ -53,6 +54,26 @@ struct RenderState {
     failed: u64,
     /// Number of files skipped (already present).
     skipped: u64,
+    /// Last printed percent per file in non-animated mode, so piped
+    /// logs get one line per 10% bucket instead of one per chunk.
+    last_pct: HashMap<FileId, u32>,
+}
+
+/// How often an in-flight file line re-renders on an animated
+/// terminal. Chunk events can arrive hundreds of times per second;
+/// faster than this the line just flickers and wastes SSH bandwidth.
+const RENDER_THROTTLE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Percent step between printed lines in non-animated mode (piped
+/// output, dumb terminals). Start/finish lines always print.
+const PLAIN_PCT_STEP: u32 = 10;
+
+/// Pure helper behind the non-animated print gate, unit tested below.
+fn should_print_plain(last: u32, pct: u32, done: bool) -> bool {
+    if done {
+        return true;
+    }
+    pct >= 100 || pct >= last.saturating_add(PLAIN_PCT_STEP)
 }
 
 /// Per-file state used to render a single line per file.
@@ -70,6 +91,8 @@ struct FileState {
     skipped: bool,
     /// Throughput tracker, seeded with the resume offset at `started`.
     rate: ui::Rate,
+    /// Last time this file's line was drawn on an animated terminal.
+    last_render: Instant,
 }
 
 /// Transfer progress UI for both sender and receiver.
@@ -122,6 +145,7 @@ impl IndicatifProgress {
                 verified: 0,
                 failed: 0,
                 skipped: 0,
+                last_pct: HashMap::new(),
             }),
         })
     }
@@ -190,6 +214,22 @@ impl IndicatifProgress {
 
         let pct = ui::percent(bytes, total);
 
+        // Without animation (piped logs, dumb terminals) every chunk
+        // would become its own log line. Start lines (`fresh_line`)
+        // and finish lines always print; in-between lines print per
+        // 10% bucket only.
+        if !ui::animated() && !fresh_line && !skipped {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let last = st.last_pct.get(&id).copied().unwrap_or(0);
+            if !should_print_plain(last, pct, done) {
+                return;
+            }
+            st.last_pct.insert(id, pct);
+        }
+
         let mut line = String::new();
         line.push_str(&prefix);
         line.push_str(&ui::pad_visible(&label, label_max));
@@ -247,10 +287,12 @@ impl IndicatifProgress {
 
         let stderr = std::io::stderr();
         let mut handle = stderr.lock();
-        if ui::is_tty() {
+        if ui::animated() {
             // Erase the previous render before writing the new one.
             // `\r` alone leaves stale characters when the line shrank;
-            // ESC[2K clears from the cursor to end of line.
+            // ESC[2K clears from the cursor to end of line. Dumb
+            // terminals take the plain-line path below instead: they
+            // may not understand either sequence.
             if !fresh_line {
                 let _ = handle.write_all(b"\r");
                 let _ = handle.write_all(b"\x1b[2K");
@@ -258,8 +300,9 @@ impl IndicatifProgress {
             let _ = write!(handle, "{line}");
             let _ = handle.flush();
         } else {
-            // Not a terminal (redirected/piped output): print each
-            // state as its own plain line. No carriage returns, no
+            // Not animated (redirected/piped output, dumb terminal):
+            // print each state as its own plain line. No carriage
+            // returns, no padding, no ANSI - keeps logs greppable.
             // padding, no ANSI - keeps logs greppable.
             let _ = writeln!(handle, "{}", ui::strip_ansi(&line).trim_end());
         }
@@ -302,6 +345,7 @@ impl Progress for IndicatifProgress {
                 ok: false,
                 skipped: false,
                 rate: ui::Rate::new(offset),
+                last_render: Instant::now(),
             },
         );
         // Fresh line for each new file. When multiple connections are
@@ -312,18 +356,38 @@ impl Progress for IndicatifProgress {
     }
 
     fn chunk_done(&self, id: FileId, bytes: u64) {
-        {
+        let should_render = {
             let mut st = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(s) = st.state.get_mut(&id) {
-                s.bytes = s.bytes.saturating_add(bytes);
-                s.rate.observe(s.bytes);
+            match st.state.get_mut(&id) {
+                Some(s) => {
+                    s.bytes = s.bytes.saturating_add(bytes);
+                    s.rate.observe(s.bytes);
+                    // Animated terminals re-draw at most ~8Hz; faster
+                    // than that the line flickers and wastes bandwidth
+                    // (matters over SSH). Plain mode has its own
+                    // percent-bucket gate inside `render_file`.
+                    if ui::animated() {
+                        let now = Instant::now();
+                        if now.duration_since(s.last_render) < RENDER_THROTTLE {
+                            false
+                        } else {
+                            s.last_render = now;
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                }
+                None => false,
             }
+        };
+        if should_render {
+            // Re-render in place.
+            self.render_file(id, false);
         }
-        // Re-render in place.
-        self.render_file(id, false);
     }
 
     fn file_done(&self, id: FileId, ok: bool) {
@@ -358,6 +422,7 @@ impl Progress for IndicatifProgress {
                     ok,
                     skipped: ok,
                     rate: ui::Rate::new(total),
+                    last_render: Instant::now(),
                 },
             );
             if ok {
@@ -396,12 +461,12 @@ impl Progress for IndicatifProgress {
         let total = st.total_bytes;
 
         let head = if failed == 0 {
-            if ui::is_tty() {
+            if ui::animated() {
                 format!("{} {}", ui::green(ui::ok_sym()), ui::green("Done"))
             } else {
                 "Done".to_string()
             }
-        } else if ui::is_tty() {
+        } else if ui::animated() {
             format!("{} {}", ui::red(ui::fail_sym()), ui::red("Done"))
         } else {
             "Done (with failures)".to_string()
@@ -457,5 +522,29 @@ fn truncate_middle(s: &str, max: usize) -> String {
     };
     let head_budget = max.saturating_sub(ext_keep.chars().count() + 1).max(2);
     let prefix: String = base.chars().take(head_budget).collect();
-    format!("{prefix}…{ext_keep}")
+    if ui::use_unicode() {
+        format!("{prefix}…{ext_keep}")
+    } else {
+        format!("{prefix}...{ext_keep}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_gate_prints_start_finish_and_buckets() {
+        // fresh_line (file start) and done (file finish) are handled by
+        // the caller; the gate only covers in-between updates.
+        assert!(should_print_plain(0, 0, true));
+        assert!(should_print_plain(90, 91, true));
+        // Buckets of 10%: 0->9 silent, 0->10 prints.
+        assert!(!should_print_plain(0, 9, false));
+        assert!(should_print_plain(0, 10, false));
+        assert!(!should_print_plain(10, 19, false));
+        assert!(should_print_plain(10, 20, false));
+        // Completion always prints even mid-bucket.
+        assert!(should_print_plain(92, 100, false));
+    }
 }

@@ -25,6 +25,47 @@ pub fn is_tty() -> bool {
     term().is_term()
 }
 
+/// True when `LANX_PLAIN` forces plain output (`1`, `true`, `yes`).
+fn plain_forced() -> bool {
+    match std::env::var("LANX_PLAIN") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        }
+        Err(_) => false,
+    }
+}
+
+/// Pure helper behind [`animated`], kept separate so it can be unit
+/// tested without touching process env.
+fn animated_for(tty: bool, term: Option<&str>, plain: bool) -> bool {
+    if !tty || plain {
+        return false;
+    }
+    match term {
+        // Plain SSH clients, emacs shells, and other minimal
+        // terminals: no cursor addressing, no UTF-8 guarantees.
+        Some("dumb") => false,
+        _ => true,
+    }
+}
+
+/// True when in-place terminal animation is safe: a real TTY that is
+/// not `TERM=dumb`, without `LANX_PLAIN` set. Piped output, dumb
+/// terminals (simple SSH clients), and forced-plain mode all fall back
+/// to one plain line per event so logs stay readable.
+pub fn animated() -> bool {
+    let term = std::env::var("TERM").ok();
+    animated_for(is_tty(), term.as_deref(), plain_forced())
+}
+
+/// True when Unicode glyphs (arrows, checkmarks, block bars) are safe
+/// to emit. Same conditions as [`animated`]: piped or dumb output
+/// gets ASCII fallbacks instead.
+pub fn use_unicode() -> bool {
+    animated()
+}
+
 /// Wrap `s` in a cyan style (used for headings / labels) when color is on.
 pub fn cyan(s: &str) -> String {
     style(s).cyan().bold().for_stderr().to_string()
@@ -56,31 +97,32 @@ pub fn dim(s: &str) -> String {
     style(s).dim().for_stderr().to_string()
 }
 
-/// Status glyphs. ASCII fallbacks when not a TTY so logs remain
-/// plain-text friendly.
+/// Status glyphs. ASCII fallbacks when Unicode is unsafe (piped
+/// output, `TERM=dumb`, `LANX_PLAIN`) so logs remain plain-text
+/// friendly.
 pub fn ok_sym() -> &'static str {
-    if is_tty() {
+    if use_unicode() {
         "✓"
     } else {
         "ok"
     }
 }
 pub fn fail_sym() -> &'static str {
-    if is_tty() {
+    if use_unicode() {
         "✗"
     } else {
         "FAIL"
     }
 }
 pub fn arrow() -> &'static str {
-    if is_tty() {
+    if use_unicode() {
         "→"
     } else {
         "->"
     }
 }
 pub fn retry_sym() -> &'static str {
-    if is_tty() {
+    if use_unicode() {
         "⟳"
     } else {
         "retry"
@@ -89,7 +131,7 @@ pub fn retry_sym() -> &'static str {
 /// Mid-dot separator used in banners. ASCII fallback so non-UTF-8
 /// pipes don't see a replacement character.
 pub fn sep_dot() -> &'static str {
-    if is_tty() {
+    if use_unicode() {
         "·"
     } else {
         "-"
@@ -97,7 +139,7 @@ pub fn sep_dot() -> &'static str {
 }
 /// Em dash used between summary segments.
 pub fn sep_dash() -> &'static str {
-    if is_tty() {
+    if use_unicode() {
         "—"
     } else {
         "-"
@@ -105,7 +147,7 @@ pub fn sep_dash() -> &'static str {
 }
 /// Trailing ellipsis for in-progress messages.
 pub fn ellipsis() -> &'static str {
-    if is_tty() {
+    if use_unicode() {
         "…"
     } else {
         "..."
@@ -133,12 +175,13 @@ pub fn banner(verb: &str, detail: &str) {
 
 /// Usable terminal width (columns) for the progress renderer's line
 /// padding. Falls back to 80 when the width can't be queried (piped
-/// output). Clamps to a minimum of 40 to avoid garbled output on very
-/// narrow terminals.
+/// output) and caps at 120 so very wide windows don't produce giant
+/// padded lines. Returns the real width on narrow terminals (even
+/// below 40) so lines are truncated to what actually fits instead of
+/// wrapping.
 pub fn term_width() -> usize {
     match term().size() {
-        (_, w) if w >= 40 => w as usize,
-        (_, w) if w > 0 => w as usize,
+        (_, w) if w > 0 => (w as usize).min(120),
         _ => 80,
     }
 }
@@ -239,10 +282,10 @@ pub fn percent(done: u64, total: u64) -> u32 {
 }
 
 /// A compact fixed-width progress bar, e.g. `▕████▏    ▎`. Width is
-/// in character cells. Returns an empty string when not a TTY (the
-/// percentage already conveys progress in plain-text mode).
+/// in character cells. Returns an empty string when Unicode is unsafe
+/// (the percentage already conveys progress in plain-text mode).
 pub fn mini_bar(done: u64, total: u64, width: usize) -> String {
-    if !is_tty() || width == 0 {
+    if !use_unicode() || width == 0 {
         return String::new();
     }
     let frac = if total == 0 {
@@ -317,7 +360,15 @@ impl Rate {
 
 /// A small animated spinner with the lanx house style. Caller is
 /// responsible for `finish_and_clear()` / `finish_with_message(...)`.
+/// Returns a hidden bar when animation is unsafe (piped output,
+/// `TERM=dumb`, `LANX_PLAIN`) so wait states don't emit spinner
+/// frames into logs; the message still appears once the bar finishes.
 pub fn spinner(msg: &str) -> ProgressBar {
+    if !animated() {
+        let bar = ProgressBar::hidden();
+        bar.set_message(msg.to_string());
+        return bar;
+    }
     let bar = ProgressBar::new_spinner();
     bar.set_style(
         ProgressStyle::with_template("{spinner} {msg}")
@@ -326,4 +377,31 @@ pub fn spinner(msg: &str) -> ProgressBar {
     bar.set_message(msg.to_string());
     bar.enable_steady_tick(Duration::from_millis(80));
     bar
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn animation_needs_a_real_terminal() {
+        // Piped output never animates, whatever TERM says.
+        assert!(!animated_for(false, Some("xterm-256color"), false));
+        assert!(!animated_for(false, None, false));
+    }
+
+    #[test]
+    fn dumb_terminals_fall_back_to_plain() {
+        // Simple SSH clients and emacs shells report TERM=dumb: no
+        // cursor addressing, no UTF-8 guarantees.
+        assert!(!animated_for(true, Some("dumb"), false));
+        assert!(animated_for(true, Some("xterm-256color"), false));
+        assert!(animated_for(true, None, false));
+    }
+
+    #[test]
+    fn plain_override_wins() {
+        assert!(!animated_for(true, Some("xterm-256color"), true));
+        assert!(!animated_for(false, Some("xterm-256color"), true));
+    }
 }
