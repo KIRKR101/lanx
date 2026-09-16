@@ -108,21 +108,20 @@ Pairing codes such as `7-cobalt-fox` make it easier to connect to another machin
 
 ## Firewalls
 
-Pairing-code discovery needs UDP `53317` inbound on the receiver; the
-transfer itself needs TCP inbound on the sender. The sender listens on
-stable TCP port `29320` by default (IANA User range, below the usual
-ephemeral floors — verified unassigned), so the normal rules are:
+If the machines cannot see each other, open two ports. The receiver
+needs UDP `53317` in and the sender needs TCP `29320` in:
 
 ```sh
-# receiver (Debian/Ubuntu with ufw)
+# receiver
 sudo ufw allow 53317/udp
 # sender
 sudo ufw allow 29320/tcp
-lanx send ~/photos/
 ```
 
-To use a different sender port, pin it explicitly (fails if taken, so
-the firewall rule always matches what is listening):
+Check the rules with `sudo ufw status verbose`. Outbound needs no
+change on a default `ufw` setup.
+
+To use another sender port, pin it and allow it:
 
 ```sh
 # sender
@@ -130,31 +129,18 @@ lanx send ~/photos/ --port 51234
 sudo ufw allow 51234/tcp
 ```
 
-If the default port is busy, the sender falls back to an ephemeral port
-and prints a `!` warning — the stable rule then does not cover that run,
-and the receiver's timeout names the actual port to allow (or free
-`29320` on the sender and retry).
+If port `29320` is busy the sender picks another port and prints a
+`!` warning with the exact `ufw allow` line for that run. Either run
+that command or free `29320` and retry.
 
-Fedora/RHEL (`firewalld`):
+Other firewalls: `firewalld` needs `53317/udp` on the receiver and
+`29320/tcp` on the sender; on macOS and Windows allow the same two
+ports in through the system firewall prompt or settings.
 
-```sh
-sudo firewall-cmd --add-port=53317/udp --permanent
-sudo firewall-cmd --add-port=29320/tcp --permanent
-sudo firewall-cmd --reload
-```
-
-macOS (Settings → Network → Firewall, or `socketfilterfw`): allow
-incoming connections for `lanx` / open TCP `29320` on the sender and UDP
-`53317` on the receiver. Windows (Defender Firewall): allow inbound TCP
-`29320` on the sender and inbound UDP `53317` on the receiver.
-
-Symptom pattern: blocked UDP `53317` → pairing codes time out in
-"looking for sender"; blocked TCP on the sender → the receiver resolves
-the sender then the connect times out (10s, retried; pairing codes
-re-resolve before each retry). Direct `ip:port` bypasses the UDP
-discovery block only — it still needs the sender's TCP rule. If all
-inbound is blocked or clients are isolated, use a relay (`53318` /
-`53319`) instead.
+Pairing codes time out when UDP `53317` is blocked. A connect timeout
+after the sender is found means TCP on the sender is blocked. Direct
+`ip:port` skips discovery but still needs the sender TCP rule. When
+inbound stays blocked on both sides, use a relay instead.
 
 ## Tests
 
