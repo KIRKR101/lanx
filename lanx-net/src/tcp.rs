@@ -73,6 +73,24 @@ pub async fn listen_default() -> Result<(TcpListener, SocketAddr, bool), TcpErro
     listen_preferred(DEFAULT_SEND_PORT).await
 }
 
+/// Bind a sender listener to a specific local address. A port of zero asks
+/// the OS for an ephemeral port; this is useful when a machine has several
+/// interfaces and the wildcard listener is not appropriate.
+pub async fn listen_on(
+    bind: &str,
+    port: Option<u16>,
+) -> Result<(TcpListener, SocketAddr), TcpError> {
+    let ip: std::net::IpAddr = bind.parse().map_err(|_| {
+        TcpError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid bind address: {bind}"),
+        ))
+    })?;
+    let listener = TcpListener::bind(SocketAddr::new(ip, port.unwrap_or(0))).await?;
+    let addr = listener.local_addr()?;
+    Ok((listener, addr))
+}
+
 /// Wrap a listener so we can keep accepting for a grace period after a
 /// client disconnects.
 ///

@@ -52,6 +52,9 @@ enum Command {
         /// ephemeral port if busy; explicit values fail if taken).
         #[arg(long)]
         port: Option<u16>,
+        /// Local IPv4 or IPv6 address to bind. Defaults to all interfaces.
+        #[arg(long)]
+        bind: Option<String>,
         /// Number of parallel TCP connections to use.
         #[arg(long, default_value_t = 1)]
         parallel: u16,
@@ -188,6 +191,7 @@ fn main() -> Result<()> {
                 no_discovery,
                 zip,
                 port,
+                bind,
                 parallel,
                 relay,
                 code_words,
@@ -200,6 +204,7 @@ fn main() -> Result<()> {
                     no_discovery,
                     zip,
                     port,
+                    bind,
                     parallel,
                     relay,
                     verbose,

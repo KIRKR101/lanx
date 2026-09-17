@@ -9,7 +9,7 @@ use lanx_net::discovery::{
     start_broadcasting,
 };
 use lanx_net::relay::{send_relay_hello, RelayHello, RelayRole};
-use lanx_net::tcp::{listen_default, GracefulListener, DEFAULT_SEND_PORT};
+use lanx_net::tcp::{listen_default, listen_on, GracefulListener, DEFAULT_SEND_PORT};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -93,6 +93,7 @@ pub async fn run(
     no_discovery: bool,
     zip: bool,
     port: Option<u16>,
+    bind: Option<String>,
     parallel: u16,
     relay: Option<String>,
     verbose: bool,
@@ -157,15 +158,23 @@ pub async fn run(
     // Explicit --port pins hard (fails if taken). When using a relay,
     // we still generate a code for display, but the actual connection
     // goes through the relay.
-    let (listener, addr, fell_back) = match port {
-        Some(p) => {
-            let listener = tokio::net::TcpListener::bind(("0.0.0.0", p))
+    let (listener, addr, fell_back) = match bind {
+        Some(bind_addr) => {
+            let (listener, addr) = listen_on(&bind_addr, port)
                 .await
-                .with_context(|| format!("bind to port {p}"))?;
-            let addr = listener.local_addr()?;
+                .with_context(|| format!("bind sender to {bind_addr}"))?;
             (listener, addr, false)
         }
-        None => listen_default().await?,
+        None => match port {
+            Some(p) => {
+                let listener = tokio::net::TcpListener::bind(("0.0.0.0", p))
+                    .await
+                    .with_context(|| format!("bind to port {p}"))?;
+                let addr = listener.local_addr()?;
+                (listener, addr, false)
+            }
+            None => listen_default().await?,
+        },
     };
     let code = generate_code_with_words(code_words as usize);
     let passphrase = crate::cmd::resolve_passphrase(psk_opt);
