@@ -172,8 +172,8 @@ pub async fn run(
     // we still generate a code for display, but the actual connection
     // goes through the relay.
     let (listener, addr, fell_back) = match bind {
-        Some(bind_addr) => {
-            let (listener, addr) = listen_on(&bind_addr, port)
+        Some(ref bind_addr) => {
+            let (listener, addr) = listen_on(bind_addr, port)
                 .await
                 .with_context(|| format!("bind sender to {bind_addr}"))?;
             (listener, addr, false)
@@ -265,10 +265,22 @@ pub async fn run(
     // diagnostics. Loopback commands are verbose-only too: they
     // almost never help a transfer to another machine.
     if relay.is_none() {
-        let addrs = crate::iface::list_non_loopback_v4().await;
+        let addrs: Vec<String> = match bind
+            .as_deref()
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        {
+            Some(ip) if !ip.is_unspecified() => {
+                vec![std::net::SocketAddr::new(ip, addr.port()).to_string()]
+            }
+            _ => crate::iface::list_non_loopback_v4()
+                .await
+                .into_iter()
+                .map(|ip| format!("{ip}:{}", addr.port()))
+                .collect(),
+        };
         if verbose {
             match addrs.first() {
-                Some(ip) => ui::kv("address", &format!("{ip}:{}", addr.port()), label_w),
+                Some(address) => ui::kv("address", address, label_w),
                 None => ui::kv("address", &format!("0.0.0.0:{}", addr.port()), label_w),
             }
         }
@@ -276,11 +288,11 @@ pub async fn run(
         // The printed direct command carries --code so it pastes and just
         // works: the direct listener requires the PSK-bound handshake
         // unless --allow-insecure-direct was passed.
-        let direct_cmd = |ip: &std::net::Ipv4Addr| {
+        let direct_cmd = |address: &str| {
             if allow_insecure_direct {
-                format!("lanx recv {ip}:{}", addr.port())
+                format!("lanx recv {address}")
             } else {
-                format!("lanx recv {ip}:{} --code {code}", addr.port())
+                format!("lanx recv {address} --code {code}")
             }
         };
         let mut first = true;
