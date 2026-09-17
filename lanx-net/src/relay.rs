@@ -513,22 +513,19 @@ async fn handle_sender(
         }
         Decision::Accept => {}
     }
-    if let Err(e) = ack(&mut stream, RELAY_ACK_OK).await {
-        tracing::debug!(?e, "failed to send relay ack");
-        return Err(RelayError::Io(e));
-    }
     {
+        // Keep the lock through the short ACK write so no receiver can pair
+        // against this ID until the sender has been fully registered.
         let mut map = pending.lock().await;
         map.retain(|_, pending| pending.connected_at.elapsed().as_secs() < PENDING_TTL_SECS);
         if map.contains_key(&hello.code_hash) {
-            // Lost a registration race after the ack: report in-use
-            // rather than evicting the winner. (The ack already said OK;
-            // the sender will see the Noise handshake stall and retry
-            // with a fresh code — no silent hijack either way.)
             tracing::warn!(
                 addr = %addr,
-                "lost sender registration race; reporting in-use"
+                "sender registration became in-use before reservation"
             );
+            if let Err(e) = ack(&mut stream, RELAY_ACK_IN_USE).await {
+                tracing::debug!(?e, "failed to send relay ack");
+            }
             return Err(RelayError::CodeInUse);
         }
         if map.len() >= MAX_PENDING_SENDERS {
@@ -536,7 +533,14 @@ async fn handle_sender(
                 addr = %addr,
                 "lost sender registration race; server filled meanwhile"
             );
+            if let Err(e) = ack(&mut stream, RELAY_ACK_FULL).await {
+                tracing::debug!(?e, "failed to send relay ack");
+            }
             return Err(RelayError::Capacity);
+        }
+        if let Err(e) = ack(&mut stream, RELAY_ACK_OK).await {
+            tracing::debug!(?e, "failed to send relay ack");
+            return Err(RelayError::Io(e));
         }
         map.insert(
             hello.code_hash,
