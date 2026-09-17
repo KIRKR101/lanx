@@ -168,27 +168,37 @@ pub async fn run(
     let progress: Arc<dyn lanx_core::progress::Progress> = IndicatifProgress::new("Sending");
 
     // Direct-mode connection details print once here, not every
-    // reconnection round. The manual command is the user-facing
-    // information; the bind address is shown above it. Loopback is
-    // verbose-only: it almost never helps a transfer to another
-    // machine.
+    // reconnection round. Pairing code first (the normal path), then
+    // the bind address for diagnostics, then the manual command in
+    // the same key/value shape. Loopback is verbose-only: it almost
+    // never helps a transfer to another machine.
     if relay.is_none() {
         let addrs = crate::iface::list_non_loopback_v4().await;
         match addrs.first() {
             Some(ip) => ui::kv("address", &format!("{ip}:{}", addr.port()), label_w),
             None => ui::kv("address", &format!("0.0.0.0:{}", addr.port()), label_w),
         }
-        eprintln!();
-        eprintln!("  {}", ui::dim("Direct:"));
+        let indent = " ".repeat(label_w + 1);
+        let mut first = true;
         for ip in &addrs {
-            eprintln!("    lanx recv {ip}:{}", addr.port());
+            if first {
+                ui::kv(
+                    "direct",
+                    &format!("lanx recv {ip}:{}", addr.port()),
+                    label_w,
+                );
+                first = false;
+            } else {
+                eprintln!("{indent}lanx recv {ip}:{}", addr.port());
+            }
         }
-        if verbose {
-            eprintln!(
-                "    lanx recv 127.0.0.1:{} {}",
-                addr.port(),
-                ui::dim("(loopback)"),
-            );
+        if addrs.is_empty() || verbose {
+            let cmd = format!("lanx recv 127.0.0.1:{}", addr.port());
+            if first {
+                ui::kv("direct", &cmd, label_w);
+            } else if verbose {
+                eprintln!("{indent}{cmd} {}", ui::dim("(loopback)"));
+            }
         }
         eprintln!();
     }
@@ -202,7 +212,7 @@ pub async fn run(
                 eprintln!(
                     "  {} {}",
                     ui::yellow("!"),
-                    ui::yellow("discovery unavailable; share the Direct command instead"),
+                    ui::yellow("discovery unavailable; share the direct command instead"),
                 );
             }
         }
@@ -256,7 +266,6 @@ pub async fn run(
                 ui::dim("registered with relay (waiting for receiver)")
             );
             eprintln!();
-            print_contents(&manifest);
 
             spawn_stream(
                 &mut set,
@@ -300,10 +309,12 @@ pub async fn run(
                 .peer_addr()
                 .map(|a| a.ip().to_string())
                 .unwrap_or_else(|_| "receiver".to_string());
-            eprintln!("  {} connected from {peer}", ui::green(ui::ok_sym()),);
-            if !had_session {
-                print_contents(&manifest);
-            }
+            eprintln!(
+                "  {} {:<12}  {}",
+                ui::green(ui::ok_sym()),
+                "connected",
+                ui::dim(&peer),
+            );
             had_session = true;
 
             spawn_stream(
@@ -407,38 +418,13 @@ pub async fn run(
     }
     // `_zip_cleanup` is dropped here; `TempDir` removes the temp directory.
 
-    // Sender-side completion line: what moved, nothing else.
-    eprintln!();
-    eprintln!(
-        "  {} {} {}",
-        ui::green(ui::ok_sym()),
-        ui::green("Sent"),
-        ui::count_line(manifest.files.len(), total_bytes),
-    );
+    // Sender-side result from what the progress layer observed: files
+    // actually sent, skips, failures. (The manifest alone can't say —
+    // the receiver may already have every file.)
+    let (verified, failed, skipped) = progress.counts();
+    progress.summary(verified, failed, skipped);
 
     Ok(())
-}
-
-/// List transfer contents: one `name  size` row per file, capped so
-/// huge manifests don't flood the terminal. Printed once after the
-/// receiver connects; live progress rows take over from there.
-fn print_contents(manifest: &lanx_core::manifest::Manifest) {
-    const LIMIT: usize = 20;
-    const NAME_W: usize = 38;
-    eprintln!();
-    for f in manifest.files.iter().take(LIMIT) {
-        let mut name = f.rel_path.clone();
-        if name.chars().count() > NAME_W {
-            name = format!("{}…", name.chars().take(NAME_W - 1).collect::<String>());
-        }
-        eprintln!("  {name:<38}  {}", ui::dim(&ui::human_bytes(f.size)));
-    }
-    if manifest.files.len() > LIMIT {
-        eprintln!(
-            "  {}",
-            ui::dim(&format!("… and {} more", manifest.files.len() - LIMIT))
-        );
-    }
 }
 
 /// Copy all bytes from `reader` into `writer` in 64 KiB chunks.

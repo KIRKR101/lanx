@@ -3,15 +3,17 @@
 //! Shape of a transfer on screen:
 //!
 //! ```text
-//!   ✓ found sender 192.168.1.120:29320
-//!   Theo_Kirk_CV.pdf          48.9 KiB      <- contents (sender lists
-//!                                              them, receiver approves them)
-//!   ████████████████████████  48.9 KiB / 48.9 KiB   <- live rows
+//!   ✓ found sender  192.168.1.120:29320
+//!   sketch.png                48.9 KiB      <- contents (receiver
+//!                                              approves them here)
+//!   [1/1] sketch.png        ▕████████████████▏  100%   48.9 KiB ✓
 //!   ✓ Done · 1 file · 48.9 KiB                     <- result
 //! ```
 //!
-//! One live row per in-flight file, updated in place with a carriage
-//! return; finished rows keep their line. Skipped files print a single
+//! Live rows read `[n/m] name  bar  percent  size  rate  eta  mark`:
+//! the bar is capped at 16 cells so the filename keeps the space,
+//! and only one size value prints (both absolute values on every
+//! redraw wasted the line). Skipped files print a single
 //! `– <name> already present` line and never enter a fake active
 //! state.
 //!
@@ -124,8 +126,7 @@ impl IndicatifProgress {
         })
     }
 
-    /// Display label for a file: basename, or `parent/basename`
-    /// for collisions, middle-truncated to fit `max` characters.
+    /// Display label for a file: basename, or `parent/basename`    /// for collisions, middle-truncated to fit `max` characters.
     fn label_for(rel_paths: &[String], rel: &str, max: usize) -> String {
         let basename = rel.rsplit('/').next().unwrap_or(rel);
         let collision_count = rel_paths.iter().filter(|r| r.ends_with(basename)).count();
@@ -178,13 +179,10 @@ impl IndicatifProgress {
         };
 
         let width = ui::term_width();
-        // Column budget: prefix + label + size + percent + bar + status.
-        // Keep the label adaptive so narrow terminals still fit.
-        let prefix = format!("  [{:>2}/{}]  ", file_idx, file_count);
-        // Fixed cost outside the label: prefix + " X.XX MiB / Y.YY MiB  NN%" + spacing.
-        let fixed = prefix.chars().count() + 23 + 6;
-        let label_max = width.saturating_sub(fixed).clamp(16, 40);
-        let label = Self::label_for(&rel_paths, &label, label_max);
+        let animated = ui::animated();
+        // Compact counter: the padded `[ 1/17]` form wastes columns
+        // that the filename needs more.
+        let counter = format!("[{file_idx}/{file_count}]");
 
         let pct = ui::percent(bytes, total);
 
@@ -192,7 +190,7 @@ impl IndicatifProgress {
         // would become its own log line. Start lines (`fresh_line`)
         // and finish lines always print; in-between lines print per
         // 10% bucket only.
-        if !ui::animated() && !fresh_line && !skipped {
+        if !animated && !fresh_line && !skipped {
             let mut st = self
                 .state
                 .lock()
@@ -203,6 +201,40 @@ impl IndicatifProgress {
             }
             st.last_pct.insert(id, pct);
         }
+
+        // Right-hand side, in display order: capped bar, percent,
+        // single total size, live rate + ETA, status mark. The bar is
+        // decorative; the filename keeps whatever space is left.
+        const BAR_W: usize = 16;
+        let show_bar = animated && width > counter.chars().count() + 52;
+        let size_txt = ui::human_bytes(total);
+        let mut live = String::new();
+        if !done && animated {
+            let r = ui::human_rate(rate_bps);
+            if !r.is_empty() {
+                live.push_str("  ");
+                live.push_str(&ui::dim(&r));
+                let eta = ui::human_eta(total.saturating_sub(bytes), rate_bps);
+                if !eta.is_empty() {
+                    live.push_str("  ");
+                    live.push_str(&ui::dim(&eta));
+                }
+            }
+        }
+        // Drop the live fields first when space is tight; the bar and
+        // the filename matter more.
+        let live_w = ui::visible_width(&live);
+        if width.saturating_sub(counter.chars().count() + 50 + live_w) < 8 {
+            live.clear();
+        }
+        let mut fixed = counter.chars().count() + 2;
+        if show_bar {
+            fixed += BAR_W + 2 + 2;
+        }
+        // Percent (4) + gaps (5) + size + live + status (2).
+        fixed += 4 + 5 + size_txt.chars().count() + ui::visible_width(&live) + 2;
+        let label_max = width.saturating_sub(fixed).clamp(8, 32);
+        let label = Self::label_for(&rel_paths, &label, label_max);
 
         let mut line = String::new();
         if skipped {
@@ -217,36 +249,17 @@ impl IndicatifProgress {
             write_line(&line, width, fresh_line);
             return;
         }
-        line.push_str(&prefix);
-        line.push_str(&ui::pad_visible(&label, label_max));
+        line.push_str(&counter);
         line.push_str("  ");
-        line.push_str(&format!(
-            "{:>8} / {:<8}",
-            ui::human_bytes(bytes),
-            ui::human_bytes(total),
-        ));
-
-        if total > 0 {
-            line.push_str(&format!("  {:>3}%", pct));
-            // Bar only when there's room; skip on narrow terminals.
-            let remaining = width.saturating_sub(ui::strip_ansi(&line).chars().count());
-            if remaining >= 10 {
-                let bar_w = remaining.min(20).saturating_sub(2);
-                let bar = ui::mini_bar(bytes, total, bar_w);
-                if !bar.is_empty() {
-                    line.push(' ');
-                    line.push_str(&bar);
-                }
-            }
-            // Throughput for the in-flight file.
-            if !done {
-                let r = ui::human_rate(rate_bps);
-                if !r.is_empty() {
-                    line.push(' ');
-                    line.push_str(&ui::dim(&r));
-                }
-            }
+        line.push_str(&ui::pad_visible(&label, label_max));
+        if show_bar {
+            line.push_str("  ");
+            line.push_str(&ui::mini_bar(bytes, total, BAR_W));
         }
+        line.push_str(&format!("  {:>3}%", pct));
+        line.push_str("   ");
+        line.push_str(&size_txt);
+        line.push_str(&live);
 
         // Status tail.
         if done {
@@ -298,6 +311,18 @@ fn write_line(line: &str, width: usize, fresh_line: bool) {
 }
 
 impl Progress for IndicatifProgress {
+    fn counts(&self) -> (usize, usize, usize) {
+        let st = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            st.verified as usize,
+            st.failed as usize,
+            st.skipped as usize,
+        )
+    }
+
     fn manifest_received(&self, manifest: &Manifest, summary: &TransferSummary) {
         let mut st = self
             .state
@@ -446,13 +471,26 @@ impl Progress for IndicatifProgress {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let skipped = skipped.max(st.skipped as usize);
         let sent = st.bytes_sent;
-        let done_word = self.done_word.to_string();
+        // Nothing moved: report completion, not a send. (The sender
+        // hits this when every file was already present.)
+        let done_word = if verified == 0 && failed == 0 {
+            "Done".to_string()
+        } else {
+            self.done_word.to_string()
+        };
 
         // Only counters that matter: zero-valued ones stay hidden, and
-        // byte accounting appears only when bytes actually moved.
+        // byte accounting appears only when bytes actually moved. A
+        // partial success counts files as transferred, not sent.
         let mut segs: Vec<String> = Vec::new();
         if verified > 0 {
-            let word = if verified == 1 { "file" } else { "files" };
+            let word = if failed > 0 {
+                "transferred"
+            } else if verified == 1 {
+                "file"
+            } else {
+                "files"
+            };
             segs.push(format!("{verified} {word}"));
             segs.push(ui::human_bytes(sent));
         }
@@ -462,8 +500,12 @@ impl Progress for IndicatifProgress {
         if failed > 0 {
             segs.push(format!("{} failed", ui::red(&failed.to_string())));
         }
+        if segs.is_empty() {
+            segs.push("0 files".to_string());
+        }
 
-        let body = segs.join(&format!(" {} ", ui::sep_dot()));
+        let sep = ui::sep_dot();
+        let body = segs.join(&format!(" {sep} "));
         eprintln!();
         if failed > 0 {
             let mark = if ui::animated() {
@@ -471,15 +513,15 @@ impl Progress for IndicatifProgress {
             } else {
                 "!".to_string()
             };
-            eprintln!("  {mark} {} {body}", ui::red(&done_word));
+            eprintln!("  {mark} {} {sep} {body}", ui::red(&done_word));
         } else if ui::animated() {
             eprintln!(
-                "  {} {} {body}",
+                "  {} {} {sep} {body}",
                 ui::green(ui::ok_sym()),
                 ui::green(&done_word)
             );
         } else {
-            eprintln!("  {done_word} {body}");
+            eprintln!("  {done_word} {sep} {body}");
         }
     }
 }

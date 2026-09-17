@@ -20,6 +20,13 @@ pub trait Progress: Send + Sync {
     fn chunk_done(&self, _id: FileId, _bytes: u64) {}
     fn file_done(&self, _id: FileId, _ok: bool) {}
     fn summary(&self, _verified: usize, _failed: usize, _skipped: usize) {}
+    /// Locally-tracked (verified, failed, skipped) counts. Lets callers
+    /// that don't get an authoritative report (e.g. the sender, which
+    /// only sees per-file progress events) summarize from what the UI
+    /// actually observed. Defaults to zeros.
+    fn counts(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
 }
 
 /// High-level description of what a transfer is moving.

@@ -117,9 +117,10 @@ pub async fn run(
         eprintln!("  {} {} {}", ui::dim("relay"), ui::arrow(), ui::bold(ra));
     } else {
         eprintln!(
-            "  {} found sender {}",
+            "  {} {:<12}  {}",
             ui::green(ui::ok_sym()),
-            ui::bold(&addr.to_string()),
+            "found sender",
+            ui::dim(&addr.to_string()),
         );
     }
     eprintln!();
@@ -402,23 +403,23 @@ impl ManifestApprover for StdinApprover {
             "    {}",
             ui::bold(&ui::count_line(summary.file_count, summary.total_bytes)),
         );
+        eprintln!();
+
+        // Same `name  size` rows as the live progress that follows,
+        // so the prompt flows into the transfer instead of switching
+        // representations.
+        for entry in manifest.files.iter().take(MANIFEST_PREVIEW_LIMIT) {
+            eprintln!("{}", ui::contents_row(&entry.rel_path, entry.size));
+        }
+        let remaining = summary.file_count.saturating_sub(MANIFEST_PREVIEW_LIMIT);
+        if remaining > 0 {
+            eprintln!("  {}", ui::dim(&format!("... and {remaining} more")));
+        }
+
         // Destination on its own line, omitted for the default (`.`).
         let out_is_default = self.out_dir.as_os_str() == ".";
         if !out_is_default {
             eprintln!("    {}  {}", ui::dim("Destination"), self.out_dir.display(),);
-        }
-
-        // List the first N files with their sizes.
-        let remaining = summary.file_count.saturating_sub(MANIFEST_PREVIEW_LIMIT);
-        for entry in manifest.files.iter().take(MANIFEST_PREVIEW_LIMIT) {
-            eprintln!(
-                "      {:>8}  {}",
-                ui::dim(&ui::human_bytes(entry.size)),
-                entry.rel_path,
-            );
-        }
-        if remaining > 0 {
-            eprintln!("      {}", ui::dim(&format!("... and {remaining} more")));
         }
 
         eprintln!();

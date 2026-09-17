@@ -163,6 +163,25 @@ pub fn kv(label: &str, value: &str, label_width: usize) {
     eprintln!("{} {}", cyan(&lbl), value);
 }
 
+/// One `name  size` contents row, e.g. `  keybinds.md   3.23 KiB`.
+/// Shared by the sender listing and the receiver approval prompt so
+/// both sides show the same representation. Names longer than the
+/// column are end-truncated; the count line above the list says how
+/// many files follow.
+pub fn contents_row(name: &str, size: u64) -> String {
+    const NAME_W: usize = 38;
+    let mut short = name.to_string();
+    if short.chars().count() > NAME_W {
+        let cut: String = short.chars().take(NAME_W - 1).collect();
+        short = if use_unicode() {
+            format!("{cut}…")
+        } else {
+            format!("{cut}...")
+        };
+    }
+    format!("  {short:<NAME_W$}  {}", dim(&human_bytes(size)))
+}
+
 /// Compact count line used across setup and result output, e.g.
 /// `1 file · 48.9 KiB` or `12 files · 384 MiB`.
 pub fn count_line(n: usize, total_bytes: u64) -> String {
@@ -181,6 +200,12 @@ pub fn term_width() -> usize {
         (_, w) if w > 0 => (w as usize).min(120),
         _ => 80,
     }
+}
+
+/// Visible width of `s` in character cells, ignoring ANSI escape
+/// codes. Used for layout budgets on lines that mix styled segments.
+pub fn visible_width(s: &str) -> usize {
+    measure_text_width(s)
 }
 
 /// Pad a possibly-colored string with trailing spaces so its *visible*
@@ -269,6 +294,23 @@ pub fn human_rate(bytes_per_sec: f64) -> String {
     format!("{}/s", human_bytes(bytes_per_sec as u64))
 }
 
+/// Format a rough ETA for `remaining` bytes at `bytes_per_sec`, e.g.
+/// `2s`, `3m`, `2h`. Returns an empty string when no estimate is
+/// possible so the caller can drop the field.
+pub fn human_eta(remaining: u64, bytes_per_sec: f64) -> String {
+    if !bytes_per_sec.is_finite() || bytes_per_sec <= 0.0 || remaining == 0 {
+        return String::new();
+    }
+    let s = (remaining as f64 / bytes_per_sec).round().max(0.0) as u64;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h", s / 3600)
+    }
+}
+
 /// Percent of `done`/`total` as an integer in 0..=100 (100 when
 /// `total` is zero, treating an empty file as trivially complete).
 pub fn percent(done: u64, total: u64) -> u32 {
@@ -278,9 +320,9 @@ pub fn percent(done: u64, total: u64) -> u32 {
     (done as u128 * 100 / total as u128).min(100) as u32
 }
 
-/// A compact fixed-width progress bar, e.g. `▕████▏    ▎`. Width is
-/// in character cells. Returns an empty string when Unicode is unsafe
-/// (the percentage already conveys progress in plain-text mode).
+/// A compact fixed-width progress bar, e.g. `▕██████░░░░░░▏`.
+/// Width is in character cells. Returns an empty string when Unicode
+/// is unsafe (the percentage already conveys progress in plain mode).
 pub fn mini_bar(done: u64, total: u64, width: usize) -> String {
     if !use_unicode() || width == 0 {
         return String::new();
@@ -295,7 +337,7 @@ pub fn mini_bar(done: u64, total: u64, width: usize) -> String {
     let filled = filled.min(width);
     let empty = width - filled;
     let bar: String = "█".repeat(filled);
-    let pad: String = " ".repeat(empty);
+    let pad: String = "░".repeat(empty);
     format!("▕{bar}{pad}▏")
 }
 
