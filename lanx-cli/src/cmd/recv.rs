@@ -11,7 +11,9 @@ use lanx_core::transfer::receiver::{
 use lanx_core::transfer::DEFAULT_MAX_RETRIES;
 use lanx_net::discovery::{code_to_pairing_id, code_to_psk, code_word_count};
 use lanx_net::pairing::{parse_target, resolve_target, Target};
-use lanx_net::relay::{send_relay_hello, RelayHello, RelayRole};
+use lanx_net::relay::{
+    read_relay_challenge, relay_auth_proof, send_relay_hello, RelayHello, RelayRole,
+};
 use lanx_net::tcp::DEFAULT_SEND_PORT;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -412,6 +414,9 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
             Ok(report) => {
                 if report.rejected {
                     if dry_run {
+                        if json {
+                            progress.summary(0, 0, 0);
+                        }
                         if human {
                             eprintln!();
                             eprintln!(
@@ -421,6 +426,9 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
                             );
                         }
                         return Ok(());
+                    }
+                    if json {
+                        progress.summary(0, 0, 0);
                     }
                     eprintln!();
                     eprintln!(
@@ -511,10 +519,12 @@ async fn try_once(
     // starting the Noise handshake. This must not run in direct mode
     // where code_hash is also Some (all pairing codes produce a hash).
     if let (Some(relay_addr), Some(hash)) = (&cfg.relay_addr, cfg.code_hash) {
+        let challenge = read_relay_challenge(&mut stream).await?;
         let hello = RelayHello {
             role: RelayRole::Receiver,
             code_hash: hash,
-            auth_token: crate::cmd::relay_auth_token(),
+            auth_token: crate::cmd::relay_auth_token()
+                .map(|token| relay_auth_proof(&token, &challenge, &hash)),
         };
         send_relay_hello(&mut stream, &hello).await?;
         tracing::info!("sent relay hello to {}", relay_addr);

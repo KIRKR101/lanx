@@ -32,8 +32,8 @@ pub async fn run(
             metrics,
         },
     )
-        .await
-        .context("create relay server")?;
+    .await
+    .context("create relay server")?;
     server.run().await.context("run relay server")?;
     Ok(())
 }

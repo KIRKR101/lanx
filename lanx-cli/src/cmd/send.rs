@@ -10,7 +10,9 @@ use lanx_net::discovery::{
     code_entropy_bits, code_to_pairing_id, code_to_psk, generate_code_with_words,
     start_broadcasting,
 };
-use lanx_net::relay::{send_relay_hello, RelayHello, RelayRole};
+use lanx_net::relay::{
+    read_relay_challenge, relay_auth_proof, send_relay_hello, RelayHello, RelayRole,
+};
 use lanx_net::tcp::{listen_default, listen_on, GracefulListener, DEFAULT_SEND_PORT};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -358,10 +360,12 @@ pub async fn run(
             // Send hello to register with the relay, then read the
             // one-byte ack so "code already registered" doesn't look
             // like a generic connection failure.
+            let challenge = read_relay_challenge(&mut stream).await?;
             let hello = RelayHello {
                 role: RelayRole::Sender,
                 code_hash,
-                auth_token: crate::cmd::relay_auth_token(),
+                auth_token: crate::cmd::relay_auth_token()
+                    .map(|token| relay_auth_proof(&token, &challenge, &code_hash)),
             };
             send_relay_hello(&mut stream, &hello).await?;
             let ack = tokio::time::timeout(

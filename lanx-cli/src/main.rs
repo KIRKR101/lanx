@@ -77,7 +77,7 @@ enum Command {
         /// Include only files matching a path pattern. Repeatable.
         #[arg(long = "include", value_name = "PATTERN")]
         include: Vec<String>,
-        /// Include hidden files and directories (included by default when no filters are set).
+        /// Include hidden files and directories.
         #[arg(long)]
         hidden: bool,
         /// Disable the on-disk manifest cache.
@@ -321,15 +321,17 @@ fn main() -> Result<()> {
                 auth_token,
                 metrics,
                 log_level: _,
-            } => cmd::relay::run(
-                sender_bind,
-                receiver_bind,
-                max_sessions,
-                idle_timeout,
-                auth_token,
-                metrics,
-            )
-            .await,
+            } => {
+                cmd::relay::run(
+                    sender_bind,
+                    receiver_bind,
+                    max_sessions,
+                    idle_timeout,
+                    auth_token,
+                    metrics,
+                )
+                .await
+            }
         }
     })
 }
