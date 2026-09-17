@@ -227,7 +227,7 @@ where
     // incremental hasher is built during the first send pass so we
     // avoid reading the entire file upfront for fresh transfers.
     // For resume transfers, we pre-hash the prefix (bytes before the
-    // resume offset) so the hasher covers the full file — matching
+    // resume offset) so the hasher covers the full file and matches
     // what the receiver computes from its verified prefix + new bytes.
     let mut file = File::open(&path).await?;
     let mut whole_file_hasher = if resume_offset > 0 {

@@ -188,11 +188,11 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
         let _ = tx.send(agreed_parallel);
     }
 
-    // Read Manifest (streaming or legacy single-frame).
+    // Read the streaming or single-frame manifest.
     let sender_manifest = read_manifest(reader).await?;
 
     // If the sender capped parallelism below our connection index, this
-    // connection must not handle any files — doing so would duplicate
+    // connection must not handle files because that would duplicate
     // work across connections and corrupt destination files.
     let skip = u32::from(cfg.connection_index) >= u32::from(agreed_parallel);
     let connection_index = if skip {
@@ -371,8 +371,7 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
     Ok(report)
 }
 
-/// Read a manifest, accepting either the legacy single-frame `Manifest`
-/// message or the current streaming manifest sequence.
+/// Read either a single-frame `Manifest` message or a streaming manifest.
 async fn read_manifest<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Manifest, ProtocolError> {
@@ -637,7 +636,7 @@ async fn recv_file<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         // Tell the sender verification failed so it loops back to send
         // a fresh FileStart, matching the receiver's next recv_full_file
-        // read. Without this both sides block on read_frame → deadlock.
+        // read. Otherwise both sides block on read_frame.
         write_frame(
             writer,
             &ControlMsg::FileVerified {
@@ -801,10 +800,9 @@ async fn recv_chunk_repair<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpi
         other => return Err(ProtocolError::Unexpected(format!("{other:?}"))),
     };
 
-    // Re-hash the whole file from disk: the receiver's incremental hasher
-    // still contains the old corrupt bytes, so it cannot be updated in
-    // place. BLAKE3 is fast enough that this local re-hash is cheap
-    // compared to re-sending the whole file over the network.
+    // Re-hash the whole file from disk because the incremental hasher
+    // contains the corrupt bytes and cannot be updated in place.
+    // BLAKE3 makes this local re-hash cheaper than re-sending the file.
     let local_hash = tokio::task::spawn_blocking({
         let dest = dest.to_path_buf();
         move || crate::hashing::hash_file(&dest)
@@ -874,8 +872,8 @@ fn find_bad_ranges(entry: &FileEntry, dest: &Path) -> Vec<(u64, u32)> {
             Err(e) => {
                 tracing::debug!(path = %dest.display(), error = %e, "read error during bad-range scan");
                 // Read error: the rest of the file is unreadable.
-                // Push the remaining expected chunk and bail — further
-                // iterations would also fail on the same broken stream.
+                // Push the remaining expected chunk and stop; later reads
+                // would fail on the same broken stream.
                 if let Ok(len) = u32::try_from(want) {
                     bad.push((offset, len));
                 }
@@ -928,8 +926,7 @@ async fn open_for_resume(
     // We deliberately do NOT set `.truncate(true)`: on a resume with
     // offset > 0 we want to preserve existing on-disk bytes. (We seek
     // past them below.) `create(true)` only creates the file if missing.
-    // We do truncate to the manifest size so a previously longer file
-    // does not leave stale trailing bytes after the transfer.
+    // Truncate to the manifest size so trailing bytes do not remain.
     #[allow(clippy::suspicious_open_options)]
     let mut f = OpenOptions::new()
         .read(true)

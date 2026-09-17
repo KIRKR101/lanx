@@ -164,13 +164,8 @@ mod tests {
 
     #[test]
     fn folder_name_with_space_resolves_to_nested_dir() {
-        // Regression: on Windows, a folder with a space in its name
-        // used to produce rel_paths with backslashes (because PathBuf::push
-        // uses the platform separator). The receiver's Path::join then
-        // re-tokenized those backslashes as additional components, so
-        // the destination tree was wrong. With forward-slash rel_paths
-        // and rel_to_path, the destination is a real nested folder
-        // tree, regardless of platform.
+        // Relative paths use forward slashes, so folder names with spaces
+        // remain single path components on every platform.
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("dest");
         let m = Manifest {

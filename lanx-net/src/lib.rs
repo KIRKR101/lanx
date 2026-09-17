@@ -2,7 +2,7 @@
 //! UDP-broadcast discovery + pairing codes.
 //!
 //! The wire-format framing for control messages lives in
-//! `lanx_core::transfer` — `lanx-net` does not redefine it.
+//! `lanx_core::transfer`; `lanx-net` does not redefine it.
 
 pub mod discovery;
 pub mod interfaces;

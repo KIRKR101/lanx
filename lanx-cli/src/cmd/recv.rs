@@ -232,8 +232,7 @@ pub async fn run(
                     );
                     bail!("transfer declined by user");
                 }
-                // `summary` is the single, styled completion line —
-                // no extra "Done." echo here.
+                // `summary` prints the styled completion line.
                 progress.summary(report.verified, report.failed, report.skipped);
                 if report.failed == 0 {
                     return Ok(());

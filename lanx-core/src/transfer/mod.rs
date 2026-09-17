@@ -31,8 +31,7 @@ pub struct HelloInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMsg {
     Hello(HelloInfo),
-    /// Legacy single-frame manifest. Kept for backwards compatibility at
-    /// the enum level; current protocol uses streaming manifest messages.
+    /// Single-frame manifest accepted for protocol compatibility.
     Manifest(crate::manifest::Manifest),
     /// First message of a streaming manifest. `total_files` and
     /// `total_bytes` let the receiver pre-allocate UI state.
@@ -64,8 +63,8 @@ pub enum ControlMsg {
         id: crate::manifest::FileId,
         offset: u64,
     },
-    /// Header for the next `len` raw bytes on the wire. The bytes are NOT
-    /// framed — receiver reads exactly `len` after this message.
+    /// Header for the next `len` raw bytes on the wire. The receiver reads
+    /// exactly `len` bytes after this message.
     ChunkHeader {
         id: crate::manifest::FileId,
         offset: u64,

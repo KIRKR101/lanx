@@ -3,8 +3,7 @@
 //! Sender side: compute per-chunk hashes for the manifest (parallel via rayon's
 //! `update_rayon`), and an incremental whole-file hash while streaming.
 //! Receiver side: incremental whole-file hash while writing, so the final
-//! `FileEnd` hash check is a comparison of in-memory hasher state — no
-//! extra read pass.
+//! `FileEnd` hash check compares in-memory hasher state without an extra read.
 
 use blake3::Hasher;
 use std::fs::File;

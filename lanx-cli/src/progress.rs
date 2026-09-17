@@ -15,7 +15,7 @@
 //! the bar is capped at 16 cells so the filename keeps the space,
 //! and only one size value prints (both absolute values on every
 //! redraw wasted the line). Skipped files print a single
-//! `– <name> already present` line and never enter a fake active
+//! `- <name> already present` line and never enter an active
 //! state.
 //!
 //! All color/glyph styling goes through `crate::ui`, which falls back
@@ -405,7 +405,7 @@ fn clear_current_line() {
 /// Emit one composed row. In-place updates on animated terminals
 /// (`\r` + `ESC[2K`, no newline); fresh rows start with `\n` so
 /// consecutive files never concatenate onto one terminal line (which
-/// is what used to wrap at the screen edge). No padding: `ESC[2K`
+/// is what wraps at the screen edge). No padding: `ESC[2K`
 /// already clears shrunk lines, and padding is what pushed status
 /// columns hundreds of cells right on wide terminals. Lines are
 /// clamped to `width` as a final guarantee against wrapping.
@@ -561,7 +561,7 @@ impl Progress for IndicatifProgress {
         };
 
         if !was_started {
-            // No `started` preceded this → the file was skipped because
+            // No `started` event preceded this. The file was skipped because
             // the receiver already had it, or it failed before starting.
             // Record a state entry so the line renders and counts stay
             // consistent. Use the caller's `ok` value rather than
@@ -600,7 +600,7 @@ impl Progress for IndicatifProgress {
         // A transferred file's live row is erased: the summary below
         // is the record, and only exceptional rows (skips, failures)
         // stay on screen. Plain logs keep the compact result row as
-        // their record instead — there is nothing to erase there.
+        // their record instead. There is nothing to erase there.
         let live_shown = st
             .state
             .get_mut(&id)
@@ -616,9 +616,7 @@ impl Progress for IndicatifProgress {
     }
 
     fn summary(&self, verified: usize, failed: usize, skipped: usize) {
-        // Trust the caller's counts (the receiver aggregates them
-        // authoritatively) but also fold in any locally-tracked skips
-        // so both sides agree when the caller passes zeros.
+        // Use the receiver's counts and include locally tracked skips.
         let st = self
             .state
             .lock()
@@ -683,8 +681,8 @@ impl Progress for IndicatifProgress {
 /// Middle-truncate `s` to fit within `max` display cells (not chars:
 /// CJK text runs two cells per char, measured via
 /// [`ui::visible_width`]). Keeps the basename end since that is
-/// usually the useful part (`docs/…/chapter1.md`, never
-/// `docs/guide/chapt…`), preserving the extension.
+/// usually the useful part (`docs/.../chapter1.md`) while preserving the
+/// extension.
 fn truncate_middle(s: &str, max: usize) -> String {
     if ui::visible_width(s) <= max {
         return s.to_string();
@@ -694,9 +692,7 @@ fn truncate_middle(s: &str, max: usize) -> String {
     if max <= marker_w + 2 {
         return take_width(s, max);
     }
-    // Prefer keeping the whole basename: shrink the directory part,
-    // so `docs/guide/chapter1.md` becomes `docs/…/chapter1.md`
-    // rather than `docs/guide/chapt…`.
+    // Prefer keeping the whole basename by shrinking the directory part.
     if let Some((dir, base)) = s.rsplit_once('/') {
         let base_w = ui::visible_width(base);
         if base_w + marker_w + 1 + 2 <= max {

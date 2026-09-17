@@ -3,8 +3,7 @@
 //! This module wraps a raw TCP (or any `AsyncRead + AsyncWrite`) stream in a
 //! confidential, forward-secret channel before any `lanx` control messages are
 //! exchanged. Authentication is limited to the peer being present on the same
-//! channel at handshake time; future work can add a PSK derived from the
-//! pairing code or static long-term keys.
+//! channel at handshake time. The pairing code is not used as a key.
 //!
 //! The design uses a pump task: the caller gets a `tokio::io::DuplexStream`
 //! that implements `AsyncRead + AsyncWrite`, while a background task reads
@@ -276,10 +275,7 @@ mod tests {
         assert_eq!(resp_read, b"hello from initiator");
     }
 
-    /// Regression: clean peer shutdown must read as `None`, not as an
-    /// "early eof" error. The pump maps `None` to a quiet exit; before
-    /// this, every normally-ending session (e.g. a fully-skipped
-    /// transfer) logged `encryption pump exited with error ... early eof`.
+    /// Clean peer shutdown returns `None`; a truncated frame returns an error.
     #[tokio::test]
     async fn read_framed_clean_shutdown_is_not_an_error() {
         let (mut a, mut b) = tokio::io::duplex(1024);

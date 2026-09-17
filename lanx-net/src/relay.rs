@@ -14,9 +14,8 @@
 //! all possible codes offline. The Noise handshake then encrypts file
 //! contents, but the human-readable pairing code itself is exposed.
 //!
-//! For relay-over-internet deployments where this is a concern, consider
-//! using longer codes or adding a PSK derived from an out-of-band shared
-//! secret (future work).
+//! Internet-facing deployments should use longer codes or authenticate peers
+//! with an out-of-band PSK.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -36,8 +35,8 @@ pub enum RelayRole {
 
 /// First message a peer sends after connecting to the relay.
 ///
-/// The relay uses the `code_hash` to pair senders and receivers. The
-/// human-readable code is never sent to the relay — only the hash.
+/// The relay pairs senders and receivers by `code_hash` and receives no
+/// human-readable pairing code.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelayHello {
     /// Whether this peer is a sender or receiver.
@@ -51,13 +50,12 @@ pub struct RelayHello {
 struct Pending {
     stream: TcpStream,
     addr: SocketAddr,
-    /// When the sender connected. Used to detect stale entries.
+    /// Time when the sender connected, used to detect stale entries.
     connected_at: std::time::Instant,
 }
 
 /// Maximum age (in seconds) before a pending sender entry is considered stale.
-/// Reduced from 30s so dead senders are evicted faster; receivers retry on
-/// a schedule so a shorter window still allows pairing of slow senders.
+/// Pending senders older than this are evicted before pairing.
 const PENDING_TTL_SECS: u64 = 10;
 
 /// Maximum number of pending senders in the map. Prevents unbounded memory
@@ -106,7 +104,7 @@ pub enum RelayError {
 pub struct RelayServer {
     sender_listener: TcpListener,
     receiver_listener: TcpListener,
-    /// Map from code_hash → pending sender connection.
+    /// Pending sender connections keyed by code hash.
     pending_senders: Arc<Mutex<HashMap<[u8; 32], Pending>>>,
     /// Count of active paired sessions (for connection limiting).
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
@@ -171,8 +169,7 @@ impl RelayServer {
                 result = self.receiver_listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
-                            // Atomically increment and check the limit. If we
-                            // exceed MAX_ACTIVE_SESSIONS, decrement and reject.
+                            // Reserve a session slot and reject connections over the limit.
                             let prev = self.active_sessions.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                             if prev >= MAX_ACTIVE_SESSIONS {
                                 self.active_sessions.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -280,9 +277,7 @@ async fn handle_sender(
         );
         return Err(RelayError::FrameTooLarge(0)); // reuse error variant for capacity
     }
-    // If a sender for this code hash already exists, replace it with the
-    // new one. The old sender is likely stale (e.g. crashed without closing
-    // the connection). Log the eviction so operators can detect issues.
+    // Replace an existing sender for this code hash and log the eviction.
     if let Some(old) = map.insert(
         hello.code_hash,
         Pending {
@@ -424,10 +419,8 @@ async fn bidirectional_copy(a: TcpStream, b: TcpStream) {
     let a_to_b = copy_loop("a->b", a_read, b_write);
     let b_to_a = copy_loop("b->a", b_read, a_write);
 
-    // Use biased selection so we always drain in a predictable order.
-    // When one direction finishes, the other is dropped — its shutdown
-    // call is best-effort; in-flight data may be lost, but the protocol
-    // has its own integrity checks (BLAKE3 hashes).
+    // Drain the remaining direction after one side closes. Its shutdown is
+    // best-effort; BLAKE3 verifies the transferred data.
     tokio::select! {
         biased;
         _ = a_to_b => {},

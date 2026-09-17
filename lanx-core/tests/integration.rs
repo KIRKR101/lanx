@@ -392,12 +392,8 @@ async fn directory_send_creates_folder_on_receiver() {
 
 #[tokio::test]
 async fn folder_name_with_space_creates_nested_folders() {
-    // Regression: on Windows, a folder name containing a space used to
-    // round-trip with backslashes in rel_path, which the receiver's
-    // Path::join then re-tokenized as additional path components. The
-    // receiver ended up with files in a flat structure or with mangled
-    // paths. With forward-slash wire form + rel_to_path, the receiver
-    // always creates the right nested folder tree.
+    // Relative paths use forward slashes so the receiver creates the
+    // expected nested folder tree on every platform.
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("Piete de Hooch");
     let dst = tmp.path().join("dst");
@@ -499,10 +495,8 @@ async fn folder_name_with_space_creates_nested_folders() {
 
 #[tokio::test]
 async fn resume_truncates_oversized_destination() {
-    // If the destination file is longer than the manifest size, the
-    // receiver must truncate it before resuming. Otherwise trailing bytes
-    // from the old file would remain on disk even though the final hash
-    // only covers the manifest size.
+    // The receiver truncates an oversized destination before resuming so
+    // trailing bytes do not remain after a successful transfer.
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src");
     let dst = tmp.path().join("dst");

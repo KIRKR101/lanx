@@ -13,11 +13,9 @@ use tokio::time::sleep;
 /// below the Linux default ephemeral floor (32768) and outside the IANA
 /// Dynamic range (49152-65535). Checked against
 /// https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.txt
-/// (2026-09-11): no entry for 29320 and none in 29315-29325; nearest
-/// assigned are 29169 and 29999. Unassigned is not a reservation, so the
-/// bind still falls back to ephemeral on `AddrInUse`.
-/// Discovery stays on UDP 53317; relay binds stay on 53318/53319
-/// (compat — not renumbered here).
+/// Port 29320 is currently unassigned. Binding falls back to an ephemeral
+/// port when it is already in use.
+/// Discovery uses UDP 53317. Relay binds use 53318 and 53319.
 pub const DEFAULT_SEND_PORT: u16 = 29320;
 
 #[derive(Debug, Error)]

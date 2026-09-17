@@ -75,8 +75,8 @@ pub fn broadcast_addrs_sync() -> Vec<Ipv4Addr> {
                 continue;
             }
         }
-        // Fallback: compute from netmask (ip | !mask). A zero netmask
-        // means the OS gave us nothing usable — skip it.
+        // Compute the broadcast address from the netmask when the OS omits it.
+        // A zero netmask provides no usable address.
         let mask = u32::from(v4.netmask);
         if mask == 0 {
             continue;
@@ -113,10 +113,8 @@ mod tests {
     use super::*;
     #[test]
     fn returns_at_most_loopback_on_isolated_host() {
-        // We can't assert much portably — on a normal dev machine this
-        // returns at least one real address. On a hermetic CI runner it
-        // may return only loopback (which we filter out). So the only
-        // universal assertion is: nothing loopback, nothing unspecified.
+        // The result can be empty on isolated CI hosts. Every returned
+        // address must be non-loopback and specified.
         for ip in list_non_loopback_v4_sync() {
             assert!(!ip.is_loopback(), "loopback leaked: {ip}");
             assert!(!ip.is_unspecified(), "unspecified leaked: {ip}");
@@ -125,9 +123,8 @@ mod tests {
 
     #[test]
     fn broadcast_targets_always_include_limited_broadcast() {
-        // Regression: discovery used to send only to heuristic directed
-        // broadcasts and omitted 255.255.255.255, breaking Linux↔Mac
-        // pairing when the heuristic guessed the wrong subnet.
+        // Include the limited broadcast address for networks where a
+        // directed broadcast is unavailable.
         let addrs = broadcast_addrs_sync();
         assert!(
             addrs.contains(&Ipv4Addr::BROADCAST),

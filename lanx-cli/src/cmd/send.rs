@@ -371,9 +371,8 @@ pub async fn run(
             }
         }
 
-        // If connection 0 finished/failed during the select! above, fold its
-        // result into the round's error handling below instead of bailing:
-        // in direct mode a failed session must retry, not exit.
+        // Include connection 0 in the round's error handling. Direct mode
+        // retries a failed session instead of exiting.
         let mut round_error: Option<anyhow::Error> = match first_task_result {
             Some(Ok(Ok(()))) => None,
             Some(Ok(Err(e))) => Some(anyhow::Error::new(e).context("transfer session")),
@@ -402,8 +401,7 @@ pub async fn run(
                 if relay.is_some() {
                     return Err(e);
                 }
-                // Direct mode: failed session — keep the port open and let
-                // the receiver's retry loop reconnect and resume.
+                // Keep the port open so the receiver can reconnect and resume.
                 warn!(?e, "session ended with error; waiting for reconnection");
                 eprintln!(
                     "  {} {} {} {}",
@@ -421,9 +419,8 @@ pub async fn run(
     }
     // `_zip_cleanup` is dropped here; `TempDir` removes the temp directory.
 
-    // Sender-side result from what the progress layer observed: files
-    // actually sent, skips, failures. (The manifest alone can't say —
-    // the receiver may already have every file.)
+    // Report the progress layer's counts. The manifest does not include
+    // files the receiver already has.
     let (verified, failed, skipped) = progress.counts();
     progress.summary(verified, failed, skipped);
 

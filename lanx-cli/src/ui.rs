@@ -3,11 +3,9 @@
 //! All lanx UI is written to stderr. When stderr is not an interactive
 //! terminal (output is piped or redirected to a file), color and
 //! box-drawing glyphs are disabled automatically so captured logs
-//! stay clean and greppable. This matters on Windows where redirected
-//! stderr used to collect stray ANSI sequences.
+//! stay clean and greppable, including on Windows.
 //!
-//! The styling is built on the `console` crate (already a transitive
-//! dependency of `indicatif`), which enables virtual-terminal colors
+//! The styling uses the `console` crate, which enables virtual-terminal colors
 //! on Windows 10+ and respects `NO_COLOR` / `CLICOLOR_FORCE`.
 
 use std::time::{Duration, Instant};
@@ -71,28 +69,27 @@ pub fn cyan(s: &str) -> String {
     style(s).cyan().bold().for_stderr().to_string()
 }
 
-/// Bold white/bright text — used for the most important value on a line
-/// (e.g. the pairing code the user needs to copy).
+/// Format a value in bold white text.
 pub fn bold(s: &str) -> String {
     style(s).bold().for_stderr().to_string()
 }
 
-/// Green — success.
+/// Format a success value in green.
 pub fn green(s: &str) -> String {
     style(s).green().for_stderr().to_string()
 }
 
-/// Red — failure.
+/// Format a failure value in red.
 pub fn red(s: &str) -> String {
     style(s).red().for_stderr().to_string()
 }
 
-/// Yellow — warning / in-progress / retry.
+/// Format a warning, in-progress, or retry value in yellow.
 pub fn yellow(s: &str) -> String {
     style(s).yellow().for_stderr().to_string()
 }
 
-/// Dim/grey — secondary info (loopback addresses, "done", etc.).
+/// Format secondary information in dim gray text.
 pub fn dim(s: &str) -> String {
     style(s).dim().for_stderr().to_string()
 }

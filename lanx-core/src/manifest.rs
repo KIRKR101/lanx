@@ -73,7 +73,7 @@ pub struct Manifest {
     pub files: Vec<FileEntry>,
     pub chunk_size: u32,
     /// Canonicalized common ancestor of the input paths. Not serialized
-    /// over the wire (`#[serde(skip)]`) — this field is sender-local only
+    /// over the wire (`#[serde(skip)]`). This field is sender-local.
     /// and will be an empty `PathBuf` on the receiver. Used by the sender
     /// to reconstruct the original source paths from `rel_path` entries
     /// regardless of how the user originally spelled them.
@@ -466,7 +466,7 @@ mod tests {
                 .any(|p| p.starts_with(dir_name) && p.ends_with("sub/a.bin")),
             "expected rel_path to start with the directory name and end with sub/a.bin, got {paths:?}"
         );
-        // All rel_paths must use forward slashes only — no backslashes,
+        // All rel_paths must use forward slashes, with no backslashes,
         // even on Windows, so the wire format is cross-platform.
         for p in &paths {
             assert!(
@@ -483,10 +483,8 @@ mod tests {
 
     #[test]
     fn directory_name_with_space_preserved() {
-        // Regression: on Windows, a folder name with a space used to
-        // produce rel_paths with backslashes, which the receiver's
-        // Path::join then re-tokenized into extra components. Verify
-        // the manifest is forward-slash only and round-trips cleanly.
+        // Relative paths use forward slashes so folder names with spaces
+        // remain intact across platforms.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("Piete de Hooch");
         fs::create_dir(&src).unwrap();
@@ -544,7 +542,7 @@ mod tests {
             "expected sub/x.bin, got {paths:?}"
         );
         // None of the paths should start with the directory's own name
-        // (the tempdir's basename) — that would indicate we incorrectly
+        // (the tempdir's basename). That would indicate an incorrect
         // preserved a root.
         let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
         for p in &paths {
@@ -573,9 +571,7 @@ mod tests {
 
     #[test]
     fn single_symlink_input_is_skipped() {
-        // The single-input fast path used to call `symlink_metadata` and
-        // then `canonicalize`, which followed a symlink-to-file. Ensure
-        // a lone symlink input is treated as empty.
+        // A lone symlink input is treated as empty.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("real.txt");
         File::create(&target).unwrap().write_all(b"hi").unwrap();
@@ -596,7 +592,7 @@ mod tests {
 
     #[test]
     fn rel_to_path_round_trips() {
-        // Forward-slash form → platform-native PathBuf. Splits on `/`
+        // Convert the forward-slash form to a platform-native PathBuf.
         // and pushes each component so the result is correct on every
         // platform.
         let p = rel_to_path("Piete de Hooch/figures/fig5.jpg");

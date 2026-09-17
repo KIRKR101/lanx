@@ -3,8 +3,8 @@
 //! Wire format: on UDP port 53317, send a small postcard-encoded packet
 //! containing `{port: u16, code_hash: [u8; 32]}`.
 //! Receivers filter by `code_hash`. The pairing code starts with a random
-//! cosmetic digit (diagnostic discriminator only) followed by two words;
-//! this is *not* security — the full port is broadcast in the clear and
+//! cosmetic digit (diagnostic discriminator only) followed by two words.
+//! This is not security. The full port is broadcast in the clear and
 //! the code is easily brute-forced. Encryption is a v2 concern (plan §1).
 //! The digit is intentionally decoupled from the port so a stable service
 //! port does not pin every code to the same leading digit.
@@ -67,9 +67,7 @@ const WORDS: &[&str] = &[
 ];
 
 /// Build a code of the form `digit-word-word`. The `digit` is a random
-/// 0–9 discriminator (preserves the established format; old port-derived
-/// codes still parse because any single ASCII digit validates). The two
-/// words come from a small wordlist.
+/// 0-9 discriminator. The two words come from a small wordlist.
 #[must_use]
 pub fn generate_code() -> String {
     use rand::Rng;
@@ -191,7 +189,7 @@ pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<Discov
     match ready_rx.await {
         Ok(Ok(())) => Ok(DiscoveryHandle { stop: tx, join }),
         Ok(Err(e)) => {
-            // Task already exited with error; propagate it.
+            // The task exited with an error; propagate it.
             drop(join);
             Err(e)
         }
@@ -240,7 +238,7 @@ pub async fn discover(
                         std::net::IpAddr::V4(v4) => v4,
                         std::net::IpAddr::V6(v6) => {
                             // Try to extract an IPv4-mapped address (e.g.
-                            // ::ffff:192.168.1.5 → 192.168.1.5). This handles
+                            // ::ffff:192.168.1.5 maps to 192.168.1.5. This handles
                             // dual-stack hosts that send from IPv6-mapped IPv4.
                             if let Some(v4) = v6.to_ipv4_mapped() {
                                 v4
@@ -267,10 +265,7 @@ pub async fn discover(
 }
 
 async fn broadcast_addrs() -> Vec<Ipv4Addr> {
-    // Use OS-reported directed broadcasts (via getifaddrs netmask) plus
-    // limited broadcast. The old class-based heuristic guessed wrong
-    // subnets (e.g. 172.20.x.x → 172.31.255.255) and omitted
-    // 255.255.255.255, which broke Linux↔Mac discovery.
+    // Use OS-reported directed broadcasts plus the limited broadcast address.
     crate::interfaces::broadcast_addrs().await
 }
 

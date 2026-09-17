@@ -8,11 +8,9 @@ pub trait Progress: Send + Sync {
     /// read and parsed, but before any file data flows. The default
     /// implementation does nothing, so simple consumers can ignore it.
     /// The implementation receives the parsed `Manifest` plus a
-    /// `TransferSummary` describing what is about to be transferred —
-    /// single file, multiple files, or a folder — so the UI can print a
-    /// clear header (e.g. "Receiving folder `myrepo/` (12 files, …)")
-    /// and pre-allocate per-file bars before the progress events start
-    /// arriving. UIs that build bars from per-file `started` calls
+    /// `TransferSummary` describing the transfer type and size. The UI can
+    /// print a clear header and pre-allocate per-file bars before progress
+    /// events arrive. UIs that build bars from per-file `started` calls
     /// exclusively can leave this as a no-op.
     fn manifest_received(&self, _manifest: &crate::manifest::Manifest, _summary: &TransferSummary) {
     }
@@ -101,7 +99,7 @@ impl TransferSummary {
                 display_name: name,
             };
         }
-        // Multiple files: all share a common first component → folder.
+        // Multiple files with one shared first component form a folder.
         let first_components: Vec<&str> = m
             .files
             .iter()
@@ -191,11 +189,7 @@ mod tests {
 
     #[test]
     fn folder_name_with_space_classified_as_folder() {
-        // Regression: a folder name with a space (e.g. "Piete de Hooch")
-        // used to confuse the classifier because the old code split
-        // rel_path with Path::components which on Windows treats
-        // backslashes as separators. With forward-slash-only rel_paths
-        // the first component is the folder name as a single piece.
+        // Classify from relative paths so folder names with spaces remain intact.
         let m = manifest_with(&[
             "Piete de Hooch/readme.txt",
             "Piete de Hooch/figures/fig5.jpg",
@@ -207,8 +201,7 @@ mod tests {
 
     #[test]
     fn mixed_inputs_classified_as_files() {
-        // Multi input with file + dir → rel_paths are flat (a.txt, sub/x.bin),
-        // no common top-level directory → Files.
+        // A file and directory input have flat relative paths, so the kind is Files.
         let m = manifest_with(&["a.txt", "sub/x.bin"]);
         let s = TransferSummary::from_manifest(&m);
         assert_eq!(s.kind, TransferKind::Files);
@@ -217,8 +210,7 @@ mod tests {
 
     #[test]
     fn two_directories_classified_as_files() {
-        // Two directory inputs (multi input case) → rel_paths are
-        // dir1/a.bin, dir2/b.bin; no common root component → Files.
+        // Separate directory inputs have no shared root, so the kind is Files.
         let m = manifest_with(&["dir1/a.bin", "dir2/b.bin"]);
         let s = TransferSummary::from_manifest(&m);
         assert_eq!(s.kind, TransferKind::Files);

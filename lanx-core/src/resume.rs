@@ -20,7 +20,7 @@ pub struct ResumePlan {
     /// from `accepted`.
     pub offsets: HashMap<FileId, u64>,
     /// File IDs where the file already exists locally with matching
-    /// content — receiver will skip without contacting the sender for
+    /// content. The receiver skips these files without contacting the sender
     /// that file.
     pub complete: HashSet<FileId>,
     /// Pre-built incremental hasher states at each resume point. The
@@ -68,8 +68,7 @@ pub fn plan(manifest: &Manifest, dests: &Destinations) -> Result<ResumePlan, Res
             offsets.insert(entry.id, offset);
             // The hasher state is pre-built at the resume point so the
             // receiver can continue hashing without re-reading the prefix.
-            // For offset == 0 (fresh start), the hasher is still useful —
-            // it's empty and ready for new data.
+            // At offset 0, the hasher is empty and ready for new data.
             hashers.insert(entry.id, hasher);
         }
     }
@@ -133,7 +132,7 @@ fn compute_resume_point(
 
     // Walk chunks; for each chunk:
     //   - if it fits in remaining bytes: hash, compare, advance.
-    //   - if it doesn't: this is the resume chunk — its byte offset is the resume point.
+    //   - otherwise, this is the resume chunk and its offset is the resume point.
     //   - if hashes mismatch: this is the resume point.
     //
     // We also build an IncrementalHasher alongside the per-chunk
@@ -177,7 +176,7 @@ fn compute_resume_point(
             source: e,
         })?;
         if n < want {
-            // Partial file is shorter than this chunk — resume from the
+            // Partial file is shorter than this chunk. Resume from the
             // start of this chunk so the sender re-transmits the full
             // chunk. The truncated bytes are not fed into the hasher;
             // the receiver will re-receive this chunk and hash it then.
@@ -185,8 +184,8 @@ fn compute_resume_point(
         }
         let actual = blake3::hash(&buf[..want]);
         if actual.as_bytes() != expected {
-            // Hash mismatch — resume from this chunk's start. The hasher
-            // has already been fed all previously verified chunks.
+            // The hash differs. Resume from this chunk's start. The hasher
+            // has already been fed all verified chunks before this point.
             return Ok((bytes_read, false, hasher));
         }
         // Feed verified bytes into the incremental hasher so the receiver
