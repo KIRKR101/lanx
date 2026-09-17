@@ -85,7 +85,6 @@ pub async fn run(
     // file is what gets sent. Without `--zip`, directories are sent
     // natively: the manifest builder walks them and the receiver
     // reconstructs the folder structure (Path B in lanx-core).
-    ui::banner("send", "");
     let (_zip_cleanup, effective_paths) = if zip {
         let paths = paths.clone();
         let (zip_path, tmp) = tokio::task::spawn_blocking(move || zip_inputs(&paths))

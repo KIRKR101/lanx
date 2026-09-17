@@ -3,7 +3,6 @@
 //! Shape of a transfer on screen:
 //!
 //! ```text
-//! lanx · recv
 //!   ✓ found sender 192.168.1.120:29320
 //!   Theo_Kirk_CV.pdf          48.9 KiB      <- contents (sender lists
 //!                                              them, receiver approves them)

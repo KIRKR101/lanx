@@ -60,8 +60,6 @@ pub async fn run(
     parallel: u16,
     relay: Option<String>,
 ) -> Result<()> {
-    ui::banner("recv", "");
-
     if accept {
         eprintln!(
             "  {} {}",

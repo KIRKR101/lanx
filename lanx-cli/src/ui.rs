@@ -170,16 +170,6 @@ pub fn count_line(n: usize, total_bytes: u64) -> String {
     format!("{n} {word} {} {}", sep_dot(), human_bytes(total_bytes))
 }
 
-/// A short banner line introducing a phase, e.g. `lanx · sending`.
-pub fn banner(verb: &str, detail: &str) {
-    let head = format!("lanx {} {}", sep_dot(), verb);
-    if detail.is_empty() {
-        eprintln!("{}", bold(&head));
-    } else {
-        eprintln!("{}  {}", bold(&head), dim(detail));
-    }
-}
-
 /// Usable terminal width (columns) for the progress renderer's line
 /// padding. Falls back to 80 when the width can't be queried (piped
 /// output) and caps at 120 so very wide windows don't produce giant
