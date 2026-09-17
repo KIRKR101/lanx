@@ -132,7 +132,14 @@ async fn recv_handshake<S>(
 where
     S: AsyncReadExt + Unpin,
 {
-    let ciphertext = read_framed(stream).await?;
+    let Some(ciphertext) = read_framed(stream).await? else {
+        // Peer vanished mid-handshake: a real failure, not a clean
+        // shutdown (nothing was ever established to shut down).
+        return Err(CryptoError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed connection during handshake",
+        )));
+    };
     Ok(state.read_message(&ciphertext, payload_buf)?)
 }
 
@@ -169,27 +176,58 @@ where
                 let ciphertext = ciphertext.map_err(|_| {
                     CryptoError::Decrypt("pump idle timeout: no data received".to_string())
                 })??;
+                // Clean peer shutdown (FIN after its duplex closed):
+                // stop quietly instead of warning. Every normal
+                // session end, including fully-skipped transfers,
+                // takes this path on at least one side.
+                let Some(ciphertext) = ciphertext else {
+                    let _ = peer.shutdown().await;
+                    return Ok(());
+                };
                 let plain_len = state.read_message(&ciphertext, &mut plain)
                     .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
                 if plain_len == 0 {
                     continue;
                 }
-                peer.write_all(&plain[..plain_len]).await?;
+                // Local end already dropped (session over): stop
+                // quietly instead of warning about a broken pipe.
+                if let Err(e) = peer.write_all(&plain[..plain_len]).await {
+                    if e.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(CryptoError::Io(e));
+                }
             }
         }
     }
 }
 
-async fn read_framed<S>(stream: &mut S) -> Result<Vec<u8>, CryptoError>
+/// Read one length-prefixed frame. Returns `Ok(None)` on clean peer
+/// shutdown (EOF before a new frame starts), which every normal
+/// session teardown produces. A truncated frame body is still an
+/// error.
+async fn read_framed<S>(stream: &mut S) -> Result<Option<Vec<u8>>, CryptoError>
 where
     S: AsyncReadExt + Unpin,
 {
     let mut len_bytes = [0u8; LENGTH_PREFIX];
-    stream.read_exact(&mut len_bytes).await?;
+    match stream.read_exact(&mut len_bytes).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(CryptoError::Io(e)),
+    }
     let len = u16::from_be_bytes(len_bytes) as usize;
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(buf)
+    match stream.read_exact(&mut buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(CryptoError::Decrypt(
+                "connection closed mid-frame".to_string(),
+            ));
+        }
+        Err(e) => return Err(CryptoError::Io(e)),
+    }
+    Ok(Some(buf))
 }
 
 async fn write_all<S>(stream: &mut S, bytes: &[u8]) -> Result<(), CryptoError>
@@ -236,5 +274,29 @@ mod tests {
         let resp_read = resp.await.unwrap();
         assert_eq!(init_read, b"hello from responder");
         assert_eq!(resp_read, b"hello from initiator");
+    }
+
+    /// Regression: clean peer shutdown must read as `None`, not as an
+    /// "early eof" error. The pump maps `None` to a quiet exit; before
+    /// this, every normally-ending session (e.g. a fully-skipped
+    /// transfer) logged `encryption pump exited with error ... early eof`.
+    #[tokio::test]
+    async fn read_framed_clean_shutdown_is_not_an_error() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        a.shutdown().await.unwrap();
+        drop(a);
+        let frame = read_framed(&mut b).await.unwrap();
+        assert!(frame.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_framed_truncated_body_is_an_error() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        // Length prefix promises 5 bytes; only 2 arrive before EOF.
+        a.write_all(&[0x00, 0x05, 0xAA, 0xBB]).await.unwrap();
+        a.shutdown().await.unwrap();
+        drop(a);
+        let err = read_framed(&mut b).await.unwrap_err();
+        assert!(err.to_string().contains("mid-frame"), "got: {err}");
     }
 }
