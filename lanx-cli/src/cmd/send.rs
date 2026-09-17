@@ -7,8 +7,7 @@ use lanx_core::manifest::{
 use lanx_core::transfer::sender::{run_sender, SenderConfig};
 use lanx_core::transfer::DEFAULT_MAX_RETRIES;
 use lanx_net::discovery::{
-    code_entropy_bits, code_to_pairing_id, code_to_psk, generate_code_with_words,
-    start_broadcasting,
+    code_to_pairing_id, code_to_psk, generate_code_with_words, start_broadcasting,
 };
 use lanx_net::relay::{
     read_relay_challenge, relay_auth_proof, send_relay_hello, RelayHello, RelayRole,
@@ -203,16 +202,7 @@ pub async fn run(
             label_w,
         );
     } else {
-        let entropy = code_entropy_bits(&code);
-        ui::kv(
-            "code",
-            &format!(
-                "{}  {}",
-                ui::bold(&code),
-                ui::dim(&format!("(~{entropy:.0} bits)"))
-            ),
-            label_w,
-        );
+        ui::kv("code", &ui::bold(&code), label_w);
         if passphrase.is_some() {
             eprintln!(
                 "  {} {}",
