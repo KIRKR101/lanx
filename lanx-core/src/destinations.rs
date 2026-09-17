@@ -646,8 +646,10 @@ mod tests {
         // failure only surfaced after approval).
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("dest");
-        let depth = (crate::manifest::MAX_REL_PATH_BYTES - 40) / 2;
+        let required_rel_len = MAX_DEST_PATH_BYTES.saturating_sub(out.as_os_str().len()) + 1;
+        let depth = required_rel_len.div_ceil(2);
         let rel = "a/".repeat(depth) + "b.bin";
+        assert!(rel.len() <= crate::manifest::MAX_REL_PATH_BYTES);
         let m = Manifest {
             files: vec![
                 FileEntry {
