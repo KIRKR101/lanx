@@ -17,5 +17,6 @@ pub use progress::{NoopProgress, Progress};
 pub use resume::ResumePlan;
 pub use transfer::{
     receiver::{Approval, AutoAccept, ManifestApprover},
-    ControlMsg, HelloInfo, ProtocolError, PROTOCOL_VERSION,
+    supports_protocol_version, ControlMsg, HelloInfo, ProtocolError, PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };

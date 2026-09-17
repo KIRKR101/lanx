@@ -281,7 +281,7 @@ pub async fn run(
             );
         } else {
             // Fresh grace window for this round: after a failed session the
-            // receiver's retry loop reconnects and resumes (plan.md §8 A).
+            // receiver's retry loop reconnects and resumes.
             listener.reset();
             let wait_msg = if had_session {
                 format!("waiting for receiver reconnection{}", ui::ellipsis())

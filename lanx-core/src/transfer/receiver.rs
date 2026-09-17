@@ -2,8 +2,8 @@
 //! hash incrementally.
 
 use super::{
-    read_frame, write_frame, ControlMsg, HelloInfo, ProtocolError, DEFAULT_MAX_RETRIES,
-    PROTOCOL_VERSION,
+    read_frame, supports_protocol_version, write_frame, ControlMsg, HelloInfo, ProtocolError,
+    DEFAULT_MAX_RETRIES, PROTOCOL_VERSION,
 };
 use crate::destinations::resolve_destinations;
 use crate::hashing::IncrementalHasher;
@@ -135,7 +135,7 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
             chunk_size,
             parallel,
         }) => {
-            if version != PROTOCOL_VERSION {
+            if !supports_protocol_version(version) {
                 return Err(ProtocolError::VersionMismatch {
                     sender: version,
                     receiver: PROTOCOL_VERSION,
@@ -168,7 +168,7 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
             chunk_size,
             parallel,
         }) => {
-            if version != PROTOCOL_VERSION {
+            if !supports_protocol_version(version) {
                 return Err(ProtocolError::VersionMismatch {
                     sender: version,
                     receiver: PROTOCOL_VERSION,
@@ -371,20 +371,12 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
     Ok(report)
 }
 
-/// Read either a single-frame `Manifest` message or a streaming manifest.
+/// Read the streaming manifest.
 async fn read_manifest<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Manifest, ProtocolError> {
     let first = read_frame(reader).await?;
     match first {
-        ControlMsg::Manifest(m) => {
-            tracing::warn!(
-                "received legacy single-frame Manifest; \
-                 sender should be updated to use streaming manifest"
-            );
-            validate_manifest(&m)?;
-            Ok(m)
-        }
         ControlMsg::ManifestStart {
             total_files,
             total_bytes,
@@ -483,25 +475,6 @@ async fn read_streaming_manifest<R: tokio::io::AsyncRead + Unpin>(
         chunk_size,
         source_root: PathBuf::new(),
     })
-}
-
-fn validate_manifest(m: &Manifest) -> Result<(), ProtocolError> {
-    if m.files.len() > MAX_MANIFEST_FILES {
-        return Err(ProtocolError::Unexpected(format!(
-            "manifest has {} files, maximum is {MAX_MANIFEST_FILES}",
-            m.files.len(),
-        )));
-    }
-    if m.chunk_size == 0 || m.chunk_size > MAX_CHUNK_SIZE {
-        return Err(ProtocolError::Unexpected(format!(
-            "chunk_size {} is out of valid range (1..{MAX_CHUNK_SIZE})",
-            m.chunk_size,
-        )));
-    }
-    for entry in &m.files {
-        validate_entry(entry)?;
-    }
-    Ok(())
 }
 
 fn validate_entry(entry: &FileEntry) -> Result<(), ProtocolError> {

@@ -3,8 +3,8 @@
 //! controls the retry loop (verdict after each file).
 
 use super::{
-    read_frame, write_frame, ControlMsg, HelloInfo, ProtocolError, DEFAULT_MAX_RETRIES,
-    PROTOCOL_VERSION,
+    read_frame, supports_protocol_version, write_frame, ControlMsg, HelloInfo, ProtocolError,
+    DEFAULT_MAX_RETRIES, PROTOCOL_VERSION,
 };
 use crate::hashing::IncrementalHasher;
 use crate::manifest::{FileEntry, FileId, Manifest};
@@ -96,7 +96,7 @@ where
             chunk_size: _,
             parallel,
         }) => {
-            if version != PROTOCOL_VERSION {
+            if !supports_protocol_version(version) {
                 return Err(ProtocolError::VersionMismatch {
                     sender: version,
                     receiver: PROTOCOL_VERSION,

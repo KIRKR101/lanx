@@ -1,6 +1,6 @@
 //! End-to-end transfer integration tests over in-process TCP. These
 //! cover the happy path, resume, and corrupt-chunk re-fetch scenarios
-//! from `plan.md` §13.
+//! and protocol message validation.
 
 use lanx_core::destinations::resolve_destinations;
 use lanx_core::manifest::{build, rel_to_path, FileEntry, FileId, Manifest, DEFAULT_CHUNK_SIZE};
@@ -82,6 +82,36 @@ async fn read_streaming_manifest<R: tokio::io::AsyncRead + Unpin>(reader: &mut R
         chunk_size,
         source_root: PathBuf::new(),
     }
+}
+
+async fn write_streaming_manifest<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    manifest: &Manifest,
+) {
+    let total_bytes: u64 = manifest.files.iter().map(|file| file.size).sum();
+    write_frame(
+        writer,
+        &ControlMsg::ManifestStart {
+            total_files: manifest.files.len() as u64,
+            total_bytes,
+        },
+    )
+    .await
+    .unwrap();
+    for entry in &manifest.files {
+        write_frame(writer, &ControlMsg::ManifestEntry(entry.clone()))
+            .await
+            .unwrap();
+    }
+    write_frame(
+        writer,
+        &ControlMsg::ManifestEnd {
+            chunk_size: manifest.chunk_size,
+        },
+    )
+    .await
+    .unwrap();
+    writer.flush().await.unwrap();
 }
 
 #[tokio::test]
@@ -687,10 +717,7 @@ async fn receiver_gives_up_after_max_retries() {
             chunk_size: DEFAULT_CHUNK_SIZE,
             source_root: PathBuf::new(),
         };
-        write_frame(&mut peer_w, &ControlMsg::Manifest(manifest))
-            .await
-            .unwrap();
-        peer_w.flush().await.unwrap();
+        write_streaming_manifest(&mut peer_w, &manifest).await;
 
         let ack = read_frame(&mut peer_r).await.unwrap();
         assert!(matches!(ack, ControlMsg::ManifestAck { .. }));
@@ -1012,10 +1039,7 @@ async fn chunk_level_repair_fixes_corrupt_chunks() {
         .unwrap();
         peer_w.flush().await.unwrap();
 
-        write_frame(&mut peer_w, &ControlMsg::Manifest(manifest.clone()))
-            .await
-            .unwrap();
-        peer_w.flush().await.unwrap();
+        write_streaming_manifest(&mut peer_w, &manifest).await;
 
         let ack = read_frame(&mut peer_r).await.unwrap();
         assert!(matches!(ack, ControlMsg::ManifestAck { .. }));

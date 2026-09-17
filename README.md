@@ -4,6 +4,23 @@ Transfer files and directories between machines over a local network. No interne
 
 Transfers are encrypted, verified with BLAKE3, and can be resumed if interrupted.
 
+## Protocol versioning
+
+The transfer protocol has one active wire version, currently `4`. Sender and
+receiver exchange this value in the initial `Hello` messages. A version the
+build does not support stops the transfer before the manifest is sent.
+The crate version and CLI version identify the release; they do not negotiate
+wire compatibility.
+
+The current protocol uses length-prefixed postcard control frames. It streams
+the manifest as `ManifestStart`, one `ManifestEntry` per file, and
+`ManifestEnd`, then sends file data after `FileStart` and `ChunkHeader`
+messages. A protocol change that alters message layout or message order
+requires a new `PROTOCOL_VERSION`. To add compatibility later, add the older
+version to the supported-version list, negotiate the selected version during
+the handshake, and keep its decoder and message rules explicit. Do not accept
+an older version without a version-specific implementation.
+
 ## Install
 
 ```sh

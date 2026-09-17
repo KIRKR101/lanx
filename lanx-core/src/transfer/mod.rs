@@ -1,8 +1,8 @@
 //! Transfer state machines: sender and receiver.
 //!
-//! Wire protocol is documented in `plan.md` §6. Control messages are
-//! length-prefixed (u32 BE) postcard payloads. The data plane (file bytes)
-//! follows a `ChunkHeader` control message inline on the same stream.
+//! Control messages are length-prefixed (u32 BE) postcard payloads. The
+//! manifest uses `ManifestStart`, `ManifestEntry`, and `ManifestEnd`; file
+//! bytes follow `ChunkHeader` inline on the same stream.
 
 pub mod receiver;
 pub mod sender;
@@ -10,7 +10,26 @@ pub mod sender;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Current control-protocol version. Peers must use the same value.
 pub const PROTOCOL_VERSION: u16 = 4;
+
+/// Versions this build can decode and execute.
+///
+/// Keep this list separate from [`PROTOCOL_VERSION`] so a future release can
+/// negotiate an older version without changing the version-check call sites.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u16] = &[PROTOCOL_VERSION];
+
+#[must_use]
+pub const fn supports_protocol_version(version: u16) -> bool {
+    let mut index = 0;
+    while index < SUPPORTED_PROTOCOL_VERSIONS.len() {
+        if SUPPORTED_PROTOCOL_VERSIONS[index] == version {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
 
 /// Default maximum number of retries per file on hash mismatch. Both
 /// sender and receiver use this value so they agree on when to give up.
@@ -27,13 +46,11 @@ pub struct HelloInfo {
     pub parallel: u16,
 }
 
-/// Control-plane message. See `plan.md` §6.2.
+/// Current control-plane message set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMsg {
     Hello(HelloInfo),
-    /// Single-frame manifest accepted for protocol compatibility.
-    Manifest(crate::manifest::Manifest),
-    /// First message of a streaming manifest. `total_files` and
+    /// First message of the manifest. `total_files` and
     /// `total_bytes` let the receiver pre-allocate UI state.
     ManifestStart {
         total_files: u64,
@@ -170,23 +187,6 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<ControlMsg, P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{FileEntry, Manifest, DEFAULT_CHUNK_SIZE};
-    use std::path::PathBuf;
-
-    fn test_manifest() -> Manifest {
-        Manifest {
-            files: vec![FileEntry {
-                id: 0,
-                rel_path: "test.bin".to_string(),
-                size: 1024,
-                chunk_size: DEFAULT_CHUNK_SIZE,
-                chunk_hashes: vec![[0xAB; 32]],
-            }],
-            chunk_size: DEFAULT_CHUNK_SIZE,
-            source_root: PathBuf::new(),
-        }
-    }
-
     #[test]
     fn hello_round_trip() {
         let msg = ControlMsg::Hello(HelloInfo {
@@ -197,19 +197,6 @@ mod tests {
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(format!("{msg:?}"), format!("{decoded:?}"));
-    }
-
-    #[test]
-    fn manifest_round_trip() {
-        let msg = ControlMsg::Manifest(test_manifest());
-        let encoded = postcard::to_allocvec(&msg).unwrap();
-        let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();
-        if let ControlMsg::Manifest(m) = decoded {
-            assert_eq!(m.files.len(), 1);
-            assert_eq!(m.files[0].rel_path, "test.bin");
-        } else {
-            panic!("expected Manifest variant");
-        }
     }
 
     #[test]
