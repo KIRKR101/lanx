@@ -1,7 +1,7 @@
 //! UDP-broadcast discovery + pairing codes.
 //!
 //! Wire format: on UDP port 53317, send a small postcard-encoded packet
-//! containing `{port: u16, code_hash: [u8; 32]}`.
+//! containing `{port: u16, code_hash: [u8; 32], auth_tag: [u8; 32]}`.
 //! Receivers filter by `code_hash` (now a domain-separated pairing ID,
 //! see [`code_to_pairing_id`]).
 //!
@@ -38,6 +38,7 @@ const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(1);
 struct Announce {
     port: u16,
     code_hash: [u8; 32],
+    auth_tag: [u8; 32],
 }
 
 #[derive(Debug, Error)]
@@ -321,6 +322,7 @@ impl DiscoveryHandle {
 /// Returns an I/O error if the UDP socket cannot be bound.
 pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<DiscoveryHandle> {
     let code_hash = code_to_hash(code);
+    let auth_tag = discovery_auth_tag(code, port, &code_hash);
     let (tx, mut rx) = tokio::sync::watch::channel(false);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let join = tokio::spawn(async move {
@@ -332,10 +334,15 @@ pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<Discov
                 return;
             }
         };
-        let _ = sock.set_broadcast(true);
-        // Best-effort: SO_BROADCAST failure means broadcast discovery may
-        // not work, but we continue anyway (unicast still functions).
-        let payload = match postcard::to_allocvec(&Announce { port, code_hash }) {
+        if let Err(e) = sock.set_broadcast(true) {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+        let payload = match postcard::to_allocvec(&Announce {
+            port,
+            code_hash,
+            auth_tag,
+        }) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(?e, "announce encode failed");
@@ -402,6 +409,7 @@ pub async fn start_broadcasting(port: u16, code: &str) -> std::io::Result<Discov
 /// malformed, or `DiscoveryError::Io` for socket failures.
 pub async fn discover(
     expected_hash: &[u8; 32],
+    code: &str,
     dur: Duration,
 ) -> Result<SocketAddr, DiscoveryError> {
     let sock = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
@@ -424,7 +432,10 @@ pub async fn discover(
         loop {
             let (n, src) = sock.recv_from(&mut buf).await?;
             if let Ok(a) = postcard::from_bytes::<Announce>(&buf[..n]) {
-                if &a.code_hash == expected_hash {
+                if &a.code_hash == expected_hash
+                    && a.port != 0
+                    && a.auth_tag == discovery_auth_tag(code, a.port, &a.code_hash)
+                {
                     let target_ip = match src.ip() {
                         std::net::IpAddr::V4(v4) => v4,
                         std::net::IpAddr::V6(v6) => {
@@ -453,6 +464,14 @@ pub async fn discover(
     .await
     .map_err(|_| DiscoveryError::Timeout)??;
     Ok(res)
+}
+
+fn discovery_auth_tag(code: &str, port: u16, code_hash: &[u8; 32]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(2 + code_hash.len() + 16);
+    input.extend_from_slice(b"lanx discovery v1");
+    input.extend_from_slice(&port.to_be_bytes());
+    input.extend_from_slice(code_hash);
+    *blake3::keyed_hash(&code_to_psk(code, None), &input).as_bytes()
 }
 
 async fn broadcast_addrs() -> Vec<Ipv4Addr> {

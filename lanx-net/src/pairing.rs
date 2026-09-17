@@ -75,7 +75,7 @@ pub async fn resolve_target(
         Target::Addr(a) => Ok(a),
         Target::Code(code) => {
             let expected = crate::discovery::code_to_hash(&code);
-            let addr = crate::discovery::discover(&expected, timeout)
+            let addr = crate::discovery::discover(&expected, &code, timeout)
                 .await
                 .map_err(|e| TargetError::Discovery(e.to_string()))?;
             Ok(addr)

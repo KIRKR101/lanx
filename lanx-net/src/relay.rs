@@ -4,13 +4,9 @@
 //!
 //! # Security note
 //!
-//! The `RelayHello` (containing the pairing ID derived via
-//! `code_to_pairing_id`) is sent in plaintext before the Noise handshake
-//! wraps the connection. The relay needs the raw ID to pair sender and
-//! receiver, so encrypting it is not feasible without relay participation
-//! in the key derivation. Treat the pairing ID as *public*: secrecy comes
-//! from the PSK mixed into the `Noise_NNpsk0` handshake
-//! (`code_to_psk`), which the relay never sees.
+//! The pairing ID is sent in plaintext because the relay needs it for lookup.
+//! Operator auth uses a fresh challenge-response proof, so the bearer token
+//! itself is never sent and captured proofs cannot be replayed.
 //!
 //! Guessing mitigations in this file: receivers that guess wrong wait up
 //! to `RECEIVER_WAIT_SECS` and are rate-limited per IP
@@ -22,6 +18,7 @@
 //! Internet-facing deployments should additionally use `--code-words 4`
 //! (or higher) and an out-of-band `--psk` passphrase.
 
+use rand::RngCore;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -88,6 +85,7 @@ const RECEIVER_WAIT_SECS: u64 = 30;
 /// Maximum concurrent paired transfers the relay will handle. Prevents
 /// unbounded memory growth from fork/bomb attacks.
 const MAX_ACTIVE_SESSIONS: usize = 256;
+const MAX_RECEIVER_WAITERS: usize = 256;
 pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Maximum failed pairing attempts per IP within `RATE_LIMIT_WINDOW`
@@ -112,6 +110,8 @@ pub const RELAY_ACK_OK: u8 = 0;
 pub const RELAY_ACK_IN_USE: u8 = 1;
 /// Server at capacity (`MAX_PENDING_SENDERS`).
 pub const RELAY_ACK_FULL: u8 = 2;
+const RELAY_CHALLENGE_LEN: usize = 32;
+const RELAY_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Per-IP failure counters for relay guessing rate limiting.
 #[derive(Debug, Default)]
@@ -213,6 +213,7 @@ pub struct RelayServer {
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-IP failed-guess counters for rate limiting receivers.
     attempts: Arc<Mutex<AttemptTracker>>,
+    receiver_waiters: Arc<tokio::sync::Semaphore>,
     config: RelayConfig,
 }
 
@@ -240,6 +241,7 @@ impl RelayServer {
             pending_senders: Arc::new(Mutex::new(HashMap::new())),
             active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             attempts: Arc::new(Mutex::new(AttemptTracker::default())),
+            receiver_waiters: Arc::new(tokio::sync::Semaphore::new(MAX_RECEIVER_WAITERS)),
             config,
         })
     }
@@ -299,7 +301,13 @@ impl RelayServer {
                             let sessions = self.active_sessions.clone();
                             let attempts = self.attempts.clone();
                             let config = self.config.clone();
+                            let waiters = self.receiver_waiters.clone();
+                            let Ok(permit) = waiters.try_acquire_owned() else {
+                                tracing::warn!(addr = %addr, "rejecting receiver: wait capacity reached");
+                                continue;
+                            };
                             receiver_set.spawn(async move {
+                                let _permit = permit;
                                 if let Err(e) = handle_receiver(stream, addr, pending, sessions, attempts, config).await {
                                     tracing::warn!(addr = %addr, error = %e, "receiver handler error");
                                 }
@@ -350,6 +358,41 @@ async fn read_relay_hello(
     Ok(hello)
 }
 
+async fn send_relay_challenge(
+    stream: &mut TcpStream,
+) -> Result<[u8; RELAY_CHALLENGE_LEN], RelayError> {
+    let mut challenge = [0u8; RELAY_CHALLENGE_LEN];
+    rand::thread_rng().fill_bytes(&mut challenge);
+    stream.write_all(&challenge).await?;
+    stream.flush().await?;
+    Ok(challenge)
+}
+
+/// Read the relay's fresh authentication challenge before sending a hello.
+pub async fn read_relay_challenge(
+    stream: &mut (impl AsyncReadExt + Unpin),
+) -> Result<[u8; RELAY_CHALLENGE_LEN], RelayError> {
+    let mut challenge = [0u8; RELAY_CHALLENGE_LEN];
+    stream.read_exact(&mut challenge).await?;
+    Ok(challenge)
+}
+
+/// Create a relay authentication proof without exposing the operator token.
+pub fn relay_auth_proof(
+    token: &str,
+    challenge: &[u8; RELAY_CHALLENGE_LEN],
+    code_hash: &[u8; 32],
+) -> String {
+    let key = blake3::hash(token.as_bytes());
+    let mut input = Vec::with_capacity(2 + challenge.len() + code_hash.len());
+    input.extend_from_slice(b"lanx relay auth v1");
+    input.extend_from_slice(challenge);
+    input.extend_from_slice(code_hash);
+    blake3::keyed_hash(key.as_bytes(), &input)
+        .to_hex()
+        .to_string()
+}
+
 /// Send a relay hello on a stream (used for testing / protocol messages).
 ///
 /// # Errors
@@ -392,8 +435,19 @@ async fn handle_sender(
         tracing::debug!(?e, "TCP_NODELAY failed on sender");
     }
 
-    let hello = read_relay_hello(&mut stream).await?;
-    if auth_token.as_deref() != hello.auth_token.as_deref() {
+    let challenge = send_relay_challenge(&mut stream).await?;
+    let hello = tokio::time::timeout(RELAY_HELLO_TIMEOUT, read_relay_hello(&mut stream))
+        .await
+        .map_err(|_| {
+            RelayError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "relay hello timeout",
+            ))
+        })??;
+    let expected_auth = auth_token
+        .as_deref()
+        .map(|token| relay_auth_proof(token, &challenge, &hello.code_hash));
+    if expected_auth.as_deref() != hello.auth_token.as_deref() {
         return Err(RelayError::Authentication);
     }
     if hello.role != RelayRole::Sender {
@@ -522,8 +576,20 @@ async fn handle_receiver(
         tracing::debug!(?e, "TCP_NODELAY failed on receiver");
     }
 
-    let hello = read_relay_hello(&mut stream).await?;
-    if config.auth_token.as_deref() != hello.auth_token.as_deref() {
+    let challenge = send_relay_challenge(&mut stream).await?;
+    let hello = tokio::time::timeout(RELAY_HELLO_TIMEOUT, read_relay_hello(&mut stream))
+        .await
+        .map_err(|_| {
+            RelayError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "relay hello timeout",
+            ))
+        })??;
+    let expected_auth = config
+        .auth_token
+        .as_deref()
+        .map(|token| relay_auth_proof(token, &challenge, &hello.code_hash));
+    if expected_auth.as_deref() != hello.auth_token.as_deref() {
         return Err(RelayError::Authentication);
     }
     if hello.role != RelayRole::Receiver {
