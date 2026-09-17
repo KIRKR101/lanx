@@ -528,6 +528,13 @@ fn matches_filter(pattern: &str, path: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        let suffix = format!("/{prefix}");
+        return path == prefix
+            || path.starts_with(&format!("{prefix}/"))
+            || path.ends_with(&suffix)
+            || path.contains(&format!("{suffix}/"));
+    }
     fn matches(p: &[u8], s: &[u8]) -> bool {
         if p.is_empty() {
             return s.is_empty();
@@ -1312,6 +1319,21 @@ mod tests {
         assert!(paths.iter().any(|p| p.ends_with("nested.txt")));
         assert!(!paths.iter().any(|p| p.ends_with("skip.log")));
         assert!(!paths.iter().any(|p| p.ends_with(".secret")));
+
+        let descendants_excluded = build_with_filters(
+            &[dir.path().to_path_buf()],
+            1024,
+            &FilterOptions {
+                include_hidden: true,
+                exclude: vec!["sub/**".into()],
+                include: vec![],
+            },
+        )
+        .unwrap();
+        assert!(!descendants_excluded
+            .files
+            .iter()
+            .any(|file| file.rel_path.ends_with("nested.txt")));
     }
 
     #[test]
