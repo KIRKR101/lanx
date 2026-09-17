@@ -6,7 +6,8 @@
 //!   ✓ found sender  192.168.1.120:29320
 //!   sketch.png                48.9 KiB      <- contents (receiver
 //!                                              approves them here)
-//!   [1/1] sketch.png        ▕████████████████▏  100%   48.9 KiB ✓
+//!   [1/1] sketch.png    ▕████████████████▏  100%   48.9 KiB / 48.9 KiB
+//!   [1/1] sketch.png                     48.9 KiB ✓   <- collapsed result
 //!   ✓ Done · 1 file · 48.9 KiB                     <- result
 //! ```
 //!
@@ -63,6 +64,11 @@ struct RenderState {
 /// terminal. Chunk events can arrive hundreds of times per second;
 /// faster than this the line just flickers and wastes SSH bandwidth.
 const RENDER_THROTTLE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Files below this size skip opening and mid-flight rows and jump
+/// straight to their completed row. A 41 B file's bar conveys
+/// nothing; the result row says everything.
+const SMALL_FILE_MAX: u64 = 64 * 1024;
 
 /// Percent step between printed lines in non-animated mode (piped
 /// output, dumb terminals). Start/finish lines always print.
@@ -126,19 +132,9 @@ impl IndicatifProgress {
         })
     }
 
-    /// Display label for a file: its root-stripped relative path
-    /// (see [`ui::display_names`]), middle-truncated to fit `max`
-    /// characters. The full relative path stays visible so identical
-    /// basenames in different directories never go ambiguous; only
-    /// overlong names truncate. `id` indexes into `display`.
-    fn label_for(display: &[String], id: FileId, max: usize) -> String {
-        let rel = display.get(id as usize).cloned().unwrap_or_default();
-        truncate_middle(&rel, max)
-    }
-
     /// Render the per-file line for `id`. On first render (`fresh_line`)
-    /// this prints a fresh line; on subsequent renders the previous line
-    /// is overwritten with a carriage return. The file's manifest index
+    /// this starts a new terminal line; on subsequent renders the
+    /// previous line is overwritten in place. The file's manifest index
     /// is used as the `[N/M]` counter.
     fn render_file(&self, id: FileId, fresh_line: bool) {
         let (bytes, total, file_idx, file_count, done, ok, skipped, rate_bps, rel_paths) = {
@@ -168,9 +164,9 @@ impl IndicatifProgress {
 
         let width = ui::term_width();
         let animated = ui::animated();
-        // Compact counter: the padded `[ 1/17]` form wastes columns
-        // that the filename needs more.
-        let counter = format!("[{file_idx}/{file_count}]");
+        // Uniform counter field so `[1/5]` and `[10/15]` rows align.
+        let counter_w = format!("[{file_count}/{file_count}]").len();
+        let counter = format!("{:<counter_w$}", format!("[{file_idx}/{file_count}]"));
 
         let pct = ui::percent(bytes, total);
 
@@ -194,115 +190,198 @@ impl IndicatifProgress {
         // listing, live rows, and result rows all show the same
         // root-stripped relative path.
         let display = ui::display_names(&rel_paths);
+        let name = display.get(id as usize).cloned().unwrap_or_default();
 
-        // Finished rows collapse to a quiet result: no bar, no
-        // percent. The bar only exists while bytes are moving, so the
-        // terminal history stays clean. `✓` means BLAKE3-verified,
-        // not merely 100%: file_done(true) fires only after the hash
-        // checks out on the receiver (and after the receiver confirms
-        // it on the sender).
-        const BAR_W: usize = 16;
-        let show_bar = animated && !done && width > counter.chars().count() + 52;
-        let size_txt = ui::human_bytes(total);
-        let mut live = String::new();
-        if !done && animated {
-            // In flight, both byte values earn their space: the total
-            // alone can't show how far along a large file is.
-            let r = ui::human_rate(rate_bps);
-            if !r.is_empty() {
-                live.push_str("  ");
-                live.push_str(&ui::dim(&r));
-                let eta = ui::human_eta(total.saturating_sub(bytes), rate_bps);
-                if !eta.is_empty() {
-                    live.push_str("  ");
-                    live.push_str(&ui::dim(&eta));
-                }
-            }
+        // A two-line row's second line is always a continuation, never
+        // an in-place rewrite (which would erase the first line).
+        let row = RowLayout {
+            counter: &counter,
+            name: &name,
+            bytes,
+            total,
+            done,
+            ok,
+            skipped,
+            rate_bps,
+            width,
+            animated,
+        };
+        let mut first = true;
+        for line in layout_row(&row) {
+            write_line(&line, width, fresh_line && first);
+            first = false;
         }
-        // Drop the live fields first when space is tight; the bar and
-        // the filename matter more.
-        let live_w = ui::visible_width(&live);
-        if width.saturating_sub(counter.chars().count() + 50 + live_w) < 8 {
-            live.clear();
-        }
-        let mut fixed = counter.chars().count() + 2;
-        if show_bar {
-            fixed += BAR_W + 2 + 2;
-        }
-        if !done {
-            // Percent (4) + gaps (5) + done/total + live + status gap.
-            let flow = format!("{} / {}", ui::human_bytes(bytes), ui::human_bytes(total));
-            fixed += 4 + 5 + flow.chars().count() + ui::visible_width(&live) + 2;
-        } else {
-            // Size + status gap.
-            fixed += 3 + size_txt.chars().count() + 2;
-        }
-        let label_max = width.saturating_sub(fixed).clamp(8, 32);
-        let label = Self::label_for(&display, id, label_max);
-
-        let mut line = String::new();
-        if skipped {
-            // Skipped files never enter an active state and keep their
-            // index: the transferred item starting at [5/5] explains
-            // itself. The whole row dims as a no-op.
-            line.push_str(&ui::dim(&counter));
-            line.push_str("  ");
-            line.push_str(&ui::pad_visible(&ui::dim(&label), label_max));
-            line.push_str("  ");
-            line.push_str(&ui::dim("already present"));
-            write_line(&line, width, fresh_line);
-            return;
-        }
-        line.push_str(&counter);
-        line.push_str("  ");
-        line.push_str(&ui::pad_visible(&label, label_max));
-        if show_bar {
-            line.push_str("  ");
-            line.push_str(&ui::mini_bar(bytes, total, BAR_W));
-            line.push_str(&format!("  {:>3}%", pct));
-            line.push_str(&format!(
-                "   {} / {}",
-                ui::human_bytes(bytes),
-                ui::human_bytes(total)
-            ));
-            line.push_str(&live);
-        } else if !done {
-            // No room (or no animation) for the bar: percent and
-            // totals still show movement.
-            line.push_str(&format!("  {:>3}%", pct));
-            line.push_str("   ");
-            line.push_str(&size_txt);
-        } else {
-            line.push_str("   ");
-            line.push_str(&size_txt);
-        }
-
-        // Status tail.
-        if done {
-            if ok {
-                line.push(' ');
-                line.push_str(&ui::green(ui::ok_sym()));
-            } else {
-                line.push(' ');
-                line.push_str(&ui::red(ui::fail_sym()));
-            }
-        }
-
-        write_line(&line, width, fresh_line);
     }
 }
 
-/// Clamp `line` to the terminal width so it never wraps (a wrapped
-/// line breaks the in-place `\r` update into stacked lines), pad it
-/// so a previous, longer line is fully cleared, then emit it: in
-/// place on animated terminals, as its own plain line otherwise.
+/// Below this terminal width, finished rows split in two instead of
+/// squeezing the path: a deliberately stacked pair reads as
+/// intentional, while edge-wrapping reads as broken.
+const NARROW_W: usize = 60;
+/// Live bar width in cells. Capped so the filename keeps the space.
+const BAR_W: usize = 16;
+/// Filename column bounds in cells of display width.
+const LABEL_MAX_W: usize = 32;
+const LABEL_MIN_W: usize = 8;
+
+/// Inputs to [`layout_row`]: one file's display state plus the
+/// terminal it must fit.
+struct RowLayout<'a> {
+    counter: &'a str,
+    name: &'a str,
+    bytes: u64,
+    total: u64,
+    done: bool,
+    ok: bool,
+    skipped: bool,
+    rate_bps: f64,
+    width: usize,
+    animated: bool,
+}
+
+/// Lay out one file row for `width`. Pure: no IO, so tests pin widths
+/// without a real terminal. Returns one line, or two when `width` is
+/// below [`NARROW_W`]. Callers must still clamp through `write_line`
+/// as a final guarantee.
+///
+/// ```text
+/// [1/5]  docs/guide/chapter1.md       already present   (done/skip)
+/// [1/1]  big.bin  ▕███████░░░░░░░░░▏   73%   18.2 MiB / 25.0 MiB   (live)
+/// ```
+fn layout_row(row: &RowLayout<'_>) -> Vec<String> {
+    let narrow = row.width < NARROW_W;
+    let counter_w = ui::visible_width(row.counter);
+    let indent = " ".repeat(counter_w);
+
+    if row.skipped {
+        // Skipped files never enter an active state and keep their
+        // index: the transferred item starting at [5/5] explains
+        // itself. The whole row dims as a no-op.
+        let status = ui::dim("already present").to_string();
+        if !narrow {
+            let lw = label_budget(row.width, counter_w, ui::visible_width(&status));
+            let label = truncate_middle(row.name, lw);
+            return vec![format!(
+                "{}  {}  {status}",
+                ui::dim(row.counter),
+                ui::pad_visible(&ui::dim(&label), lw),
+            )];
+        }
+        let lw = row.width.saturating_sub(counter_w + 2).max(4);
+        let label = truncate_middle(row.name, lw);
+        return vec![
+            format!("{}  {label}", ui::dim(row.counter)),
+            format!("{indent}  {status}"),
+        ];
+    }
+
+    if row.done {
+        // Finished rows collapse to a quiet result: no bar, no
+        // percent. `✓` means BLAKE3-verified, not merely 100%:
+        // file_done(true) fires only after the hash checks out on
+        // the receiver (and after the receiver confirms it on the
+        // sender).
+        let mark = if row.ok {
+            ui::green(ui::ok_sym())
+        } else {
+            ui::red(ui::fail_sym())
+        };
+        let size = ui::human_bytes(row.total);
+        let result = format!("{size} {mark}");
+        let result_w = ui::visible_width(&result);
+        if !narrow {
+            let lw = label_budget(row.width, counter_w, result_w);
+            let label = truncate_middle(row.name, lw);
+            return vec![format!(
+                "{}  {}  {result}",
+                row.counter,
+                ui::pad_visible(&label, lw),
+            )];
+        }
+        let lw = row.width.saturating_sub(counter_w + 2).max(4);
+        let label = truncate_middle(row.name, lw);
+        return vec![
+            format!("{}  {label}", row.counter),
+            format!("{indent}  {result}"),
+        ];
+    }
+
+    // Live row: counter, label, capped bar, percent, done/total,
+    // rate + ETA. The bar is decorative; the filename keeps whatever
+    // space is left.
+    let pct = ui::percent(row.bytes, row.total);
+    let show_bar = row.animated && row.width > counter_w + 52;
+    let mut live = String::new();
+    if row.animated {
+        // In flight, both byte values earn their space: the total
+        // alone can't show how far along a large file is.
+        let r = ui::human_rate(row.rate_bps);
+        if !r.is_empty() {
+            live.push_str("  ");
+            live.push_str(&ui::dim(&r));
+            let eta = ui::human_eta(row.total.saturating_sub(row.bytes), row.rate_bps);
+            if !eta.is_empty() {
+                live.push_str("  ");
+                live.push_str(&ui::dim(&eta));
+            }
+        }
+    }
+    // Drop the live fields first when space is tight; the bar and
+    // the filename matter more.
+    let live_w = ui::visible_width(&live);
+    if row.width.saturating_sub(counter_w + 50 + live_w) < LABEL_MIN_W {
+        live.clear();
+    }
+    let mut fixed = counter_w + 2;
+    if show_bar {
+        fixed += BAR_W + 2 + 2;
+    }
+    // Percent (4) + gaps (5) + done/total + live + status gap.
+    let flow = format!(
+        "{} / {}",
+        ui::human_bytes(row.bytes),
+        ui::human_bytes(row.total)
+    );
+    fixed += 4 + 5 + ui::visible_width(&flow) + ui::visible_width(&live) + 2;
+    let lw = row
+        .width
+        .saturating_sub(fixed)
+        .clamp(LABEL_MIN_W, LABEL_MAX_W);
+    let label = truncate_middle(row.name, lw);
+
+    let mut line = String::from(row.counter);
+    line.push_str("  ");
+    line.push_str(&ui::pad_visible(&label, lw));
+    if show_bar {
+        line.push_str("  ");
+        line.push_str(&ui::mini_bar(row.bytes, row.total, BAR_W));
+    }
+    line.push_str(&format!("  {:>3}%", pct));
+    line.push_str("   ");
+    line.push_str(&flow);
+    line.push_str(&live);
+    vec![line]
+}
+
+/// Filename column width for a row whose right-hand side is
+/// `right_w` cells wide: whatever is left after the counter, gaps,
+/// and result, bounded so tiny terminals still show something and
+/// huge ones don't stretch names forever.
+fn label_budget(width: usize, counter_w: usize, right_w: usize) -> usize {
+    width
+        .saturating_sub(counter_w + 2 + right_w + 2)
+        .clamp(LABEL_MIN_W, LABEL_MAX_W)
+}
+
+/// Emit one composed row. In-place updates on animated terminals
+/// (`\r` + `ESC[2K`, no newline); fresh rows start with `\n` so
+/// consecutive files never concatenate onto one terminal line (which
+/// is what used to wrap at the screen edge). No padding: `ESC[2K`
+/// already clears shrunk lines, and padding is what pushed status
+/// columns hundreds of cells right on wide terminals. Lines are
+/// clamped to `width` as a final guarantee against wrapping.
 fn write_line(line: &str, width: usize, fresh_line: bool) {
-    // Clamp to the terminal width so the line never wraps (a
-    // wrapped line breaks the in-place `\r` update into stacked
-    // lines), then pad to the full width so the previous, longer
-    // line is fully cleared before we move on.
     let line = ui::truncate_visible(line, width);
-    let line = ui::pad_visible(&line, width);
 
     let stderr = std::io::stderr();
     let mut handle = stderr.lock();
@@ -312,11 +391,13 @@ fn write_line(line: &str, width: usize, fresh_line: bool) {
         // ESC[2K clears from the cursor to end of line. Dumb
         // terminals take the plain-line path below instead: they
         // may not understand either sequence.
-        if !fresh_line {
+        if fresh_line {
+            let _ = write!(handle, "\n{line}");
+        } else {
             let _ = handle.write_all(b"\r");
             let _ = handle.write_all(b"\x1b[2K");
+            let _ = write!(handle, "{line}");
         }
-        let _ = write!(handle, "{line}");
         let _ = handle.flush();
     } else {
         // Not animated (redirected/piped output, dumb terminal):
@@ -379,9 +460,13 @@ impl Progress for IndicatifProgress {
         );
         // Fresh line for each new file. When multiple connections are
         // active, files may start out of order; `fresh_line=true` prints
-        // each new file on its own line.
+        // each new file on its own line. Tiny files skip the opening
+        // 0% row entirely and jump straight to their result row.
+        let tiny = total < SMALL_FILE_MAX;
         drop(st);
-        self.render_file(id, true);
+        if !tiny {
+            self.render_file(id, true);
+        }
     }
 
     fn chunk_done(&self, id: FileId, bytes: u64) {
@@ -390,15 +475,22 @@ impl Progress for IndicatifProgress {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Sizes are copied out first so the borrow ends before
+            // the mutable file-state borrow below begins.
+            let total = st.sizes.get(&id).copied().unwrap_or(u64::MAX);
             match st.state.get_mut(&id) {
                 Some(s) => {
                     s.bytes = s.bytes.saturating_add(bytes);
                     s.rate.observe(s.bytes);
-                    // Animated terminals re-draw at most ~8Hz; faster
-                    // than that the line flickers and wastes bandwidth
-                    // (matters over SSH). Plain mode has its own
-                    // percent-bucket gate inside `render_file`.
-                    if ui::animated() {
+                    // Tiny files never render mid-flight rows; their
+                    // completion row says everything.
+                    if total < SMALL_FILE_MAX {
+                        false
+                    } else if ui::animated() {
+                        // Animated terminals re-draw at most ~8Hz; faster
+                        // than that the line flickers and wastes bandwidth
+                        // (matters over SSH). Plain mode has its own
+                        // percent-bucket gate inside `render_file`.
                         let now = Instant::now();
                         if now.duration_since(s.last_render) < RENDER_THROTTLE {
                             false
@@ -542,38 +634,58 @@ impl Progress for IndicatifProgress {
     }
 }
 
-/// Middle-truncate `s` to fit within `max` characters. Preserves the
-/// file extension at the end.
+/// Middle-truncate `s` to fit within `max` display cells (not chars:
+/// CJK text runs two cells per char, measured via
+/// [`ui::visible_width`]). Keeps the basename end since that is
+/// usually the useful part (`docs/…/chapter1.md`, never
+/// `docs/guide/chapt…`), preserving the extension.
 fn truncate_middle(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if ui::visible_width(s) <= max {
         return s.to_string();
     }
-    if max < 5 {
-        return s
-            .chars()
-            .rev()
-            .take(max)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
+    let marker = if ui::use_unicode() { "…" } else { "..." };
+    let marker_w = ui::visible_width(marker);
+    if max <= marker_w + 2 {
+        return take_width(s, max);
+    }
+    // Prefer keeping the whole basename: shrink the directory part,
+    // so `docs/guide/chapter1.md` becomes `docs/…/chapter1.md`
+    // rather than `docs/guide/chapt…`.
+    if let Some((dir, base)) = s.rsplit_once('/') {
+        let base_w = ui::visible_width(base);
+        if base_w + marker_w + 1 + 2 <= max {
+            let dir_keep = take_width(dir, max - marker_w - 1 - base_w);
+            return format!("{dir_keep}{marker}/{base}");
+        }
     }
     let (base, ext) = match s.rfind('.') {
         Some(i) if i > 0 && !s[i..].contains('/') => (&s[..i], &s[i..]),
         _ => (s, ""),
     };
-    let ext_keep = if !ext.is_empty() {
-        ext.chars().take(max.saturating_sub(4)).collect::<String>()
-    } else {
-        String::new()
-    };
-    let head_budget = max.saturating_sub(ext_keep.chars().count() + 1).max(2);
-    let prefix: String = base.chars().take(head_budget).collect();
-    if ui::use_unicode() {
-        format!("{prefix}…{ext_keep}")
-    } else {
-        format!("{prefix}...{ext_keep}")
+    let ext_keep = take_width(
+        ext,
+        max.saturating_sub(marker_w + 4).min(ui::visible_width(ext)),
+    );
+    let head_budget = max
+        .saturating_sub(marker_w + ui::visible_width(&ext_keep))
+        .max(1);
+    let prefix = take_width(base, head_budget);
+    format!("{prefix}{marker}{ext_keep}")
+}
+
+/// Leading substring of `s` fitting in `max` display cells.
+fn take_width(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = ui::visible_width(&c.to_string());
+        if w + cw > max {
+            break;
+        }
+        out.push(c);
+        w += cw;
     }
+    out
 }
 
 #[cfg(test)]
@@ -593,5 +705,93 @@ mod tests {
         assert!(should_print_plain(10, 20, false));
         // Completion always prints even mid-bucket.
         assert!(should_print_plain(92, 100, false));
+    }
+
+    #[test]
+    fn truncation_keeps_the_basename() {
+        // Directory part shrinks; the file the user must recognize
+        // survives. (ASCII `...` marker under test; `…` on a terminal.)
+        let t = truncate_middle("docs/guide/chapter1.md", 20);
+        assert!(ui::visible_width(&t) <= 20, "{t:?}");
+        assert!(t.ends_with("chapter1.md"), "{t:?}");
+        assert!(t.contains("..."), "{t:?}");
+    }
+
+    #[test]
+    fn truncation_counts_cells_not_chars() {
+        // Each kana is two cells: a char-counting cut would overflow.
+        let t = truncate_middle("docs/ガイド/chapter1.md", 20);
+        assert!(ui::visible_width(&t) <= 20, "{t:?}");
+        assert!(t.ends_with("chapter1.md"), "{t:?}");
+    }
+
+    #[test]
+    fn truncation_leaves_short_names_alone() {
+        assert_eq!(truncate_middle("readme.md", 32), "readme.md");
+    }
+
+    /// Every emitted row must fit its width; finished rows split in
+    /// two below [`NARROW_W`]. Layout is pure, so pin widths directly
+    /// instead of needing real terminals.
+    #[test]
+    fn rows_fit_their_width_at_50_60_80_120() {
+        let name = "docs/guide/deeply/nested/chapter1.md";
+        for width in [50usize, 60, 80, 120] {
+            // (done, ok, skipped): live, verified, failed, skipped.
+            for (done, ok, skipped) in [
+                (false, false, false),
+                (true, true, false),
+                (true, false, false),
+                (false, false, true),
+            ] {
+                for animated in [false, true] {
+                    let row = RowLayout {
+                        counter: "[1/5]",
+                        name,
+                        bytes: 20,
+                        total: 41,
+                        done,
+                        ok,
+                        skipped,
+                        rate_bps: 0.0,
+                        width,
+                        animated,
+                    };
+                    let rows = layout_row(&row);
+                    if width < NARROW_W && (done || skipped) {
+                        assert_eq!(rows.len(), 2, "width {width}");
+                    } else {
+                        assert_eq!(rows.len(), 1, "width {width}");
+                    }
+                    for r in &rows {
+                        let plain = ui::strip_ansi(r);
+                        assert!(
+                            ui::visible_width(plain.trim_end()) <= width,
+                            "width {width}: {plain:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_rows_keep_status_on_line_two() {
+        let row = RowLayout {
+            counter: "[1/5]",
+            name: "docs/guide/chapter1.md",
+            bytes: 41,
+            total: 41,
+            done: true,
+            ok: true,
+            skipped: false,
+            rate_bps: 0.0,
+            width: 50,
+            animated: false,
+        };
+        let rows = layout_row(&row);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("chapter1.md"), "{rows:?}");
+        assert!(rows[1].contains("41 B"), "{rows:?}");
     }
 }

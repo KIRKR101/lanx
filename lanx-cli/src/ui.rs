@@ -474,4 +474,30 @@ mod tests {
         assert!(!animated_for(true, Some("xterm-256color"), true));
         assert!(!animated_for(false, Some("xterm-256color"), true));
     }
+
+    #[test]
+    fn strips_shared_top_level_root() {
+        let paths = vec!["docs/guide/a.md".to_string(), "docs/readme.md".to_string()];
+        assert_eq!(display_names(&paths), vec!["guide/a.md", "readme.md"]);
+    }
+
+    #[test]
+    fn keeps_mixed_and_single_paths() {
+        let mixed = vec!["notes.txt".to_string(), "docs/readme.md".to_string()];
+        assert_eq!(display_names(&mixed), mixed);
+        let single = vec!["notes.txt".to_string()];
+        assert_eq!(display_names(&single), single);
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(display_names(&empty), empty);
+    }
+
+    #[test]
+    fn eta_formats_and_rejects_nonsense() {
+        assert_eq!(human_eta(0, 10.0), "");
+        assert_eq!(human_eta(100, 0.0), "");
+        assert_eq!(human_eta(100, f64::INFINITY), "");
+        assert_eq!(human_eta(20, 10.0), "2s");
+        assert_eq!(human_eta(600, 10.0), "1m");
+        assert_eq!(human_eta(7200, 1.0), "2h");
+    }
 }

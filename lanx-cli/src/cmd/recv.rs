@@ -64,9 +64,7 @@ pub async fn run(
         eprintln!(
             "  {} {}",
             ui::yellow("!"),
-            ui::yellow(
-                "auto-accept enabled: all incoming transfers will be accepted without prompting"
-            ),
+            ui::yellow("auto-accept: accepting without prompting"),
         );
         eprintln!("    {}", ui::dim("only use this when you trust the sender"),);
     }
