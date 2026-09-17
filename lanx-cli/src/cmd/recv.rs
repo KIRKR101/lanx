@@ -21,6 +21,52 @@ use tokio::net::TcpStream;
 
 use crate::progress::IndicatifProgress;
 use crate::ui;
+use crate::json_progress::JsonProgress;
+
+/// Conflict behavior for non-interactive use (`--on-conflict`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnConflict {
+    /// Skip files whose destination already exists.
+    Skip,
+    /// Overwrite existing destination files.
+    Overwrite,
+    /// Abort if any destination file already exists.
+    Fail,
+}
+
+/// Resolve the effective [`OverwritePolicy`] from the granular flags and
+/// `--on-conflict`. Returns an error when mutually exclusive options are
+/// combined (Clap also enforces this for CLI input; this covers
+/// programmatic callers).
+///
+/// # Errors
+///
+/// Returns an error if more than one policy source is set.
+pub fn resolve_policy(
+    overwrite: bool,
+    skip_existing: bool,
+    rename_existing: bool,
+    on_conflict: Option<OnConflict>,
+) -> Result<OverwritePolicy> {
+    let granular = [overwrite, skip_existing, rename_existing]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+    if granular > 1 || (granular == 1 && on_conflict.is_some()) {
+        bail!("--overwrite, --skip-existing, --rename-existing and --on-conflict are mutually exclusive");
+    }
+    if overwrite || on_conflict == Some(OnConflict::Overwrite) {
+        Ok(OverwritePolicy::Overwrite)
+    } else if skip_existing || on_conflict == Some(OnConflict::Skip) {
+        Ok(OverwritePolicy::SkipExisting)
+    } else if rename_existing {
+        Ok(OverwritePolicy::RenameExisting)
+    } else if on_conflict == Some(OnConflict::Fail) {
+        Ok(OverwritePolicy::Fail)
+    } else {
+        Ok(OverwritePolicy::Resume)
+    }
+}
 
 const MANIFEST_PREVIEW_LIMIT: usize = 20;
 const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -62,6 +108,9 @@ pub struct RecvOptions {
     pub skip_existing: bool,
     pub rename_existing: bool,
     pub dry_run: bool,
+    pub json: bool,
+    pub quiet: bool,
+    pub on_conflict: Option<OnConflict>,
     pub retry_forever: bool,
     pub discovery_timeout: Duration,
     pub parallel: u16,
@@ -77,29 +126,19 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
         skip_existing,
         rename_existing,
         dry_run,
+        json,
+        quiet,
+        on_conflict,
         retry_forever,
         discovery_timeout,
         parallel,
         relay,
     } = opts;
-    let overwrite_policy = if overwrite {
-        OverwritePolicy::Overwrite
-    } else if skip_existing {
-        OverwritePolicy::SkipExisting
-    } else if rename_existing {
-        OverwritePolicy::RenameExisting
-    } else {
-        OverwritePolicy::Resume
-    };
-    if [overwrite, skip_existing, rename_existing]
-        .iter()
-        .filter(|&&b| b)
-        .count()
-        > 1
-    {
-        bail!("--overwrite, --skip-existing and --rename-existing are mutually exclusive");
-    }
-    if accept {
+    let overwrite_policy = resolve_policy(overwrite, skip_existing, rename_existing, on_conflict)?;
+    // `--json` and `--quiet` suppress informational stderr; warnings and
+    // errors still print.
+    let human = !json && !quiet;
+    if accept && human {
         eprintln!(
             "  {} {}",
             ui::yellow("!"),
@@ -107,7 +146,7 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
         );
         eprintln!("    {}", ui::dim("only use this when you trust the sender"),);
     }
-    if dry_run {
+    if dry_run && human {
         eprintln!(
             "  {} {}",
             ui::yellow("!"),
@@ -158,22 +197,33 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
     };
 
     if let Some(ref ra) = relay_addr {
-        eprintln!("  {} {} {}", ui::dim("relay"), ui::arrow(), ui::bold(ra));
-    } else {
+        if human {
+            eprintln!("  {} {} {}", ui::dim("relay"), ui::arrow(), ui::bold(ra));
+        }
+    } else if human {
         eprintln!(
             "  {} found sender  {}",
             ui::green(ui::ok_sym()),
             ui::dim(&addr.to_string()),
         );
     }
-    eprintln!();
+    if human {
+        eprintln!();
+    }
 
-    let progress: Arc<dyn Progress> = IndicatifProgress::new("Receiving");
+    let progress: Arc<dyn Progress> = if json {
+        JsonProgress::new()
+    } else if quiet {
+        Arc::new(lanx_core::NoopProgress)
+    } else {
+        IndicatifProgress::new("Receiving")
+    };
 
     let base_approver: Arc<dyn ManifestApprover> = if dry_run {
         Arc::new(DryRunApprover {
             out_dir: out.clone(),
             overwrite_policy,
+            json,
         })
     } else if accept {
         Arc::new(AutoAccept)
@@ -221,11 +271,13 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
                 match r {
                     Ok(new_addr) => {
                         if new_addr != try_cfg.addr {
-                            eprintln!(
-                                "  {} sender {}",
-                                ui::dim("update"),
-                                ui::bold(&new_addr.to_string()),
-                            );
+                            if human {
+                                eprintln!(
+                                    "  {} sender {}",
+                                    ui::dim("update"),
+                                    ui::bold(&new_addr.to_string()),
+                                );
+                            }
                             try_cfg.addr = new_addr;
                         }
                     }
@@ -277,15 +329,18 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
         match result {
             Ok(report) => {
                 if report.rejected {
-                    eprintln!();
                     if dry_run {
-                        eprintln!(
-                            "  {} {}",
-                            ui::dim("dry run complete:"),
-                            ui::dim("no files were written"),
-                        );
+                        if human {
+                            eprintln!();
+                            eprintln!(
+                                "  {} {}",
+                                ui::dim("dry run complete:"),
+                                ui::dim("no files were written"),
+                            );
+                        }
                         return Ok(());
                     }
+                    eprintln!();
                     eprintln!(
                         "  {} {}",
                         ui::red(ui::fail_sym()),
@@ -451,6 +506,7 @@ struct StdinApprover {
 struct DryRunApprover {
     out_dir: PathBuf,
     overwrite_policy: OverwritePolicy,
+    json: bool,
 }
 
 /// Shared conflict summary printed before confirmation: how many
@@ -479,6 +535,7 @@ fn print_conflict_preview(manifest: &Manifest, out_dir: &Path, overwrite_policy:
         OverwritePolicy::RenameExisting => {
             Some("rename-existing: incoming files will be written to numbered siblings")
         }
+        OverwritePolicy::Fail => Some("on-conflict fail: aborting would trigger if any file exists"),
     };
     if let Some(note) = note {
         eprintln!("    {}", ui::dim(note));
@@ -488,10 +545,11 @@ fn print_conflict_preview(manifest: &Manifest, out_dir: &Path, overwrite_policy:
 impl ManifestApprover for StdinApprover {
     fn approve(&self, manifest: &Manifest, summary: &TransferSummary) -> Approval {
         // Non-interactive stdin cannot answer a prompt; refuse so the user
-        // can rerun with `--accept` if automation is intended.
+        // can rerun with `--accept`/`--yes` if automation is intended.
         if !io::stdin().is_terminal() {
             return Approval::Reject {
-                reason: "stdin is not a TTY; pass --accept to accept automatically".to_string(),
+                reason: "stdin is not a TTY; pass --accept (or --yes) to accept automatically"
+                    .to_string(),
             };
         }
 
@@ -552,6 +610,31 @@ impl ManifestApprover for StdinApprover {
 
 impl ManifestApprover for DryRunApprover {
     fn approve(&self, manifest: &Manifest, summary: &TransferSummary) -> Approval {
+        if self.json {
+            // Machine-readable preview on stdout; stderr stays silent.
+            let preview = preview_conflicts(manifest, &self.out_dir);
+            let files: Vec<serde_json::Value> = manifest
+                .files
+                .iter()
+                .map(|f| serde_json::json!({"path": f.rel_path, "size": f.size}))
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "dry_run",
+                    "files": summary.file_count,
+                    "bytes": summary.total_bytes,
+                    "existing": preview.existing,
+                    "complete": preview.complete_by_size,
+                    "resumable": preview.resumable_by_size,
+                    "new": preview.new,
+                    "contents": files,
+                })
+            );
+            return Approval::Reject {
+                reason: "dry run: transfer not accepted".to_string(),
+            };
+        }
         eprintln!("  {} Incoming transfer (dry run)", ui::cyan(ui::down_sym()));
         eprintln!(
             "    {}",
@@ -581,5 +664,57 @@ impl ManifestApprover for DryRunApprover {
         Approval::Reject {
             reason: "dry run: transfer not accepted".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_defaults_to_resume() {
+        assert_eq!(
+            resolve_policy(false, false, false, None).unwrap(),
+            OverwritePolicy::Resume
+        );
+    }
+
+    #[test]
+    fn granular_flags_map_to_policies() {
+        assert_eq!(
+            resolve_policy(true, false, false, None).unwrap(),
+            OverwritePolicy::Overwrite
+        );
+        assert_eq!(
+            resolve_policy(false, true, false, None).unwrap(),
+            OverwritePolicy::SkipExisting
+        );
+        assert_eq!(
+            resolve_policy(false, false, true, None).unwrap(),
+            OverwritePolicy::RenameExisting
+        );
+    }
+
+    #[test]
+    fn on_conflict_maps_to_policies() {
+        assert_eq!(
+            resolve_policy(false, false, false, Some(OnConflict::Skip)).unwrap(),
+            OverwritePolicy::SkipExisting
+        );
+        assert_eq!(
+            resolve_policy(false, false, false, Some(OnConflict::Overwrite)).unwrap(),
+            OverwritePolicy::Overwrite
+        );
+        assert_eq!(
+            resolve_policy(false, false, false, Some(OnConflict::Fail)).unwrap(),
+            OverwritePolicy::Fail
+        );
+    }
+
+    #[test]
+    fn conflicting_policy_sources_are_rejected() {
+        assert!(resolve_policy(true, true, false, None).is_err());
+        assert!(resolve_policy(true, false, false, Some(OnConflict::Skip)).is_err());
+        assert!(resolve_policy(false, true, false, Some(OnConflict::Fail)).is_err());
     }
 }

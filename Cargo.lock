@@ -695,6 +695,7 @@ dependencies = [
  "indicatif",
  "lanx-core",
  "lanx-net",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

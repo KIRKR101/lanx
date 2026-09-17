@@ -11,8 +11,9 @@ pub mod sidecar;
 pub mod transfer;
 
 pub use destinations::{
-    destination_paths, next_available_path, preview_conflicts, resolve_destinations,
-    resolve_destinations_with_policy, ConflictPreview, Destinations, OverwritePolicy,
+    destination_paths, existing_conflicts, next_available_path, preview_conflicts,
+    resolve_destinations, resolve_destinations_with_policy, ConflictPreview, Destinations,
+    OverwritePolicy,
 };
 pub use hashing::{chunk_hashes, IncrementalHasher};
 pub use manifest::{build, FileEntry, FileId, Manifest};

@@ -24,6 +24,9 @@ pub enum OverwritePolicy {
     /// Keep existing files; write incoming files to a numbered sibling
     /// (`photo.jpg` -> `photo.1.jpg`) instead.
     RenameExisting,
+    /// Abort the transfer if any destination file already exists, without
+    /// modifying anything.
+    Fail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,11 +238,33 @@ pub fn resolve_destinations(manifest: &Manifest, out: &Path) -> Result<Destinati
     }
 }
 
+/// Destination paths that already exist, in manifest order.
+///
+/// Used by `--on-conflict fail` to abort before writing anything.
+#[must_use]
+pub fn existing_conflicts(manifest: &Manifest, dests: &Destinations) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut ids: Vec<crate::manifest::FileId> = dests.paths.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        if manifest.files.iter().any(|f| f.id == id) {
+            if let Some(p) = dests.paths.get(&id) {
+                if std::fs::symlink_metadata(p).is_ok() {
+                    out.push(p.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Resolve destinations, applying an [`OverwritePolicy`].
 ///
 /// Only [`OverwritePolicy::RenameExisting`] changes the paths: every
 /// destination that already exists is remapped to the first unused
-/// numbered sibling. The other policies keep the default paths; they
+/// numbered sibling. [`OverwritePolicy::Fail`] also keeps the default
+/// paths; the receiver aborts before writing when any of them exists.
+/// The other policies keep the default paths; they
 /// are enforced later against the resume plan (overwrite from byte 0,
 /// or skip existing files).
 ///
@@ -486,5 +511,17 @@ mod tests {
         assert_eq!(preview.complete_by_size, 1);
         assert_eq!(preview.resumable_by_size, 1);
         assert_eq!(preview.new, 1);
+    }
+
+    #[test]
+    fn existing_conflicts_lists_only_present_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dest");
+        let m = mfiles(2);
+        let d = resolve_destinations(&m, &out).unwrap();
+        assert!(existing_conflicts(&m, &d).is_empty());
+        std::fs::write(&d.paths[&1], b"x").unwrap();
+        let conflicts = existing_conflicts(&m, &d);
+        assert_eq!(conflicts, vec![d.paths[&1].clone()]);
     }
 }

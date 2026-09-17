@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 mod cmd;
 mod iface;
+mod json_progress;
 mod progress;
 mod ui;
 
@@ -60,21 +61,36 @@ enum Command {
         #[arg(long, default_value = ".")]
         out: PathBuf,
         /// Accept the incoming transfer automatically without prompting.
-        #[arg(long)]
+        /// `--yes` is an alias, so scripts can use either spelling.
+        #[arg(long, visible_alias = "yes")]
         accept: bool,
         /// Overwrite existing destination files instead of resuming them.
-        #[arg(long, conflicts_with_all = ["skip_existing", "rename_existing"])]
+        #[arg(long, conflicts_with_all = ["skip_existing", "rename_existing", "on_conflict"])]
         overwrite: bool,
         /// Skip files whose destination already exists, leaving them untouched.
-        #[arg(long, conflicts_with_all = ["overwrite", "rename_existing"])]
+        #[arg(long, conflicts_with_all = ["overwrite", "rename_existing", "on_conflict"])]
         skip_existing: bool,
         /// Keep existing files; write incoming files to numbered siblings
         /// (`photo.jpg` becomes `photo.1.jpg`).
-        #[arg(long, conflicts_with_all = ["overwrite", "skip_existing"])]
+        #[arg(long, conflicts_with_all = ["overwrite", "skip_existing", "on_conflict"])]
         rename_existing: bool,
         /// Show what would be received without writing any files.
         #[arg(long)]
         dry_run: bool,
+        /// Emit machine-readable JSON Lines events on stdout (see
+        /// `json_progress` for the schema) instead of human progress.
+        /// Stdout carries events only; warnings and errors go to stderr.
+        #[arg(long)]
+        json: bool,
+        /// Suppress informational output; warnings and errors still print.
+        #[arg(long)]
+        quiet: bool,
+        /// Conflict behavior for automation: skip, overwrite, or fail when
+        /// a destination file already exists. Mutually exclusive with the
+        /// granular `--overwrite` / `--skip-existing` / `--rename-existing`
+        /// flags.
+        #[arg(long, value_enum, conflicts_with_all = ["overwrite", "skip_existing", "rename_existing"])]
+        on_conflict: Option<cmd::recv::OnConflict>,
         /// Retry forever on connection drop.
         #[arg(long)]
         retry_forever: bool,
@@ -161,6 +177,9 @@ fn main() -> Result<()> {
                 skip_existing,
                 rename_existing,
                 dry_run,
+                json,
+                quiet,
+                on_conflict,
                 retry_forever,
                 discovery_timeout,
                 parallel,
@@ -174,6 +193,9 @@ fn main() -> Result<()> {
                     skip_existing,
                     rename_existing,
                     dry_run,
+                    json,
+                    quiet,
+                    on_conflict,
                     retry_forever,
                     discovery_timeout: Duration::from_secs(discovery_timeout),
                     parallel,

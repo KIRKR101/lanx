@@ -5,7 +5,9 @@ use super::{
     read_frame, supports_protocol_version, write_frame, ControlMsg, HelloInfo, ProtocolError,
     DEFAULT_MAX_RETRIES, PROTOCOL_VERSION,
 };
-use crate::destinations::{resolve_destinations, resolve_destinations_with_policy, OverwritePolicy};
+use crate::destinations::{
+    existing_conflicts, resolve_destinations, resolve_destinations_with_policy, OverwritePolicy,
+};
 use crate::hashing::IncrementalHasher;
 use crate::manifest::{FileEntry, Manifest, MAX_CHUNK_SIZE, MAX_MANIFEST_FILES};
 use crate::progress::{Progress, TransferSummary};
@@ -269,10 +271,19 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
         resolve_destinations(&sender_manifest, out_dir)
     }
     .map_err(|e| ProtocolError::Unexpected(format!("destinations: {e}")))?;
+    if cfg.overwrite_policy == OverwritePolicy::Fail {
+        let conflicts = existing_conflicts(&sender_manifest, &dests);
+        if let Some(first) = conflicts.first() {
+            return Err(ProtocolError::Unexpected(format!(
+                "destination exists: {} (--on-conflict fail)",
+                first.display()
+            )));
+        }
+    }
     let mut plan = crate::resume::plan(&sender_manifest, &dests)
         .map_err(|e| ProtocolError::Unexpected(format!("resume plan: {e}")))?;
     match cfg.overwrite_policy {
-        OverwritePolicy::Resume | OverwritePolicy::RenameExisting => {}
+        OverwritePolicy::Resume | OverwritePolicy::RenameExisting | OverwritePolicy::Fail => {}
         OverwritePolicy::Overwrite => {
             // Forget resume state: every file is re-downloaded from byte 0
             // (opening with offset 0 truncates the destination).
