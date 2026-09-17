@@ -1,7 +1,7 @@
 //! `lanx send`: build manifest, listen for receiver, transfer.
 
 use anyhow::{Context, Result};
-use lanx_core::manifest::{build, rel_to_path};
+use lanx_core::manifest::{build, rel_to_path, validate_rel_path};
 use lanx_core::transfer::sender::{run_sender, SenderConfig};
 use lanx_core::transfer::DEFAULT_MAX_RETRIES;
 use lanx_net::discovery::{code_to_hash, generate_code, start_broadcasting};
@@ -467,14 +467,29 @@ fn zip_inputs(inputs: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir)> {
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("input has no name: {input:?}"))?
         .to_os_string();
+    // Strict portable default: ZIP entry names must be UTF-8
+    // forward-slash paths. A non-UTF-8 input name cannot be represented
+    // inside the archive, so reject instead of lossy-converting (which
+    // could collide two distinct names into one entry).
+    let base_name_str = base_name
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("input file name is not valid UTF-8: {input:?}"))?;
+    // The archive prefix becomes the first path component of every entry;
+    // it must itself be a portable name (no reserved device names,
+    // trailing spaces/dots, reserved characters, over-long names).
+    validate_rel_path(base_name_str)
+        .map_err(|e| anyhow::anyhow!("input file name is not portable: {e}"))?;
 
     let tmp = tempfile::Builder::new()
         .prefix("lanx-zip-")
         .tempdir()
         .context("create temp dir")?;
-    let zip_path = tmp
-        .path()
-        .join(format!("{}.zip", Path::new(&base_name).display()));
+    // The name is validated UTF-8 above, so this `OsString` push is
+    // equivalent to string formatting here; it avoids a lossy
+    // `display()` round-trip for the archive file name itself.
+    let mut zip_name = base_name.clone();
+    zip_name.push(".zip");
+    let zip_path = tmp.path().join(&zip_name);
 
     let file =
         std::fs::File::create(&zip_path).with_context(|| format!("create zip {zip_path:?}"))?;
@@ -483,11 +498,11 @@ fn zip_inputs(inputs: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir)> {
 
     if meta.is_dir() {
         // Walk the directory, adding every file under `<dirname>/<...>`.
-        let prefix = Path::new(&base_name);
-        add_directory_to_zip(&mut writer, input, prefix, opts)?;
+        // Entry names always use `/`, regardless of host OS.
+        add_directory_to_zip(&mut writer, input, base_name_str, opts)?;
     } else {
         // Single file: store it under its own basename.
-        writer.start_file(Path::new(&base_name).to_string_lossy(), opts)?;
+        writer.start_file(base_name_str, opts)?;
         let mut f = std::fs::File::open(input).with_context(|| format!("open {input:?}"))?;
         copy_to_zip(&mut f, &mut writer)?;
     }
@@ -499,7 +514,7 @@ fn zip_inputs(inputs: &[PathBuf]) -> Result<(PathBuf, tempfile::TempDir)> {
 fn add_directory_to_zip(
     writer: &mut zip::ZipWriter<std::fs::File>,
     dir: &Path,
-    archive_prefix: &Path,
+    archive_prefix: &str,
     opts: SimpleFileOptions,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {dir:?}"))? {
@@ -516,17 +531,31 @@ fn add_directory_to_zip(
             warn!(path = %path.display(), "skipping symlink");
             continue;
         }
-        let file_name = match path.file_name() {
+        let file_name_os = match path.file_name() {
             Some(n) => n,
-            None => continue,
+            None => anyhow::bail!("path has no file name: {:?}", path),
         };
-        let archive_path = archive_prefix.join(file_name);
+        // Strict default: reject non-UTF-8 names inside `--zip` instead
+        // of `to_string_lossy` (which could merge distinct names).
+        let file_name_str = match file_name_os.to_str() {
+            Some(n) => n,
+            None => anyhow::bail!("file name is not valid UTF-8: {:?}", path),
+        };
+        // Forward slashes on every host OS: `Path::join` would emit `\`
+        // separators on Windows, which unzip tools treat as literal
+        // filename characters instead of directories.
+        let entry_name = format!("{archive_prefix}/{file_name_str}");
+        // Same traversal / absolute / reserved-name / length checks as the
+        // native manifest path: the entry becomes a filename again when a
+        // user extracts the archive on Windows.
+        validate_rel_path(&entry_name)
+            .map_err(|e| anyhow::anyhow!("entry name is not portable: {e}"))?;
         if meta.is_dir() {
-            add_directory_to_zip(writer, &path, &archive_path, opts)?;
+            add_directory_to_zip(writer, &path, &entry_name, opts)?;
         } else if meta.is_file() {
             writer
-                .start_file(archive_path.to_string_lossy(), opts)
-                .with_context(|| format!("zip start_file {archive_path:?}"))?;
+                .start_file(entry_name, opts)
+                .with_context(|| format!("zip start_file {path:?}"))?;
             let mut f = std::fs::File::open(&path).with_context(|| format!("open {path:?}"))?;
             copy_to_zip(&mut f, writer)?;
         } else {

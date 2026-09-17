@@ -523,19 +523,31 @@ async fn read_streaming_manifest<R: tokio::io::AsyncRead + Unpin>(
             "manifest byte count mismatch: declared {expected_bytes}, got {total_bytes}",
         )));
     }
-    Ok(Manifest {
+    let manifest = Manifest {
         files,
         chunk_size,
         source_root: PathBuf::new(),
-    })
+    };
+    // Exact-duplicate and case-insensitive collisions (e.g. `Report.txt`
+    // vs `report.txt`) would overwrite each other on Windows/macOS, and
+    // duplicate file IDs would collapse destination/resume/sharding maps
+    // keyed by ID. Reject the whole manifest before approval or disk
+    // writes.
+    crate::manifest::validate_manifest_no_collisions(&manifest)
+        .map_err(|e| ProtocolError::Unexpected(format!("invalid rel_path: {e}")))?;
+    crate::manifest::validate_manifest_ids(&manifest)
+        .map_err(|e| ProtocolError::Unexpected(format!("invalid file id: {e}")))?;
+    Ok(manifest)
 }
 
 fn validate_entry(entry: &FileEntry) -> Result<(), ProtocolError> {
-    // Strict relative-path validation at wire receipt, before the manifest
+    // Strict portable validation at wire receipt, before the manifest
     // is displayed in the approval prompt or any destination is created.
     // Anything that is not a plain `/`-separated relative path (absolute
-    // paths, Windows prefixes, backslashes, empty/`.`/`..` components) is
-    // rejected instead of normalized.
+    // paths, Windows prefixes, backslashes, empty/`.`/`..` components,
+    // Windows-reserved names/characters, trailing spaces/dots, control
+    // characters, over-long components/paths) is rejected instead of
+    // normalized.
     crate::manifest::validate_rel_path(&entry.rel_path)
         .map_err(|e| ProtocolError::Unexpected(format!("invalid rel_path: {e}")))?;
     Ok(())

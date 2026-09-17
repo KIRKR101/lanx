@@ -772,6 +772,101 @@ async fn receiver_gives_up_after_max_retries() {
 }
 
 #[tokio::test]
+async fn receiver_rejects_duplicate_file_ids() {
+    // A hostile manifest reuses one file ID for two entries. The receiver
+    // must reject the manifest before approval or any disk writes: the
+    // IDs index destination maps, resume offsets, and `id % parallel`
+    // sharding, so a collision would corrupt the transfer.
+    let tmp = tempfile::tempdir().unwrap();
+    let dst = tmp.path().join("dst");
+    std::fs::create_dir(&dst).unwrap();
+
+    let (local, peer) = tokio::io::duplex(4096);
+    let (mut local_r, mut local_w) = tokio::io::split(local);
+    let (mut peer_r, mut peer_w) = tokio::io::split(peer);
+
+    let dst_for_recv = dst.clone();
+    let receiver_task = tokio::spawn(async move {
+        run_receiver(
+            &mut local_r,
+            &mut local_w,
+            &dst_for_recv,
+            &NoopProgress,
+            &ReceiverConfig::default(),
+            Arc::new(AutoAccept),
+        )
+        .await
+    });
+
+    let fake_sender = tokio::spawn(async move {
+        write_frame(
+            &mut peer_w,
+            &ControlMsg::Hello(HelloInfo {
+                version: PROTOCOL_VERSION,
+                chunk_size: DEFAULT_CHUNK_SIZE,
+                parallel: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        peer_w.flush().await.unwrap();
+
+        let hello = read_frame(&mut peer_r).await.unwrap();
+        assert!(matches!(hello, ControlMsg::Hello(_)));
+        write_frame(
+            &mut peer_w,
+            &ControlMsg::Hello(HelloInfo {
+                version: PROTOCOL_VERSION,
+                chunk_size: DEFAULT_CHUNK_SIZE,
+                parallel: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        peer_w.flush().await.unwrap();
+
+        let manifest = Manifest {
+            files: vec![
+                FileEntry {
+                    id: 0,
+                    rel_path: "a.bin".to_string(),
+                    size: 4,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    chunk_hashes: vec![],
+                },
+                FileEntry {
+                    id: 0,
+                    rel_path: "b.bin".to_string(),
+                    size: 4,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    chunk_hashes: vec![],
+                },
+            ],
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            source_root: PathBuf::new(),
+        };
+        write_streaming_manifest(&mut peer_w, &manifest).await;
+
+        // The receiver must fail instead of acking: no ManifestAck may
+        // arrive, and the connection must close.
+        let next = read_frame(&mut peer_r).await;
+        assert!(
+            next.is_err(),
+            "receiver must not ack a duplicate-ID manifest, got {next:?}"
+        );
+    });
+
+    let (receiver_result, _) = tokio::join!(receiver_task, fake_sender);
+    let err = receiver_result.unwrap().unwrap_err();
+    assert!(
+        matches!(&err, ProtocolError::Unexpected(m) if m.contains("duplicate")),
+        "expected duplicate-ID Unexpected error, got {err:?}"
+    );
+    // Nothing may have been written.
+    assert!(std::fs::read_dir(&dst).unwrap().next().is_none());
+}
+
+#[tokio::test]
 async fn sender_gives_up_after_max_retries() {
     // A fake receiver rejects every FileEnd. The sender must retry exactly
     // `max_retries` times after the initial attempt, then return

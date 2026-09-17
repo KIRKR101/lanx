@@ -514,7 +514,16 @@ struct DryRunApprover {
 /// by size, and how many are new. Size equality is a heuristic; content
 /// is verified by hash during the real transfer.
 fn print_conflict_preview(manifest: &Manifest, out_dir: &Path, overwrite_policy: OverwritePolicy) {
-    let preview = preview_conflicts(manifest, out_dir);
+    let preview = match preview_conflicts(manifest, out_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            // E.g. multi-file transfer with `--out` pointing at an
+            // existing file: show the coming failure instead of
+            // misleading `0 existing / 0 new` counts.
+            eprintln!("    {}", ui::dim(&format!("cannot receive here: {e}")));
+            return;
+        }
+    };
     if preview.existing == 0 && preview.new == 0 {
         return;
     }
@@ -612,7 +621,17 @@ impl ManifestApprover for DryRunApprover {
     fn approve(&self, manifest: &Manifest, summary: &TransferSummary) -> Approval {
         if self.json {
             // Machine-readable preview on stdout; stderr stays silent.
-            let preview = preview_conflicts(manifest, &self.out_dir);
+            let (existing, complete, resumable, new, error) =
+                match preview_conflicts(manifest, &self.out_dir) {
+                    Ok(p) => (
+                        p.existing,
+                        p.complete_by_size,
+                        p.resumable_by_size,
+                        p.new,
+                        None,
+                    ),
+                    Err(e) => (0, 0, 0, 0, Some(e.to_string())),
+                };
             let files: Vec<serde_json::Value> = manifest
                 .files
                 .iter()
@@ -624,10 +643,11 @@ impl ManifestApprover for DryRunApprover {
                     "event": "dry_run",
                     "files": summary.file_count,
                     "bytes": summary.total_bytes,
-                    "existing": preview.existing,
-                    "complete": preview.complete_by_size,
-                    "resumable": preview.resumable_by_size,
-                    "new": preview.new,
+                    "existing": existing,
+                    "complete": complete,
+                    "resumable": resumable,
+                    "new": new,
+                    "error": error,
                     "contents": files,
                 })
             );

@@ -27,6 +27,13 @@ enum Command {
     /// Send one or more files/directories.
     Send {
         /// Files or directories to send.
+        ///
+        /// Names must be valid UTF-8 and portable across Windows, macOS,
+        /// and Linux: Windows-reserved device names (CON, PRN, AUX, NUL,
+        /// COM1-9, LPT1-9), reserved characters (<>:"|?*), trailing
+        /// spaces/dots, and case-insensitive collisions (Report.txt vs
+        /// report.txt) abort the whole send with an error instead of
+        /// being skipped or renamed.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         /// Chunk size in bytes (default 1 MiB).
