@@ -99,6 +99,10 @@ struct FileState {
     rate: ui::Rate,
     /// Last time this file's line was drawn on an animated terminal.
     last_render: Instant,
+    /// Whether a live (in-flight) row for this file is currently
+    /// displayed. Used to erase it on completion instead of leaving
+    /// a redundant result row behind.
+    live_shown: bool,
 }
 
 /// Transfer progress UI for both sender and receiver.
@@ -110,9 +114,11 @@ pub struct IndicatifProgress {
 impl IndicatifProgress {
     pub fn new(verb: &'static str) -> Arc<Self> {
         // Past-tense result word: the sender reports what it sent,
-        // the receiver reports completion.
+        // the receiver reports what it received. "Done" is reserved
+        // for summaries where nothing moved (see `summary`).
         let done_word = match verb {
             "Sending" => "Sent",
+            "Receiving" => "Received",
             _ => "Done",
         };
         Arc::new(Self {
@@ -130,6 +136,18 @@ impl IndicatifProgress {
                 last_pct: HashMap::new(),
             }),
         })
+    }
+
+    /// Record that `id` currently owns a live row on screen, so its
+    /// completion can erase that row instead of orphaning it.
+    fn mark_live_shown(&self, id: FileId) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(s) = st.state.get_mut(&id) {
+            s.live_shown = true;
+        }
     }
 
     /// Render the per-file line for `id`. On first render (`fresh_line`)
@@ -373,6 +391,17 @@ fn label_budget(width: usize, counter_w: usize, right_w: usize) -> usize {
         .clamp(LABEL_MIN_W, LABEL_MAX_W)
 }
 
+/// Erase the live row currently on screen, leaving no trace. Used
+/// when a transferred file completes on an animated terminal: the
+/// aggregate summary is the record.
+fn clear_current_line() {
+    let stderr = std::io::stderr();
+    let mut handle = stderr.lock();
+    let _ = handle.write_all(b"\r");
+    let _ = handle.write_all(b"\x1b[2K");
+    let _ = handle.flush();
+}
+
 /// Emit one composed row. In-place updates on animated terminals
 /// (`\r` + `ESC[2K`, no newline); fresh rows start with `\n` so
 /// consecutive files never concatenate onto one terminal line (which
@@ -456,6 +485,7 @@ impl Progress for IndicatifProgress {
                 skipped: false,
                 rate: ui::Rate::new(offset),
                 last_render: Instant::now(),
+                live_shown: false,
             },
         );
         // Fresh line for each new file. When multiple connections are
@@ -466,6 +496,7 @@ impl Progress for IndicatifProgress {
         drop(st);
         if !tiny {
             self.render_file(id, true);
+            self.mark_live_shown(id);
         }
     }
 
@@ -508,6 +539,7 @@ impl Progress for IndicatifProgress {
         if should_render {
             // Re-render in place.
             self.render_file(id, false);
+            self.mark_live_shown(id);
         }
     }
 
@@ -544,6 +576,7 @@ impl Progress for IndicatifProgress {
                     skipped: ok,
                     rate: ui::Rate::new(total),
                     last_render: Instant::now(),
+                    live_shown: false,
                 },
             );
             if ok {
@@ -564,9 +597,22 @@ impl Progress for IndicatifProgress {
         } else {
             st.failed += 1;
         }
+        // A transferred file's live row is erased: the summary below
+        // is the record, and only exceptional rows (skips, failures)
+        // stay on screen. Plain logs keep the compact result row as
+        // their record instead — there is nothing to erase there.
+        let live_shown = st
+            .state
+            .get_mut(&id)
+            .map(|s| std::mem::replace(&mut s.live_shown, false))
+            .unwrap_or(false);
         drop(st);
-        // Final render of the file's line with the status symbol.
-        self.render_file(id, false);
+        if ok && ui::animated() && live_shown {
+            clear_current_line();
+        } else if !ok || !ui::animated() {
+            // Final render of the file's line with the status symbol.
+            self.render_file(id, false);
+        }
     }
 
     fn summary(&self, verified: usize, failed: usize, skipped: usize) {
