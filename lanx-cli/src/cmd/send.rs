@@ -169,14 +169,18 @@ pub async fn run(
 
     // Direct-mode connection details print once here, not every
     // reconnection round. Pairing code first (the normal path), then
-    // the bind address for diagnostics, then the manual command in
-    // the same key/value shape. Loopback is verbose-only: it almost
-    // never helps a transfer to another machine.
+    // the manual command in the same key/value shape; the command
+    // already carries the address, so a separate `address` row would
+    // only repeat it. The bare bind address is verbose-only
+    // diagnostics. Loopback commands are verbose-only too: they
+    // almost never help a transfer to another machine.
     if relay.is_none() {
         let addrs = crate::iface::list_non_loopback_v4().await;
-        match addrs.first() {
-            Some(ip) => ui::kv("address", &format!("{ip}:{}", addr.port()), label_w),
-            None => ui::kv("address", &format!("0.0.0.0:{}", addr.port()), label_w),
+        if verbose {
+            match addrs.first() {
+                Some(ip) => ui::kv("address", &format!("{ip}:{}", addr.port()), label_w),
+                None => ui::kv("address", &format!("0.0.0.0:{}", addr.port()), label_w),
+            }
         }
         let indent = " ".repeat(label_w + 1);
         let mut first = true;
@@ -310,9 +314,8 @@ pub async fn run(
                 .map(|a| a.ip().to_string())
                 .unwrap_or_else(|_| "receiver".to_string());
             eprintln!(
-                "  {} {:<12}  {}",
+                "  {} connected  {}",
                 ui::green(ui::ok_sym()),
-                "connected",
                 ui::dim(&peer),
             );
             had_session = true;

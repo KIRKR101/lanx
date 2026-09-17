@@ -109,9 +109,18 @@ pub fn ok_sym() -> &'static str {
 }
 pub fn fail_sym() -> &'static str {
     if use_unicode() {
-        "✗"
+        "×"
     } else {
         "FAIL"
+    }
+}
+/// Incoming-transfer marker. `?` is reserved for the actual
+/// confirmation prompt, so the header gets its own symbol.
+pub fn down_sym() -> &'static str {
+    if use_unicode() {
+        "↓"
+    } else {
+        "v"
     }
 }
 pub fn arrow() -> &'static str {
@@ -126,14 +135,6 @@ pub fn retry_sym() -> &'static str {
         "⟳"
     } else {
         "retry"
-    }
-}
-/// No-op marker for skipped files. ASCII fallback in plain mode.
-pub fn skip_sym() -> &'static str {
-    if use_unicode() {
-        "–"
-    } else {
-        "-"
     }
 }
 /// Mid-dot separator used in banners. ASCII fallback so non-UTF-8
@@ -161,6 +162,36 @@ pub fn ellipsis() -> &'static str {
 pub fn kv(label: &str, value: &str, label_width: usize) {
     let lbl = format!("{:<label_width$}", label);
     eprintln!("{} {}", cyan(&lbl), value);
+}
+
+/// Display names for a transfer's paths: the `rel_path`s with a
+/// shared top-level root removed. When the sender transmits one
+/// directory, every path starts with that directory's name
+/// (`docs/guide/x.md`); rows read `guide/x.md` instead. Returns the
+/// paths unchanged unless all of them share a first component and all
+/// sit at least one level deep.
+pub fn display_names(rel_paths: &[String]) -> Vec<String> {
+    let root = common_root(rel_paths);
+    rel_paths
+        .iter()
+        .map(|r| match root {
+            Some(rt) => r.strip_prefix(&format!("{rt}/")).unwrap_or(r).to_string(),
+            None => r.clone(),
+        })
+        .collect()
+}
+
+fn common_root(rel_paths: &[String]) -> Option<&str> {
+    let root = rel_paths.first()?.split('/').find(|s| !s.is_empty())?;
+    let shared = rel_paths.iter().all(|r| {
+        let mut comps = r.split('/').filter(|s| !s.is_empty());
+        matches!(comps.next(), Some(c) if c == root) && comps.next().is_some()
+    });
+    if shared {
+        Some(root)
+    } else {
+        None
+    }
 }
 
 /// One `name  size` contents row, e.g. `  keybinds.md   3.23 KiB`.

@@ -126,24 +126,14 @@ impl IndicatifProgress {
         })
     }
 
-    /// Display label for a file: basename, or `parent/basename`    /// for collisions, middle-truncated to fit `max` characters.
-    fn label_for(rel_paths: &[String], rel: &str, max: usize) -> String {
-        let basename = rel.rsplit('/').next().unwrap_or(rel);
-        let collision_count = rel_paths.iter().filter(|r| r.ends_with(basename)).count();
-        let full = if collision_count > 1 {
-            let parent = rel
-                .rsplit_once('/')
-                .map(|(p, _)| p.rsplit('/').next().unwrap_or(""))
-                .unwrap_or("");
-            if parent.is_empty() {
-                rel.to_string()
-            } else {
-                format!("{parent}/{basename}")
-            }
-        } else {
-            basename.to_string()
-        };
-        truncate_middle(&full, max)
+    /// Display label for a file: its root-stripped relative path
+    /// (see [`ui::display_names`]), middle-truncated to fit `max`
+    /// characters. The full relative path stays visible so identical
+    /// basenames in different directories never go ambiguous; only
+    /// overlong names truncate. `id` indexes into `display`.
+    fn label_for(display: &[String], id: FileId, max: usize) -> String {
+        let rel = display.get(id as usize).cloned().unwrap_or_default();
+        truncate_middle(&rel, max)
     }
 
     /// Render the per-file line for `id`. On first render (`fresh_line`)
@@ -151,7 +141,7 @@ impl IndicatifProgress {
     /// is overwritten with a carriage return. The file's manifest index
     /// is used as the `[N/M]` counter.
     fn render_file(&self, id: FileId, fresh_line: bool) {
-        let (label, bytes, total, file_idx, file_count, done, ok, skipped, rate_bps, rel_paths) = {
+        let (bytes, total, file_idx, file_count, done, ok, skipped, rate_bps, rel_paths) = {
             let st = self
                 .state
                 .lock()
@@ -161,11 +151,9 @@ impl IndicatifProgress {
                 None => return,
             };
             let total = st.sizes.get(&id).copied().unwrap_or(0);
-            let rel = st.rel_paths.get(id as usize).cloned().unwrap_or_default();
             let file_count = st.file_count;
             let rel_paths = st.rel_paths.clone();
             (
-                rel,
                 entry.bytes,
                 total,
                 id.saturating_add(1),
@@ -202,14 +190,24 @@ impl IndicatifProgress {
             st.last_pct.insert(id, pct);
         }
 
-        // Right-hand side, in display order: capped bar, percent,
-        // single total size, live rate + ETA, status mark. The bar is
-        // decorative; the filename keeps whatever space is left.
+        // Names share one representation everywhere: the prompt
+        // listing, live rows, and result rows all show the same
+        // root-stripped relative path.
+        let display = ui::display_names(&rel_paths);
+
+        // Finished rows collapse to a quiet result: no bar, no
+        // percent. The bar only exists while bytes are moving, so the
+        // terminal history stays clean. `✓` means BLAKE3-verified,
+        // not merely 100%: file_done(true) fires only after the hash
+        // checks out on the receiver (and after the receiver confirms
+        // it on the sender).
         const BAR_W: usize = 16;
-        let show_bar = animated && width > counter.chars().count() + 52;
+        let show_bar = animated && !done && width > counter.chars().count() + 52;
         let size_txt = ui::human_bytes(total);
         let mut live = String::new();
         if !done && animated {
+            // In flight, both byte values earn their space: the total
+            // alone can't show how far along a large file is.
             let r = ui::human_rate(rate_bps);
             if !r.is_empty() {
                 live.push_str("  ");
@@ -231,19 +229,25 @@ impl IndicatifProgress {
         if show_bar {
             fixed += BAR_W + 2 + 2;
         }
-        // Percent (4) + gaps (5) + size + live + status (2).
-        fixed += 4 + 5 + size_txt.chars().count() + ui::visible_width(&live) + 2;
+        if !done {
+            // Percent (4) + gaps (5) + done/total + live + status gap.
+            let flow = format!("{} / {}", ui::human_bytes(bytes), ui::human_bytes(total));
+            fixed += 4 + 5 + flow.chars().count() + ui::visible_width(&live) + 2;
+        } else {
+            // Size + status gap.
+            fixed += 3 + size_txt.chars().count() + 2;
+        }
         let label_max = width.saturating_sub(fixed).clamp(8, 32);
-        let label = Self::label_for(&rel_paths, &label, label_max);
+        let label = Self::label_for(&display, id, label_max);
 
         let mut line = String::new();
         if skipped {
-            // Skipped files never enter an active state: one quiet
-            // no-op line instead of a progress row.
+            // Skipped files never enter an active state and keep their
+            // index: the transferred item starting at [5/5] explains
+            // itself. The whole row dims as a no-op.
+            line.push_str(&ui::dim(&counter));
             line.push_str("  ");
-            line.push_str(ui::skip_sym());
-            line.push(' ');
-            line.push_str(&ui::pad_visible(&label, label_max));
+            line.push_str(&ui::pad_visible(&ui::dim(&label), label_max));
             line.push_str("  ");
             line.push_str(&ui::dim("already present"));
             write_line(&line, width, fresh_line);
@@ -255,11 +259,23 @@ impl IndicatifProgress {
         if show_bar {
             line.push_str("  ");
             line.push_str(&ui::mini_bar(bytes, total, BAR_W));
+            line.push_str(&format!("  {:>3}%", pct));
+            line.push_str(&format!(
+                "   {} / {}",
+                ui::human_bytes(bytes),
+                ui::human_bytes(total)
+            ));
+            line.push_str(&live);
+        } else if !done {
+            // No room (or no animation) for the bar: percent and
+            // totals still show movement.
+            line.push_str(&format!("  {:>3}%", pct));
+            line.push_str("   ");
+            line.push_str(&size_txt);
+        } else {
+            line.push_str("   ");
+            line.push_str(&size_txt);
         }
-        line.push_str(&format!("  {:>3}%", pct));
-        line.push_str("   ");
-        line.push_str(&size_txt);
-        line.push_str(&live);
 
         // Status tail.
         if done {

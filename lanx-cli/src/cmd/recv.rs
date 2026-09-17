@@ -117,9 +117,8 @@ pub async fn run(
         eprintln!("  {} {} {}", ui::dim("relay"), ui::arrow(), ui::bold(ra));
     } else {
         eprintln!(
-            "  {} {:<12}  {}",
+            "  {} found sender  {}",
             ui::green(ui::ok_sym()),
-            "found sender",
             ui::dim(&addr.to_string()),
         );
     }
@@ -398,18 +397,25 @@ impl ManifestApprover for StdinApprover {
             };
         }
 
-        eprintln!("  {} Incoming transfer", ui::cyan("?"));
+        eprintln!("  {} Incoming transfer", ui::cyan(ui::down_sym()));
         eprintln!(
             "    {}",
             ui::bold(&ui::count_line(summary.file_count, summary.total_bytes)),
         );
         eprintln!();
 
-        // Same `name  size` rows as the live progress that follows,
-        // so the prompt flows into the transfer instead of switching
-        // representations.
-        for entry in manifest.files.iter().take(MANIFEST_PREVIEW_LIMIT) {
-            eprintln!("{}", ui::contents_row(&entry.rel_path, entry.size));
+        // Same root-stripped `name  size` rows as the live progress
+        // that follows, so the prompt flows into the transfer instead
+        // of switching representations.
+        let rel_paths: Vec<String> = manifest.files.iter().map(|f| f.rel_path.clone()).collect();
+        let display = ui::display_names(&rel_paths);
+        for (entry, name) in manifest
+            .files
+            .iter()
+            .zip(display.iter())
+            .take(MANIFEST_PREVIEW_LIMIT)
+        {
+            eprintln!("{}", ui::contents_row(name, entry.size));
         }
         let remaining = summary.file_count.saturating_sub(MANIFEST_PREVIEW_LIMIT);
         if remaining > 0 {
@@ -423,8 +429,7 @@ impl ManifestApprover for StdinApprover {
         }
 
         eprintln!();
-        let prompt = "  Accept? [y/N]: ";
-        eprint!("{}", prompt);
+        eprint!("  {} Accept? [y/N]: ", ui::cyan("?"));
         let _ = io::stderr().flush();
 
         let mut line = String::new();
