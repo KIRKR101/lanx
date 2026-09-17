@@ -421,7 +421,7 @@ pub fn build_with_filters_cached(
     let fingerprint = input_fingerprint(inputs, chunk_size)?;
     if let Ok(bytes) = std::fs::read(&cache_path) {
         if let Ok(cache) = serde_json::from_slice::<ManifestCache>(&bytes) {
-            if cache.fingerprint == fingerprint {
+            if cache.version == MANIFEST_CACHE_VERSION && cache.fingerprint == fingerprint {
                 let mut manifest = cache.manifest;
                 manifest.source_root = cache.source_root;
                 apply_filters(&mut manifest, filters);
@@ -438,6 +438,7 @@ pub fn build_with_filters_cached(
         return Err(ManifestError::Empty);
     }
     let cache = ManifestCache {
+        version: MANIFEST_CACHE_VERSION,
         fingerprint,
         manifest: unfiltered,
         source_root: manifest.source_root.clone(),
@@ -454,8 +455,11 @@ pub fn build_with_filters_cached(
     Ok(manifest)
 }
 
+const MANIFEST_CACHE_VERSION: u8 = 2;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ManifestCache {
+    version: u8,
     fingerprint: String,
     manifest: Manifest,
     source_root: PathBuf,
