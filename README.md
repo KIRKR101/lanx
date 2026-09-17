@@ -1,27 +1,13 @@
 # lanx
 
-Transfer files and directories between machines over a local network. No internet connection, central server, or account required.
-
-Transfers are encrypted, verified with BLAKE3, and can be resumed if interrupted.
-
-## Protocol versioning
-
-The transfer protocol has one active wire version, currently `4`. Sender and
-receiver exchange this value in the initial `Hello` messages. A version the
-build does not support stops the transfer before the manifest is sent.
-The crate version and CLI version identify the release; they do not negotiate
-wire compatibility.
-
-The current protocol uses length-prefixed postcard control frames. It streams
-the manifest as `ManifestStart`, one `ManifestEntry` per file, and
-`ManifestEnd`, then sends file data after `FileStart` and `ChunkHeader`
-messages. A protocol change that alters message layout or message order
-requires a new `PROTOCOL_VERSION`. To add compatibility later, add the older
-version to the supported-version list, negotiate the selected version during
-the handshake, and keep its decoder and message rules explicit. Do not accept
-an older version without a version-specific implementation.
+Transfer files and directories between machines over a local network. lanx
+needs no account, central server, or internet connection for direct transfers.
+Transfers use an encrypted connection, verify file contents with BLAKE3, and
+resume after an interruption.
 
 ## Install
+
+Build from source with Rust 1.85 or later:
 
 ```sh
 git clone https://github.com/KIRKR101/lanx.git
@@ -29,199 +15,411 @@ cd lanx
 cargo build --release
 ```
 
-The binary will be at `target/release/lanx` (`lanx.exe` on Windows). Copy it somewhere on your PATH if you want to use it globally.
+The binary is `target/release/lanx`, or `lanx.exe` on Windows. Install it on
+your PATH if you want to run `lanx` from any directory:
 
-Tagged GitHub releases include Linux, macOS, and Windows archives. You can also
-install from source with `cargo install --path lanx-cli` or use
+```sh
+cargo install --path lanx-cli
+```
+
+Tagged releases include Linux, macOS, and Windows archives. You can also use
 `cargo-binstall lanx-cli` when a published package is available.
 
-Generate completions with, for example, `lanx completions zsh > _lanx`.
-Run `lanx doctor` to check local interfaces, discovery and sender ports,
-permissions, and optionally relay reachability with `--relay HOST:PORT`.
+## Quick start
 
-## Usage
-
-On the machine sending the files:
+Run this command on the sending machine:
 
 ```sh
 lanx send ~/Pictures/Wallpapers/
 ```
 
-lanx will print a pairing code, the address it's listening on, and a
-copy-pasteable receiver command (the `--code` is required: the direct
-listener verifies it in the encrypted handshake):
+Disable the UDP lookup when you plan to use the direct command only:
+
+```sh
+lanx send ~/Pictures/Wallpapers/ --no-discovery
+```
+
+lanx prints a pairing code, the address it is listening on, and a direct
+receiver command:
 
 ```text
 code   7-cobalt-fox-tundra  (~28 bits)
 direct lanx recv 192.168.1.42:29320 --code 7-cobalt-fox-tundra
 ```
 
-On the receiving machine:
+Run this command on the receiving machine:
 
 ```sh
 lanx recv 7-cobalt-fox-tundra
 ```
 
-Machines on the same network can find each other automatically, so you normally don't need to enter an IP address. You can also connect directly with the command the sender printed:
+lanx discovers the sender over UDP when both machines share a network. You can
+also paste the direct command printed by the sender:
 
 ```sh
 lanx recv 192.168.1.42:29320 --code 7-cobalt-fox-tundra --out ~/Desktop
 ```
 
-A bare `lanx recv ip:port` without `--code` only works against senders
-started with `--allow-insecure-direct` (trusted networks only).
+The receiver previews the incoming files and asks for confirmation before it
+writes anything. Use `--accept` or its alias `--yes` to skip that prompt.
 
-Before starting, lanx shows the incoming files and asks for confirmation. Use `--accept` to skip this.
+## Sending
 
-Directories keep their structure, and multiple files or directories can be sent at once:
+Send several files and directories in one transfer. Directory names stay in
+the destination structure:
 
 ```sh
-lanx send file.txt photos/ project/
+lanx send report.pdf photos/ project/
 ```
 
-Use `--zip` to send the input as a single archive instead.
+Use `--zip` when one archive is more useful than the original directory tree.
+The flag accepts one input path:
 
-## Options
+```sh
+lanx send ~/Documents/project --zip
+```
 
-### `lanx send`
+Select files with repeatable include and exclude patterns. Quote patterns so
+your shell does not expand them before lanx sees them:
 
-| Flag | Description |
-| --- | --- |
-| `--no-discovery` | Disable automatic network discovery |
-| `--zip` | Send the input as a single archive |
-| `--port N` | Listen on port N (default: stable 29320; falls back to ephemeral if busy; explicit values fail if taken) |
-| `--bind address` | Bind the sender to one local IPv4 or IPv6 address instead of all interfaces |
-| `--exclude PATTERN` | Exclude matching paths; repeatable (`*`, `?`, and `**` are supported) |
-| `--include PATTERN` | Include only matching paths; repeatable |
-| `--hidden` | Include hidden files and directories |
-| `--no-cache` | Disable the local manifest cache |
-| `--parallel N` | Transfer using N parallel connections (default: 1) |
-| `--relay addr` | Transfer through a relay |
-| `--chunk-size bytes` | Set the hashing chunk size (default: 1 MiB) |
-| `--code-words N` | Pairing code words, 2-5 (default: 3; use 4+ with relays) |
-| `--psk phrase` | Extra passphrase for the handshake (`LANX_PSK` env also works) |
-| `--allow-insecure-direct` | Direct-only mode: accept bare `ip:port` receivers without the pairing code; disables discovery (trusted networks only) |
+```sh
+lanx send ~/src/project \
+  --include '*.rs' \
+  --include 'Cargo.toml' \
+  --exclude 'target/**'
+```
 
-### `lanx recv`
+`*` matches within one path component, `?` matches one character, and `**`
+matches across directories. A pattern without `/` also matches a component at
+any depth:
 
-| Flag | Description |
-| --- | --- |
-| `--out dir` | Output directory (default: `.`) |
-| `--accept` | Skip the confirmation prompt |
-| `--retry-forever` | Keep retrying after a connection is lost |
-| `--discovery-timeout secs` | Network discovery timeout (default: 30 seconds) |
-| `--parallel N` | Transfer using N parallel connections |
-| `--relay addr` | Transfer through a relay |
-| `--psk phrase` | Handshake passphrase, must match sender (`LANX_PSK` env also works) |
+```sh
+lanx send ~/src/project --exclude 'node_modules' --exclude '*.log'
+```
 
-## Resuming transfers
+Hidden files and directories are excluded by default. Include them explicitly:
 
-Interrupted transfers can be resumed by reconnecting to the same sender. Files that have already been transferred are skipped, while incomplete files continue from the missing data.
+```sh
+lanx send ~/src/project --hidden
+```
 
-Use `--retry-forever` if you want lanx to keep trying until the connection is restored.
+Bind the sender to one local interface when the machine has several network
+addresses:
+
+```sh
+lanx send ~/photos --bind 192.168.1.42
+```
+
+With no explicit port, lanx tries stable port `29320` and falls back to an
+ephemeral port if another process already uses it. Pin a port when a firewall
+rule or router rule depends on it:
+
+```sh
+lanx send ~/photos --bind 192.168.1.42 --port 51234
+```
+
+Use an IPv6 address when both machines connect over IPv6:
+
+```sh
+lanx send ~/photos --bind 2001:db8::42 --port 29320
+lanx recv '[2001:db8::42]:29320' --code 7-cobalt-fox-tundra
+```
+
+The default manifest cache avoids hashing unchanged inputs on later sends. Use
+`--no-cache` when another process changes files without reliable timestamps:
+
+```sh
+lanx send ~/build-output --no-cache
+```
+
+Use more than one connection for large transfers with many files:
+
+```sh
+lanx send ~/photos --parallel 4
+```
+
+Set the chunk size when you need a different hashing and resume granularity:
+
+```sh
+lanx send ~/photos --chunk-size 4194304
+```
+
+The sender and receiver negotiate down if they request different parallel
+connection counts.
+
+## Receiving
+
+Choose the destination with `--out`. For a directory transfer, lanx preserves
+the sender's directory structure:
+
+```sh
+lanx recv 7-cobalt-fox-tundra --out ~/Incoming
+```
+
+Accept an unattended transfer from a script:
+
+```sh
+lanx recv 7-cobalt-fox-tundra --accept --out ~/Incoming
+```
+
+By default, lanx resumes partial files and skips files that already match.
+Choose another policy when existing files need explicit treatment:
+
+```sh
+# Leave every existing destination untouched.
+lanx recv 7-cobalt-fox-tundra --skip-existing --accept --out ~/Incoming
+
+# Replace existing files from byte zero.
+lanx recv 7-cobalt-fox-tundra --overwrite --accept --out ~/Incoming
+
+# Keep existing files and write photo.1.jpg, photo.2.jpg, and so on.
+lanx recv 7-cobalt-fox-tundra --rename-existing --accept --out ~/Incoming
+```
+
+Use `--on-conflict` when a script should state its policy as a value. It accepts
+`skip`, `overwrite`, or `fail`:
+
+```sh
+lanx recv 7-cobalt-fox-tundra \
+  --on-conflict fail \
+  --accept \
+  --out ~/Incoming
+```
+
+The `fail` policy checks for conflicts before creating destination directories
+or writing files.
+
+Preview a transfer without writing files:
+
+```sh
+lanx recv 7-cobalt-fox-tundra --dry-run --out ~/Incoming
+```
+
+The preview includes the file list, total size, and existing, complete,
+resumable, and new destination counts.
+
+Use `--parallel` on the receiver as well when the sender supports parallel
+connections:
+
+```sh
+lanx recv 7-cobalt-fox-tundra --parallel 4 --accept --out ~/Incoming
+```
+
+For a direct address, pass the pairing code with `--code`:
+
+```sh
+lanx recv 192.168.1.42:29320 --code 7-cobalt-fox-tundra --accept
+```
+
+Allow more time for discovery on a busy or filtered network:
+
+```sh
+lanx recv 7-cobalt-fox-tundra --discovery-timeout 90
+```
+
+Retry until the sender comes back online:
+
+```sh
+lanx recv 7-cobalt-fox-tundra --retry-forever --out ~/Incoming
+```
+
+## Automation
+
+`--json` writes one JSON object per line to stdout. Informational messages,
+warnings, and errors stay on stderr. Once lanx receives a manifest, the final
+JSON event is a `summary` event:
+
+```sh
+lanx recv 7-cobalt-fox-tundra \
+  --json \
+  --accept \
+  --on-conflict skip \
+  --out ~/Incoming > transfer.jsonl
+```
+
+Inspect the final result with any JSON tool:
+
+```sh
+tail -n 1 transfer.jsonl
+```
+
+Use `--quiet` for a human-readable command that prints only warnings and
+errors:
+
+```sh
+lanx recv 7-cobalt-fox-tundra --quiet --accept --out ~/Incoming
+```
+
+## Pairing and security
+
+Pairing codes such as `7-cobalt-fox-tundra` identify a transfer. The code also
+derives the PSK used by the encrypted handshake, so a peer that does not know
+the full code cannot complete a code-based transfer.
+
+Generate a longer code for an untrusted network or a relay:
+
+```sh
+lanx send ~/photos --code-words 4
+```
+
+Add a passphrase when the code needs an extra secret. Set it on both machines:
+
+```sh
+lanx send ~/photos --psk 'correct horse battery staple'
+lanx recv 7-cobalt-fox-tundra --psk 'correct horse battery staple'
+```
+
+The same setting works through the `LANX_PSK` environment variable:
+
+```sh
+export LANX_PSK='correct horse battery staple'
+lanx send ~/photos
+lanx recv 7-cobalt-fox-tundra --accept
+```
+
+An empty passphrase is treated as unset. Use a non-empty passphrase when you
+need the additional secret.
+
+Direct `ip:port` connections still use the pairing code when you pass
+`--code`. A bare address is unauthenticated and works only when the sender
+explicitly enables trusted-network mode:
+
+```sh
+# Sender, direct mode without a pairing code.
+lanx send ~/photos --allow-insecure-direct
+
+# Receiver, using the bare address printed by the sender.
+lanx recv 192.168.1.42:29320 --accept --out ~/Incoming
+```
+
+`--allow-insecure-direct` disables discovery and cannot be combined with
+`--relay`. Use pairing codes on networks where another user might inspect or
+alter traffic.
 
 ## Relays
 
-If the machines can't connect directly, you can run a relay on a machine accessible to both:
+Run a relay on a machine reachable by both endpoints when direct connections
+are blocked:
 
 ```sh
 lanx relay
 ```
 
-Then pass its address to the sender and receiver:
+The relay uses `53318` for sender connections and `53319` for receiver
+connections. Start both clients with the matching relay listener addresses:
 
 ```sh
-lanx send ~/photos/ --relay 198.51.100.1:53318
-lanx recv 7-cobalt-fox-tundra --relay 198.51.100.1:53319
+lanx send ~/photos --relay 198.51.100.1:53318
+lanx recv 7-cobalt-fox-tundra --relay 198.51.100.1:53319 --accept
 ```
 
-The relay only forwards traffic; transfers remain encrypted between the sender and receiver.
+The relay forwards encrypted bytes and does not receive the transfer PSK or
+file contents. It does see the public pairing ID needed to match the two
+connections.
 
-By default, relay connections use port `53318` for senders and `53319` for receivers. These can be changed with `--sender-bind` and `--receiver-bind`.
+Set different listener addresses when the relay has more than one interface:
 
-Relay operators can set `--max-sessions`, `--idle-timeout`, `--auth-token`,
-`--metrics`, and `--log-level`. Clients authenticate with the same token through
-`LANX_RELAY_AUTH_TOKEN`; the token is sent only in the relay registration
-frame and is never part of the transfer protocol.
+```sh
+lanx relay \
+  --sender-bind 192.0.2.10:53318 \
+  --receiver-bind 192.0.2.10:53319
+```
 
-Sender registrations are acknowledged: a second sender for the same pairing
-ID is rejected (`re-register` by re-running `send` for a fresh code) so an
-attacker cannot steal a waiting receiver. Pending senders expire after 5
-minutes, and receivers that repeatedly guess wrong IDs are rate-limited
-per IP.
+Limit active transfers and disconnect sessions that stop making progress:
 
-## Pairing codes
+```sh
+lanx relay --max-sessions 64 --idle-timeout 900
+```
 
-Pairing codes such as `7-cobalt-fox-tundra` replace manual IP entry. The
-broadcast/relayed pairing ID is a *public identifier*; secrecy comes from
-a PSK derived from the code and mixed into the `Noise_NNpsk0` handshake —
-a peer that does not know the code cannot complete the handshake.
+Require clients to authenticate with a shared relay token. The relay sends a
+fresh challenge, and each client sends a proof bound to that challenge and its
+pairing ID. The token itself never crosses the network:
 
-* Default codes are `digit + 3 words` (~28 bits). Use `lanx send
-  --code-words 4` (~36 bits) on untrusted networks or with relays.
-* For internet relays, additionally set `--psk <passphrase>` (or
-  `LANX_PSK` env) on both sides; the passphrase is never transmitted.
-* The relay rate-limits failed guesses per IP and rejects sender
-  takeover, but a public relay still sees *which* pairing IDs are active.
-  `lanx` warns when `--relay` points at a non-LAN address.
-* Direct `ip:port` transfers also verify the code by default — paste the
-  full command the sender printed (it includes `--code`). Bare `ip:port`
-  without a code requires the sender to opt into `--allow-insecure-direct`
-  and stays unauthenticated: prefer pairing codes on untrusted networks.
-* `--allow-insecure-direct` disables code discovery and prints bare direct
-  commands only. It cannot be combined with `--relay`.
-* For a direct `ip:port --code` target, retries stay pinned to that explicit
-  address; discovery is only re-run for pairing-code targets.
-* An empty `--psk ""` is treated as unset. Use a non-empty passphrase when
-  adding an out-of-band secret.
+```sh
+export LANX_RELAY_AUTH_TOKEN='relay-only-secret'
+lanx relay --auth-token "$LANX_RELAY_AUTH_TOKEN" --metrics
+```
 
-Relay operators should deploy the sender and receiver services in lock-step:
-the current sender registration protocol adds one acknowledgement byte after
-the sender hello, so mixed old/new relay peers are not wire-compatible.
-Pending sender IDs can remain occupied for up to 5 minutes after a crashed
-sender; codes are fresh-random each run, so this is an availability cost, not
-code reuse.
+Run the clients with the same environment variable:
+
+```sh
+export LANX_RELAY_AUTH_TOKEN='relay-only-secret'
+lanx send ~/photos --relay 198.51.100.1:53318
+lanx recv 7-cobalt-fox-tundra --relay 198.51.100.1:53319 --accept
+```
+
+Use `--metrics` to log pending and active session counts, and choose a relay
+log level with `--log-level`:
+
+```sh
+lanx relay --metrics --log-level debug
+```
+
+Pending sender registrations expire after five minutes. A second sender using
+the same pairing ID is rejected, and repeated wrong receiver guesses from one
+IP address are rate-limited.
+
+## Diagnostics and completions
+
+Check interfaces, sender ports, discovery, permissions, and relay reachability:
+
+```sh
+lanx doctor
+lanx doctor --port 51234 --relay 198.51.100.1:53318
+```
+
+Generate completion files for your shell:
+
+```sh
+lanx completions bash > lanx.bash
+lanx completions zsh > _lanx
+lanx completions fish > lanx.fish
+```
+
+Install the generated file using your shell's normal completion setup.
 
 ## Firewalls
 
-If the machines cannot see each other, open two ports. The receiver
-needs UDP `53317` in and the sender needs TCP `29320` in:
+Direct discovery needs UDP `53317` on the receiver. Direct transfers need the
+sender's TCP port, which defaults to `29320`:
 
 ```sh
-# receiver
 sudo ufw allow 53317/udp
-# sender
 sudo ufw allow 29320/tcp
 ```
 
-Check the rules with `sudo ufw status verbose`. Outbound needs no
-change on a default `ufw` setup.
-
-To use another sender port, pin it and allow it:
+If the sender uses another pinned port, open that port instead:
 
 ```sh
-# sender
-lanx send ~/photos/ --port 51234
+lanx send ~/photos --port 51234
 sudo ufw allow 51234/tcp
 ```
 
-If port `29320` is busy the sender picks another port and prints a
-`!` warning with the exact `ufw allow` line for that run. Either run
-that command or free `29320` and retry.
+When the default port is busy, lanx prints the selected ephemeral port and the
+firewall command for that run. Direct addresses skip UDP discovery but still
+need the sender's TCP port. A relay needs its sender and receiver listener
+ports open instead.
 
-Other firewalls: `firewalld` needs `53317/udp` on the receiver and
-`29320/tcp` on the sender; on macOS and Windows allow the same two
-ports in through the system firewall prompt or settings.
+## Protocol compatibility
 
-Pairing codes time out when UDP `53317` is blocked. A connect timeout
-after the sender is found means TCP on the sender is blocked. Direct
-`ip:port` skips discovery but still needs the sender TCP rule. When
-inbound stays blocked on both sides, use a relay instead.
+The current wire protocol version is `4`. Sender and receiver exchange the
+version in their first messages and stop before sending a manifest when the
+peer does not support it.
+
+The protocol uses length-prefixed postcard control frames. It streams a
+manifest between `ManifestStart` and `ManifestEnd`, then sends file data using
+`FileStart` and `ChunkHeader` messages. Sender, receiver, and relay builds
+should come from the same release when using relay registration, because relay
+registration includes a challenge and a sender acknowledgement.
 
 ## Tests
 
+Run the workspace tests and static checks:
+
 ```sh
-cargo test
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
 ## Licence
