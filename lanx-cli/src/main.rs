@@ -55,6 +55,15 @@ enum Command {
         /// Local IPv4 or IPv6 address to bind. Defaults to all interfaces.
         #[arg(long)]
         bind: Option<String>,
+        /// Exclude files matching a path pattern. Repeatable.
+        #[arg(long = "exclude", value_name = "PATTERN")]
+        exclude: Vec<String>,
+        /// Include only files matching a path pattern. Repeatable.
+        #[arg(long = "include", value_name = "PATTERN")]
+        include: Vec<String>,
+        /// Include hidden files and directories (included by default when no filters are set).
+        #[arg(long)]
+        hidden: bool,
         /// Number of parallel TCP connections to use.
         #[arg(long, default_value_t = 1)]
         parallel: u16,
@@ -192,6 +201,9 @@ fn main() -> Result<()> {
                 zip,
                 port,
                 bind,
+                exclude,
+                include,
+                hidden,
                 parallel,
                 relay,
                 code_words,
@@ -205,6 +217,9 @@ fn main() -> Result<()> {
                     zip,
                     port,
                     bind,
+                    exclude,
+                    include,
+                    hidden,
                     parallel,
                     relay,
                     verbose,

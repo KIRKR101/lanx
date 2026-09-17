@@ -26,6 +26,17 @@ pub const MAX_COMPONENT_BYTES: usize = 255;
 /// resource exhaustion on the receiver.
 pub const MAX_MANIFEST_FILES: usize = 100_000;
 
+/// File-selection rules used while building a sender manifest.
+#[derive(Debug, Clone, Default)]
+pub struct FilterOptions {
+    /// Exclude hidden path components unless explicitly requested.
+    pub include_hidden: bool,
+    /// Glob-like patterns matched against the forward-slash relative path.
+    pub exclude: Vec<String>,
+    /// When non-empty, only paths matching at least one pattern are kept.
+    pub include: Vec<String>,
+}
+
 // Compile-time guarantee that MAX_MANIFEST_FILES fits in FileId (u32).
 const _: () = assert!(
     MAX_MANIFEST_FILES <= u32::MAX as usize,
@@ -373,6 +384,80 @@ fn check_no_collisions<R: AsRef<str>>(
 /// itself, or `ManifestError::Io` for other I/O failures.
 pub fn build(inputs: &[PathBuf], chunk_size: u32) -> Result<Manifest, ManifestError> {
     build_inner(inputs, chunk_size, true)
+}
+
+/// Build a manifest and apply path-selection filters before hashing is
+/// performed by callers. The default `build` API remains unfiltered for
+/// library compatibility; CLI callers should use this function.
+pub fn build_with_filters(
+    inputs: &[PathBuf],
+    chunk_size: u32,
+    filters: &FilterOptions,
+) -> Result<Manifest, ManifestError> {
+    let mut manifest = build(inputs, chunk_size)?;
+    manifest.files.retain(|entry| {
+        let hidden = !filters.include_hidden
+            && entry
+                .rel_path
+                .split('/')
+                .skip(1)
+                .any(|component| component.starts_with('.'));
+        let excluded = filters
+            .exclude
+            .iter()
+            .any(|pattern| matches_filter(pattern, &entry.rel_path));
+        let included = filters.include.is_empty()
+            || filters
+                .include
+                .iter()
+                .any(|pattern| matches_filter(pattern, &entry.rel_path));
+        !hidden && !excluded && included
+    });
+    if manifest.files.is_empty() {
+        return Err(ManifestError::Empty);
+    }
+    for (id, file) in manifest.files.iter_mut().enumerate() {
+        file.id = id as FileId;
+    }
+    Ok(manifest)
+}
+
+/// Small dependency-free glob matcher. `*` matches within one component,
+/// `**` also crosses `/`, and `?` matches one non-separator character.
+fn matches_filter(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim_matches('/');
+    if pattern.is_empty() {
+        return false;
+    }
+    fn matches(p: &[u8], s: &[u8]) -> bool {
+        if p.is_empty() {
+            return s.is_empty();
+        }
+        if p[0] == b'*' {
+            let double = p.get(1) == Some(&b'*');
+            let rest = if double { &p[2..] } else { &p[1..] };
+            if matches(rest, s) {
+                return true;
+            }
+            if let Some((&first, tail)) = s.split_first() {
+                if double || first != b'/' {
+                    return matches(p, tail);
+                }
+            }
+            return false;
+        }
+        if let Some((&first, tail)) = s.split_first() {
+            if p[0] == b'?' && first != b'/' {
+                return matches(&p[1..], tail);
+            }
+            if p[0] == first {
+                return matches(&p[1..], tail);
+            }
+        }
+        false
+    }
+    matches(pattern.as_bytes(), path.as_bytes())
+        || (!pattern.contains('/') && path.split('/').any(|part| matches(pattern.as_bytes(), part.as_bytes())))
 }
 
 fn build_inner(
@@ -1105,6 +1190,32 @@ mod tests {
                 "{good:?} must be accepted"
             );
         }
+    }
+
+    #[test]
+    fn filtered_manifest_applies_include_exclude_and_hidden_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        File::create(dir.path().join("keep.txt")).unwrap();
+        File::create(dir.path().join("skip.log")).unwrap();
+        File::create(dir.path().join(".secret")).unwrap();
+        File::create(dir.path().join("sub/nested.txt")).unwrap();
+
+        let filtered = build_with_filters(
+            &[dir.path().to_path_buf()],
+            1024,
+            &FilterOptions {
+                include_hidden: false,
+                exclude: vec!["*.log".into()],
+                include: vec!["*.txt".into()],
+            },
+        )
+        .unwrap();
+        let paths: Vec<_> = filtered.files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(paths.iter().any(|p| p.ends_with("keep.txt")));
+        assert!(paths.iter().any(|p| p.ends_with("nested.txt")));
+        assert!(!paths.iter().any(|p| p.ends_with("skip.log")));
+        assert!(!paths.iter().any(|p| p.ends_with(".secret")));
     }
 
     #[test]

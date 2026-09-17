@@ -82,6 +82,10 @@ Use `--zip` to send the input as a single archive instead.
 | `--no-discovery` | Disable automatic network discovery |
 | `--zip` | Send the input as a single archive |
 | `--port N` | Listen on port N (default: stable 29320; falls back to ephemeral if busy; explicit values fail if taken) |
+| `--bind address` | Bind the sender to one local IPv4 or IPv6 address instead of all interfaces |
+| `--exclude PATTERN` | Exclude matching paths; repeatable (`*`, `?`, and `**` are supported) |
+| `--include PATTERN` | Include only matching paths; repeatable |
+| `--hidden` | Include hidden files and directories |
 | `--parallel N` | Transfer using N parallel connections (default: 1) |
 | `--relay addr` | Transfer through a relay |
 | `--chunk-size bytes` | Set the hashing chunk size (default: 1 MiB) |

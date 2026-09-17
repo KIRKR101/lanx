@@ -1,7 +1,7 @@
 //! `lanx send`: build manifest, listen for receiver, transfer.
 
 use anyhow::{Context, Result};
-use lanx_core::manifest::{build, rel_to_path, validate_rel_path};
+use lanx_core::manifest::{build_with_filters, rel_to_path, validate_rel_path, FilterOptions};
 use lanx_core::transfer::sender::{run_sender, SenderConfig};
 use lanx_core::transfer::DEFAULT_MAX_RETRIES;
 use lanx_net::discovery::{
@@ -94,6 +94,9 @@ pub async fn run(
     zip: bool,
     port: Option<u16>,
     bind: Option<String>,
+    exclude: Vec<String>,
+    include: Vec<String>,
+    hidden: bool,
     parallel: u16,
     relay: Option<String>,
     verbose: bool,
@@ -129,7 +132,12 @@ pub async fn run(
     let hash_spinner = ui::spinner(&format!("hashing files{}", ui::ellipsis()));
     let manifest = tokio::task::spawn_blocking({
         let paths = effective_paths.clone();
-        move || build(&paths, chunk_size)
+        let filters = FilterOptions {
+            include_hidden: hidden,
+            exclude,
+            include,
+        };
+        move || build_with_filters(&paths, chunk_size, &filters)
     })
     .await
     .context("hash task panicked")??;
