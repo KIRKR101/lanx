@@ -1,29 +1,28 @@
 //! Transfer progress UI.
 //!
-//! Layout (one line per file, updated in place with a carriage return):
+//! Shape of a transfer on screen:
 //!
 //! ```text
-//! lanx · receiving
-//! Receiving folder `myrepo` (17 files, 36.2 MiB)
-//!   [ 1/17] Berchem_fig_2.jpg           13.39 MiB / 13.39 MiB  100% ✓
-//!   [ 2/17] Charles_de_hooch_fig_1.jpg   2.10 MiB /  5.34 MiB   39% ▕████▏          3.21 MiB/s
-//!   [ 3/17] readme.txt                   · skipped (already present)
-//!   ✓ Done — 17 verified, 0 failed, 0 skipped  (36.2 MiB / 36.2 MiB)
+//! lanx · recv
+//!   ✓ found sender 192.168.1.120:29320
+//!   Theo_Kirk_CV.pdf          48.9 KiB      <- contents (sender lists
+//!                                              them, receiver approves them)
+//!   ████████████████████████  48.9 KiB / 48.9 KiB   <- live rows
+//!   ✓ Done · 1 file · 48.9 KiB                     <- result
 //! ```
 //!
-//! The header is printed once when the manifest arrives. Each file gets
-//! one line; the in-flight file is updated in place with `\r` while
-//! finished files keep their line. New files appear on a fresh line so
-//! the per-file lines accumulate up the screen.
+//! One live row per in-flight file, updated in place with a carriage
+//! return; finished rows keep their line. Skipped files print a single
+//! `– <name> already present` line and never enter a fake active
+//! state.
 //!
-//! All color/glyph styling goes through `crate::ui`, which auto-disables
-//! ANSI when stderr is not a TTY — so piped output stays plain and
-//! greppable (important on Windows where redirected stderr used to
-//! collect stray escape sequences).
+//! All color/glyph styling goes through `crate::ui`, which falls back
+//! to plain ASCII when animation is unsafe (piped output, `TERM=dumb`,
+//! `LANX_PLAIN`) so logs stay greppable.
 
 use crate::ui;
 use lanx_core::manifest::{FileId, Manifest};
-use lanx_core::progress::{Progress, TransferKind, TransferSummary};
+use lanx_core::progress::{Progress, TransferSummary};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -97,44 +96,20 @@ struct FileState {
 
 /// Transfer progress UI for both sender and receiver.
 pub struct IndicatifProgress {
-    verb: &'static str,
+    done_word: &'static str,
     state: Mutex<RenderState>,
-}
-
-/// Build the one-line transfer header used by both sides. The sender
-/// prints a "Sending …" line, the receiver a "Receiving …" line in
-/// `IndicatifProgress::manifest_received`. Styling auto-disables when
-/// stderr is not a TTY.
-pub fn transfer_header(verb: &str, m: &Manifest) -> String {
-    let summary = TransferSummary::from_manifest(m);
-    let human_size = ui::human_bytes(summary.total_bytes);
-    match &summary.kind {
-        TransferKind::Folder => format!(
-            "{} folder `{}` ({} files, {})",
-            ui::bold(verb),
-            ui::bold(&summary.display_name),
-            summary.file_count,
-            ui::dim(&human_size),
-        ),
-        TransferKind::SingleFile => format!(
-            "{} file `{}` ({})",
-            ui::bold(verb),
-            ui::bold(&summary.display_name),
-            ui::dim(&human_size),
-        ),
-        TransferKind::Files => format!(
-            "{} {} files ({})",
-            ui::bold(verb),
-            summary.file_count,
-            ui::dim(&human_size),
-        ),
-    }
 }
 
 impl IndicatifProgress {
     pub fn new(verb: &'static str) -> Arc<Self> {
+        // Past-tense result word: the sender reports what it sent,
+        // the receiver reports completion.
+        let done_word = match verb {
+            "Sending" => "Sent",
+            _ => "Done",
+        };
         Arc::new(Self {
-            verb,
+            done_word,
             state: Mutex::new(RenderState {
                 rel_paths: Vec::new(),
                 state: HashMap::new(),
@@ -231,6 +206,18 @@ impl IndicatifProgress {
         }
 
         let mut line = String::new();
+        if skipped {
+            // Skipped files never enter an active state: one quiet
+            // no-op line instead of a progress row.
+            line.push_str("  ");
+            line.push_str(ui::skip_sym());
+            line.push(' ');
+            line.push_str(&ui::pad_visible(&label, label_max));
+            line.push_str("  ");
+            line.push_str(&ui::dim("already present"));
+            write_line(&line, width, fresh_line);
+            return;
+        }
         line.push_str(&prefix);
         line.push_str(&ui::pad_visible(&label, label_max));
         line.push_str("  ");
@@ -240,11 +227,7 @@ impl IndicatifProgress {
             ui::human_bytes(total),
         ));
 
-        if skipped {
-            // Skipped files have no byte flow to show; surface the
-            // reason instead of a percentage.
-            line.push_str(&format!("  {}", ui::dim("skipped (already present)")));
-        } else if total > 0 {
+        if total > 0 {
             line.push_str(&format!("  {:>3}%", pct));
             // Bar only when there's room; skip on narrow terminals.
             let remaining = width.saturating_sub(ui::strip_ansi(&line).chars().count());
@@ -266,46 +249,52 @@ impl IndicatifProgress {
             }
         }
 
-        // Status tail. Skipped files already carry a "skipped" note in
-        // the body, so they don't get a redundant trailing glyph.
+        // Status tail.
         if done {
-            if ok && !skipped {
+            if ok {
                 line.push(' ');
                 line.push_str(&ui::green(ui::ok_sym()));
-            } else if !ok {
+            } else {
                 line.push(' ');
                 line.push_str(&ui::red(ui::fail_sym()));
             }
         }
 
-        // Clamp to the terminal width so the line never wraps (a
-        // wrapped line breaks the in-place `\r` update into stacked
-        // lines), then pad to the full width so the previous, longer
-        // line is fully cleared before we move on.
-        let line = ui::truncate_visible(&line, width);
-        let line = ui::pad_visible(&line, width);
+        write_line(&line, width, fresh_line);
+    }
+}
 
-        let stderr = std::io::stderr();
-        let mut handle = stderr.lock();
-        if ui::animated() {
-            // Erase the previous render before writing the new one.
-            // `\r` alone leaves stale characters when the line shrank;
-            // ESC[2K clears from the cursor to end of line. Dumb
-            // terminals take the plain-line path below instead: they
-            // may not understand either sequence.
-            if !fresh_line {
-                let _ = handle.write_all(b"\r");
-                let _ = handle.write_all(b"\x1b[2K");
-            }
-            let _ = write!(handle, "{line}");
-            let _ = handle.flush();
-        } else {
-            // Not animated (redirected/piped output, dumb terminal):
-            // print each state as its own plain line. No carriage
-            // returns, no padding, no ANSI - keeps logs greppable.
-            // padding, no ANSI - keeps logs greppable.
-            let _ = writeln!(handle, "{}", ui::strip_ansi(&line).trim_end());
+/// Clamp `line` to the terminal width so it never wraps (a wrapped
+/// line breaks the in-place `\r` update into stacked lines), pad it
+/// so a previous, longer line is fully cleared, then emit it: in
+/// place on animated terminals, as its own plain line otherwise.
+fn write_line(line: &str, width: usize, fresh_line: bool) {
+    // Clamp to the terminal width so the line never wraps (a
+    // wrapped line breaks the in-place `\r` update into stacked
+    // lines), then pad to the full width so the previous, longer
+    // line is fully cleared before we move on.
+    let line = ui::truncate_visible(line, width);
+    let line = ui::pad_visible(&line, width);
+
+    let stderr = std::io::stderr();
+    let mut handle = stderr.lock();
+    if ui::animated() {
+        // Erase the previous render before writing the new one.
+        // `\r` alone leaves stale characters when the line shrank;
+        // ESC[2K clears from the cursor to end of line. Dumb
+        // terminals take the plain-line path below instead: they
+        // may not understand either sequence.
+        if !fresh_line {
+            let _ = handle.write_all(b"\r");
+            let _ = handle.write_all(b"\x1b[2K");
         }
+        let _ = write!(handle, "{line}");
+        let _ = handle.flush();
+    } else {
+        // Not animated (redirected/piped output, dumb terminal):
+        // print each state as its own plain line. No carriage
+        // returns, no padding, no ANSI - keeps logs greppable.
+        let _ = writeln!(handle, "{}", ui::strip_ansi(&line).trim_end());
     }
 }
 
@@ -316,8 +305,7 @@ impl Progress for IndicatifProgress {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // With parallel connections, multiple `run_sender` instances
-        // call this with the same manifest. Only print the header once
-        // to avoid duplicate output.
+        // call this with the same manifest.
         if !st.rel_paths.is_empty() {
             return;
         }
@@ -327,8 +315,9 @@ impl Progress for IndicatifProgress {
         for f in &manifest.files {
             st.sizes.insert(f.id, f.size);
         }
-        // Single-line header.
-        eprintln!("{}", transfer_header(self.verb, manifest));
+        // No header line: the sender lists contents explicitly after
+        // connecting and the receiver shows them in the approval
+        // prompt, so a third listing here would only repeat them.
     }
 
     fn started(&self, id: FileId, _rel: &str, total: u64, offset: u64) {
@@ -458,40 +447,41 @@ impl Progress for IndicatifProgress {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let skipped = skipped.max(st.skipped as usize);
         let sent = st.bytes_sent;
-        let total = st.total_bytes;
+        let done_word = self.done_word.to_string();
 
-        let head = if failed == 0 {
-            if ui::animated() {
-                format!("{} {}", ui::green(ui::ok_sym()), ui::green("Done"))
-            } else {
-                "Done".to_string()
-            }
-        } else if ui::animated() {
-            format!("{} {}", ui::red(ui::fail_sym()), ui::red("Done"))
-        } else {
-            "Done (with failures)".to_string()
-        };
-
-        let mut parts = Vec::new();
-        parts.push(format!("{} verified", ui::green(&verified.to_string())));
-        if failed > 0 {
-            parts.push(format!("{} failed", ui::red(&failed.to_string())));
-        } else {
-            parts.push(format!("{} failed", ui::dim(&failed.to_string())));
+        // Only counters that matter: zero-valued ones stay hidden, and
+        // byte accounting appears only when bytes actually moved.
+        let mut segs: Vec<String> = Vec::new();
+        if verified > 0 {
+            let word = if verified == 1 { "file" } else { "files" };
+            segs.push(format!("{verified} {word}"));
+            segs.push(ui::human_bytes(sent));
         }
         if skipped > 0 {
-            parts.push(format!("{} skipped", ui::dim(&skipped.to_string())));
+            segs.push(format!("{skipped} skipped"));
+        }
+        if failed > 0 {
+            segs.push(format!("{} failed", ui::red(&failed.to_string())));
         }
 
-        let progress = format!("({} / {})", ui::human_bytes(sent), ui::human_bytes(total));
+        let body = segs.join(&format!(" {} ", ui::sep_dot()));
         eprintln!();
-        eprintln!(
-            "  {} {} {}  {}",
-            head,
-            ui::sep_dash(),
-            parts.join(", "),
-            ui::dim(&progress),
-        );
+        if failed > 0 {
+            let mark = if ui::animated() {
+                ui::yellow("!")
+            } else {
+                "!".to_string()
+            };
+            eprintln!("  {mark} {} {body}", ui::red(&done_word));
+        } else if ui::animated() {
+            eprintln!(
+                "  {} {} {body}",
+                ui::green(ui::ok_sym()),
+                ui::green(&done_word)
+            );
+        } else {
+            eprintln!("  {done_word} {body}");
+        }
     }
 }
 

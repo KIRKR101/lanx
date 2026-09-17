@@ -128,19 +128,19 @@ pub fn retry_sym() -> &'static str {
         "retry"
     }
 }
+/// No-op marker for skipped files. ASCII fallback in plain mode.
+pub fn skip_sym() -> &'static str {
+    if use_unicode() {
+        "–"
+    } else {
+        "-"
+    }
+}
 /// Mid-dot separator used in banners. ASCII fallback so non-UTF-8
 /// pipes don't see a replacement character.
 pub fn sep_dot() -> &'static str {
     if use_unicode() {
         "·"
-    } else {
-        "-"
-    }
-}
-/// Em dash used between summary segments.
-pub fn sep_dash() -> &'static str {
-    if use_unicode() {
-        "—"
     } else {
         "-"
     }
@@ -155,12 +155,19 @@ pub fn ellipsis() -> &'static str {
 }
 
 /// Print a labeled key/value line with aligned columns, e.g.
-///   `code   7-cobalt-fox`
-///   `listen 192.168.1.5:51234`
+///   `code    5-drift-forge`
+///   `address 192.168.1.5:29320`
 /// `label` is colored cyan and right-padded to `label_width`.
 pub fn kv(label: &str, value: &str, label_width: usize) {
     let lbl = format!("{:<label_width$}", label);
     eprintln!("{} {}", cyan(&lbl), value);
+}
+
+/// Compact count line used across setup and result output, e.g.
+/// `1 file · 48.9 KiB` or `12 files · 384 MiB`.
+pub fn count_line(n: usize, total_bytes: u64) -> String {
+    let word = if n == 1 { "file" } else { "files" };
+    format!("{n} {word} {} {}", sep_dot(), human_bytes(total_bytes))
 }
 
 /// A short banner line introducing a phase, e.g. `lanx · sending`.

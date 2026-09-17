@@ -119,11 +119,12 @@ pub async fn run(
         eprintln!("  {} {} {}", ui::dim("relay"), ui::arrow(), ui::bold(ra));
     } else {
         eprintln!(
-            "  {} sender {}",
+            "  {} found sender {}",
             ui::green(ui::ok_sym()),
             ui::bold(&addr.to_string()),
         );
     }
+    eprintln!();
 
     let progress: Arc<dyn Progress> = IndicatifProgress::new("Receiving");
 
@@ -131,7 +132,6 @@ pub async fn run(
         Arc::new(AutoAccept)
     } else {
         Arc::new(StdinApprover {
-            sender: addr.to_string(),
             out_dir: out.clone(),
         })
     };
@@ -178,18 +178,6 @@ pub async fn run(
                                 ui::bold(&new_addr.to_string()),
                             );
                             try_cfg.addr = new_addr;
-                            // Refresh the prompt label to the new address.
-                            if !accept {
-                                let base: Arc<dyn ManifestApprover> = Arc::new(StdinApprover {
-                                    sender: new_addr.to_string(),
-                                    out_dir: out.clone(),
-                                });
-                                try_cfg.approver = if parallel > 1 {
-                                    SharedApprover::new(base)
-                                } else {
-                                    base
-                                };
-                            }
                         }
                     }
                     Err(e) => {
@@ -398,7 +386,6 @@ async fn aggregate_reports(
 /// Prompts the user to accept or decline an incoming manifest by reading
 /// from stdin. Used unless `--accept` is passed.
 struct StdinApprover {
-    sender: String,
     out_dir: PathBuf,
 }
 
@@ -412,25 +399,16 @@ impl ManifestApprover for StdinApprover {
             };
         }
 
-        eprintln!();
+        eprintln!("  {} Incoming transfer", ui::cyan("?"));
         eprintln!(
-            "  {} Incoming transfer from {}",
-            ui::cyan("?"),
-            ui::bold(&self.sender),
+            "    {}",
+            ui::bold(&ui::count_line(summary.file_count, summary.total_bytes)),
         );
-
-        let file_word = if summary.file_count == 1 {
-            "file"
-        } else {
-            "files"
-        };
-        eprintln!(
-            "    {} {} {}, {}",
-            ui::bold(&summary.file_count.to_string()),
-            file_word,
-            ui::dim(&ui::human_bytes(summary.total_bytes).to_string()),
-            ui::dim(&format!("destination: {}", self.out_dir.display())),
-        );
+        // Destination on its own line, omitted for the default (`.`).
+        let out_is_default = self.out_dir.as_os_str() == ".";
+        if !out_is_default {
+            eprintln!("    {}  {}", ui::dim("Destination"), self.out_dir.display(),);
+        }
 
         // List the first N files with their sizes.
         let remaining = summary.file_count.saturating_sub(MANIFEST_PREVIEW_LIMIT);

@@ -12,6 +12,11 @@ mod ui;
 #[derive(Parser, Debug)]
 #[command(name = "lanx", about = "LAN file transfer", version)]
 struct Cli {
+    /// Increase log detail (-v for info, -vv for debug). Without it,
+    /// only errors are shown; progress stays quiet.
+    #[arg(long, short, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -83,18 +88,35 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .try_init();
-
     let cli = Cli::parse();
+    // Quiet by default: internal tracing (handshake chatter, retry
+    // notes, pump errors) stays hidden unless asked for. `RUST_LOG`
+    // still wins when set explicitly.
+    let noisy = cli.verbose > 0 || std::env::var("RUST_LOG").is_ok();
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(v) if !v.is_empty() => EnvFilter::new(v),
+        _ => {
+            let level = match cli.verbose {
+                0 => "error",
+                1 => "info",
+                _ => "debug",
+            };
+            EnvFilter::new(format!("lanx={level},lanx_core={level},lanx_net={level}"))
+        }
+    };
+    let fmt = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false);
+    if noisy {
+        let _ = fmt.try_init();
+    } else {
+        let _ = fmt.without_time().try_init();
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build tokio runtime")?;
+    let verbose = cli.verbose > 0;
     runtime.block_on(async move {
         match cli.command {
             Command::Send {
@@ -105,7 +127,19 @@ fn main() -> Result<()> {
                 port,
                 parallel,
                 relay,
-            } => cmd::send::run(paths, chunk_size, no_discovery, zip, port, parallel, relay).await,
+            } => {
+                cmd::send::run(
+                    paths,
+                    chunk_size,
+                    no_discovery,
+                    zip,
+                    port,
+                    parallel,
+                    relay,
+                    verbose,
+                )
+                .await
+            }
             Command::Recv {
                 target,
                 out,

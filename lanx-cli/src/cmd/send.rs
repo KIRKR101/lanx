@@ -69,6 +69,7 @@ fn spawn_stream(
 ///
 /// Returns an error if manifest building fails, no receiver connects
 /// within the grace period, or the transfer encounters a protocol error.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     paths: Vec<PathBuf>,
     chunk_size: u32,
@@ -77,6 +78,7 @@ pub async fn run(
     port: Option<u16>,
     parallel: u16,
     relay: Option<String>,
+    verbose: bool,
 ) -> Result<()> {
     // Optional zip mode (explicit `--zip`). When set, the input is
     // packaged into a single `.zip` file in a temp dir and that single
@@ -109,18 +111,12 @@ pub async fn run(
     .context("hash task panicked")??;
     let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
     hash_spinner.finish_and_clear();
-    let file_word = if manifest.files.len() == 1 {
-        "file"
-    } else {
-        "files"
-    };
+    let n_files = manifest.files.len();
     eprintln!(
-        "  {} {} {} {} ({} total)",
+        "  {} {} {}",
         ui::green(ui::ok_sym()),
         ui::dim("hashed"),
-        manifest.files.len(),
-        file_word,
-        ui::human_bytes(total_bytes),
+        ui::count_line(n_files, total_bytes),
     );
 
     // Reconstruct source paths from the manifest's canonicalized
@@ -172,7 +168,46 @@ pub async fn run(
     crate::cmd::validate_parallel_relay(parallel, &relay)?;
     let progress: Arc<dyn lanx_core::progress::Progress> = IndicatifProgress::new("Sending");
 
+    // Direct-mode connection details print once here, not every
+    // reconnection round. The manual command is the user-facing
+    // information; the bind address is shown above it. Loopback is
+    // verbose-only: it almost never helps a transfer to another
+    // machine.
+    if relay.is_none() {
+        let addrs = crate::iface::list_non_loopback_v4().await;
+        match addrs.first() {
+            Some(ip) => ui::kv("address", &format!("{ip}:{}", addr.port()), label_w),
+            None => ui::kv("address", &format!("0.0.0.0:{}", addr.port()), label_w),
+        }
+        eprintln!();
+        eprintln!("  {}", ui::dim("Direct:"));
+        for ip in &addrs {
+            eprintln!("    lanx recv {ip}:{}", addr.port());
+        }
+        if verbose {
+            eprintln!(
+                "    lanx recv 127.0.0.1:{} {}",
+                addr.port(),
+                ui::dim("(loopback)"),
+            );
+        }
+        eprintln!();
+    }
+
     let mut disc = None;
+    if relay.is_none() && !no_discovery {
+        match start_broadcasting(addr.port(), &code).await {
+            Ok(h) => disc = Some(h),
+            Err(e) => {
+                warn!(?e, "discovery failed; continuing without broadcast");
+                eprintln!(
+                    "  {} {}",
+                    ui::yellow("!"),
+                    ui::yellow("discovery unavailable; share the Direct command instead"),
+                );
+            }
+        }
+    }
 
     let mut listener = GracefulListener::new(listener, Duration::from_secs(60));
     let mut had_session = false;
@@ -190,7 +225,6 @@ pub async fn run(
         };
 
         let mut set = tokio::task::JoinSet::new();
-        let mut actual_parallel = 1;
         let mut first_task_result = None;
 
         if let Some(ref relay_addr) = relay {
@@ -223,6 +257,7 @@ pub async fn run(
                 ui::dim("registered with relay (waiting for receiver)")
             );
             eprintln!();
+            print_contents(&manifest);
 
             spawn_stream(
                 &mut set,
@@ -233,48 +268,6 @@ pub async fn run(
                 cfg.clone(),
             );
         } else {
-            // Direct mode: listen for incoming connections.
-            let addrs = crate::iface::list_non_loopback_v4().await;
-            let indent = " ".repeat(label_w + 1);
-            if addrs.is_empty() {
-                ui::kv("listen", &format!("0.0.0.0:{}", addr.port()), label_w);
-                ui::kv(
-                    "recv",
-                    &format!("lanx recv 127.0.0.1:{}", addr.port()),
-                    label_w,
-                );
-            } else {
-                ui::kv("listen", &format!("{}:{}", addrs[0], addr.port()), label_w);
-                for ip in &addrs[1..] {
-                    eprintln!("{indent}{ip}:{}", addr.port());
-                }
-                // Copy-pasteable receiver command per reachable interface,
-                // plus loopback so every listen address has a recv match.
-                ui::kv(
-                    "recv",
-                    &format!("lanx recv {}:{}", addrs[0], addr.port()),
-                    label_w,
-                );
-                for ip in &addrs[1..] {
-                    eprintln!("{indent}lanx recv {ip}:{}", addr.port());
-                }
-                eprintln!(
-                    "{indent}lanx recv 127.0.0.1:{} {}",
-                    addr.port(),
-                    ui::dim("(loopback)"),
-                );
-            }
-            eprintln!();
-
-            if !no_discovery {
-                match start_broadcasting(addr.port(), &code).await {
-                    Ok(h) => disc = Some(h),
-                    Err(e) => {
-                        warn!(?e, "discovery failed; continuing without broadcast");
-                    }
-                }
-            }
-
             // Fresh grace window for this round: after a failed session the
             // receiver's retry loop reconnects and resumes (plan.md §8 A).
             listener.reset();
@@ -304,6 +297,14 @@ pub async fn run(
                 }
             };
             wait_spinner.finish_and_clear();
+            let peer = stream0
+                .peer_addr()
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|_| "receiver".to_string());
+            eprintln!("  {} connected from {peer}", ui::green(ui::ok_sym()),);
+            if !had_session {
+                print_contents(&manifest);
+            }
             had_session = true;
 
             spawn_stream(
@@ -326,7 +327,6 @@ pub async fn run(
                     1
                 }
             };
-            actual_parallel = agreed_parallel;
 
             if agreed_parallel > 1 {
                 let extra_wait_spinner = ui::spinner(&format!(
@@ -357,17 +357,6 @@ pub async fn run(
                 extra_wait_spinner.finish_and_clear();
             }
         }
-
-        eprintln!(
-            "  {} {} {}",
-            ui::green(ui::ok_sym()),
-            ui::dim("receiver connected"),
-            ui::dim(&format!(
-                "({} stream{})",
-                actual_parallel,
-                if actual_parallel == 1 { "" } else { "s" }
-            )),
-        );
 
         // If connection 0 finished/failed during the select! above, fold its
         // result into the round's error handling below instead of bailing:
@@ -419,20 +408,38 @@ pub async fn run(
     }
     // `_zip_cleanup` is dropped here; `TempDir` removes the temp directory.
 
-    // Sender-side completion line. The receiver prints the authoritative
-    // verified/failed/skipped summary; on the sender we surface a concise
-    // "sent" confirmation so the operator sees the session ended cleanly.
+    // Sender-side completion line: what moved, nothing else.
     eprintln!();
     eprintln!(
-        "  {} {} {} {} ({} total)",
+        "  {} {} {}",
         ui::green(ui::ok_sym()),
-        ui::green("sent"),
-        manifest.files.len(),
-        file_word,
-        ui::human_bytes(total_bytes),
+        ui::green("Sent"),
+        ui::count_line(manifest.files.len(), total_bytes),
     );
 
     Ok(())
+}
+
+/// List transfer contents: one `name  size` row per file, capped so
+/// huge manifests don't flood the terminal. Printed once after the
+/// receiver connects; live progress rows take over from there.
+fn print_contents(manifest: &lanx_core::manifest::Manifest) {
+    const LIMIT: usize = 20;
+    const NAME_W: usize = 38;
+    eprintln!();
+    for f in manifest.files.iter().take(LIMIT) {
+        let mut name = f.rel_path.clone();
+        if name.chars().count() > NAME_W {
+            name = format!("{}…", name.chars().take(NAME_W - 1).collect::<String>());
+        }
+        eprintln!("  {name:<38}  {}", ui::dim(&ui::human_bytes(f.size)));
+    }
+    if manifest.files.len() > LIMIT {
+        eprintln!(
+            "  {}",
+            ui::dim(&format!("… and {} more", manifest.files.len() - LIMIT))
+        );
+    }
 }
 
 /// Copy all bytes from `reader` into `writer` in 64 KiB chunks.
