@@ -23,6 +23,12 @@ pub fn resolve_passphrase(opt: Option<String>) -> Option<String> {
     std::env::var("LANX_PSK").ok().filter(|v| !v.is_empty())
 }
 
+pub fn relay_auth_token() -> Option<String> {
+    std::env::var("LANX_RELAY_AUTH_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
 /// Warn when a relay target is not LAN-local: the pairing ID is visible
 /// to the relay and network path, so short codes without `--psk` are
 /// guessable there. Public targets get the strong warning; unparseable

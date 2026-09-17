@@ -52,6 +52,8 @@ pub struct RelayHello {
     /// network path; guessing the underlying code still requires
     /// completing the PSK-bound Noise handshake.
     pub code_hash: [u8; 32],
+    /// Optional operator-provided token checked before pairing.
+    pub auth_token: Option<String>,
 }
 
 /// A pending connection waiting to be paired.
@@ -83,11 +85,10 @@ const RECEIVER_WAIT_SECS: u64 = 30;
 /// Maximum seconds of inactivity before a paired transfer is considered
 /// stalled and the session is released. Prevents leaked sessions from
 /// half-open TCP connections holding slots indefinitely.
-const TRANSFER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
 /// Maximum concurrent paired transfers the relay will handle. Prevents
 /// unbounded memory growth from fork/bomb attacks.
 const MAX_ACTIVE_SESSIONS: usize = 256;
+pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Maximum failed pairing attempts per IP within `RATE_LIMIT_WINDOW`
 /// before the relay starts rejecting with [`RelayError::RateLimited`].
@@ -169,6 +170,27 @@ pub enum RelayError {
     RateLimited,
     #[error("server at capacity; try again later")]
     Capacity,
+    #[error("relay authentication failed")]
+    Authentication,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayConfig {
+    pub max_sessions: usize,
+    pub idle_timeout: std::time::Duration,
+    pub auth_token: Option<String>,
+    pub metrics: bool,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: MAX_ACTIVE_SESSIONS,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            auth_token: None,
+            metrics: false,
+        }
+    }
 }
 
 /// A TURN-like relay server that pairs sender and receiver TCP connections
@@ -191,6 +213,7 @@ pub struct RelayServer {
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-IP failed-guess counters for rate limiting receivers.
     attempts: Arc<Mutex<AttemptTracker>>,
+    config: RelayConfig,
 }
 
 impl RelayServer {
@@ -200,6 +223,14 @@ impl RelayServer {
     ///
     /// Returns `RelayError::Io` if either listener cannot be bound.
     pub async fn new(sender_bind: String, receiver_bind: String) -> Result<Self, RelayError> {
+        Self::new_with_config(sender_bind, receiver_bind, RelayConfig::default()).await
+    }
+
+    pub async fn new_with_config(
+        sender_bind: String,
+        receiver_bind: String,
+        config: RelayConfig,
+    ) -> Result<Self, RelayError> {
         let sender_listener = TcpListener::bind(&sender_bind).await?;
         let receiver_listener = TcpListener::bind(&receiver_bind).await?;
 
@@ -209,6 +240,7 @@ impl RelayServer {
             pending_senders: Arc::new(Mutex::new(HashMap::new())),
             active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             attempts: Arc::new(Mutex::new(AttemptTracker::default())),
+            config,
         })
     }
 
@@ -224,9 +256,13 @@ impl RelayServer {
             receiver = %self.receiver_listener.local_addr()?,
             "relay server started"
         );
+        if self.config.metrics {
+            tracing::info!("relay metrics enabled; active_sessions is reported every 60s");
+        }
 
         let mut sender_set = tokio::task::JoinSet::new();
         let mut receiver_set = tokio::task::JoinSet::new();
+        let mut metrics_tick = tokio::time::interval(std::time::Duration::from_secs(60));
 
         loop {
             tokio::select! {
@@ -238,8 +274,9 @@ impl RelayServer {
                     match result {
                         Ok((stream, addr)) => {
                             let pending = self.pending_senders.clone();
+                            let auth_token = self.config.auth_token.clone();
                             sender_set.spawn(async move {
-                                if let Err(e) = handle_sender(stream, addr, pending).await {
+                                if let Err(e) = handle_sender(stream, addr, pending, auth_token).await {
                                     tracing::warn!(addr = %addr, error = %e, "sender handler error");
                                 }
                             });
@@ -261,8 +298,9 @@ impl RelayServer {
                             let pending = self.pending_senders.clone();
                             let sessions = self.active_sessions.clone();
                             let attempts = self.attempts.clone();
+                            let config = self.config.clone();
                             receiver_set.spawn(async move {
-                                if let Err(e) = handle_receiver(stream, addr, pending, sessions, attempts).await {
+                                if let Err(e) = handle_receiver(stream, addr, pending, sessions, attempts, config).await {
                                     tracing::warn!(addr = %addr, error = %e, "receiver handler error");
                                 }
                             });
@@ -282,6 +320,11 @@ impl RelayServer {
                     if let Err(e) = result {
                         tracing::debug!(error = %e, "receiver handler task panicked");
                     }
+                }
+                _ = metrics_tick.tick(), if self.config.metrics => {
+                    let pending = self.pending_senders.lock().await.len();
+                    let active = self.active_sessions.load(std::sync::atomic::Ordering::Acquire);
+                    tracing::info!(pending_senders = pending, active_sessions = active, "relay metrics");
                 }
             }
         }
@@ -343,12 +386,16 @@ async fn handle_sender(
     mut stream: TcpStream,
     addr: SocketAddr,
     pending: Arc<Mutex<HashMap<[u8; 32], Pending>>>,
+    auth_token: Option<String>,
 ) -> Result<(), RelayError> {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(?e, "TCP_NODELAY failed on sender");
     }
 
     let hello = read_relay_hello(&mut stream).await?;
+    if auth_token.as_deref() != hello.auth_token.as_deref() {
+        return Err(RelayError::Authentication);
+    }
     if hello.role != RelayRole::Sender {
         return Err(RelayError::UnexpectedRole(hello.role));
     }
@@ -469,12 +516,16 @@ async fn handle_receiver(
     pending: Arc<Mutex<HashMap<[u8; 32], Pending>>>,
     active_sessions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     attempts: Arc<Mutex<AttemptTracker>>,
+    config: RelayConfig,
 ) -> Result<(), RelayError> {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(?e, "TCP_NODELAY failed on receiver");
     }
 
     let hello = read_relay_hello(&mut stream).await?;
+    if config.auth_token.as_deref() != hello.auth_token.as_deref() {
+        return Err(RelayError::Authentication);
+    }
     if hello.role != RelayRole::Receiver {
         return Err(RelayError::UnexpectedRole(hello.role));
     }
@@ -516,7 +567,7 @@ async fn handle_receiver(
                 // sender to pending (fresh timestamp) so a later retry
                 // can still find it.
                 let prev = active_sessions.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                if prev >= MAX_ACTIVE_SESSIONS {
+                if prev >= config.max_sessions {
                     active_sessions.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     tracing::warn!(
                         receiver = %addr,
@@ -541,7 +592,7 @@ async fn handle_receiver(
                 tokio::spawn(async move {
                     let _g = moved_guard;
                     match tokio::time::timeout(
-                        TRANSFER_IDLE_TIMEOUT,
+                        config.idle_timeout,
                         bidirectional_copy(sender.stream, stream),
                     )
                     .await
@@ -552,7 +603,7 @@ async fn handle_receiver(
                                 sender = %sender.addr,
                                 receiver = %addr,
                                 "transfer timed out after {}s of inactivity",
-                                TRANSFER_IDLE_TIMEOUT.as_secs(),
+                                config.idle_timeout.as_secs(),
                             );
                         }
                     }
@@ -634,6 +685,7 @@ mod tests {
         let hello = RelayHello {
             role: RelayRole::Sender,
             code_hash: hash,
+            auth_token: None,
         };
 
         let payload = postcard::to_allocvec(&hello).unwrap();

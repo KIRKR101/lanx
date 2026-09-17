@@ -361,6 +361,7 @@ pub async fn run(
             let hello = RelayHello {
                 role: RelayRole::Sender,
                 code_hash,
+                auth_token: crate::cmd::relay_auth_token(),
             };
             send_relay_hello(&mut stream, &hello).await?;
             let ack = tokio::time::timeout(

@@ -178,6 +178,21 @@ enum Command {
         /// Address to listen on for receiver connections.
         #[arg(long, default_value = "0.0.0.0:53319")]
         receiver_bind: String,
+        /// Maximum number of active paired sessions.
+        #[arg(long, default_value_t = 256)]
+        max_sessions: usize,
+        /// Disconnect idle sessions after this many seconds (0 uses 30 minutes).
+        #[arg(long, default_value_t = 1800)]
+        idle_timeout: u64,
+        /// Shared relay token. Clients read `LANX_RELAY_AUTH_TOKEN`.
+        #[arg(long, env = "LANX_RELAY_AUTH_TOKEN")]
+        auth_token: Option<String>,
+        /// Log periodic operational metrics.
+        #[arg(long)]
+        metrics: bool,
+        /// Relay log level: error, warn, info, debug, or trace.
+        #[arg(long, default_value = "info")]
+        log_level: String,
     },
 }
 
@@ -187,14 +202,18 @@ fn main() -> Result<()> {
     // notes, pump errors) stays hidden unless asked for. `RUST_LOG`
     // still wins when set explicitly.
     let noisy = cli.verbose > 0 || std::env::var("RUST_LOG").is_ok();
+    let relay_log_level = match &cli.command {
+        Command::Relay { log_level, .. } => Some(log_level.as_str()),
+        _ => None,
+    };
     let filter = match std::env::var("RUST_LOG") {
         Ok(v) if !v.is_empty() => EnvFilter::new(v),
         _ => {
-            let level = match cli.verbose {
+            let level = relay_log_level.unwrap_or(match cli.verbose {
                 0 => "error",
                 1 => "info",
                 _ => "debug",
-            };
+            });
             EnvFilter::new(format!("lanx={level},lanx_core={level},lanx_net={level}"))
         }
     };
@@ -297,7 +316,20 @@ fn main() -> Result<()> {
             Command::Relay {
                 sender_bind,
                 receiver_bind,
-            } => cmd::relay::run(sender_bind, receiver_bind).await,
+                max_sessions,
+                idle_timeout,
+                auth_token,
+                metrics,
+                log_level: _,
+            } => cmd::relay::run(
+                sender_bind,
+                receiver_bind,
+                max_sessions,
+                idle_timeout,
+                auth_token,
+                metrics,
+            )
+            .await,
         }
     })
 }

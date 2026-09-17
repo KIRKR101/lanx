@@ -139,6 +139,11 @@ The relay only forwards traffic; transfers remain encrypted between the sender a
 
 By default, relay connections use port `53318` for senders and `53319` for receivers. These can be changed with `--sender-bind` and `--receiver-bind`.
 
+Relay operators can set `--max-sessions`, `--idle-timeout`, `--auth-token`,
+`--metrics`, and `--log-level`. Clients authenticate with the same token through
+`LANX_RELAY_AUTH_TOKEN`; the token is sent only in the relay registration
+frame and is never part of the transfer protocol.
+
 Sender registrations are acknowledged: a second sender for the same pairing
 ID is rejected (`re-register` by re-running `send` for a fresh code) so an
 attacker cannot steal a waiting receiver. Pending senders expire after 5

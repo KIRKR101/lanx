@@ -514,6 +514,7 @@ async fn try_once(
         let hello = RelayHello {
             role: RelayRole::Receiver,
             code_hash: hash,
+            auth_token: crate::cmd::relay_auth_token(),
         };
         send_relay_hello(&mut stream, &hello).await?;
         tracing::info!("sent relay hello to {}", relay_addr);
