@@ -531,17 +531,13 @@ async fn read_streaming_manifest<R: tokio::io::AsyncRead + Unpin>(
 }
 
 fn validate_entry(entry: &FileEntry) -> Result<(), ProtocolError> {
-    // Split on both Unix and Windows separators to prevent path traversal
-    // on any platform. A malicious sender could use backslashes on Windows
-    // to write outside the destination directory.
-    for component in entry.rel_path.split(['/', '\\']) {
-        if component == ".." {
-            return Err(ProtocolError::Unexpected(format!(
-                "rel_path contains '..' component: {}",
-                entry.rel_path,
-            )));
-        }
-    }
+    // Strict relative-path validation at wire receipt, before the manifest
+    // is displayed in the approval prompt or any destination is created.
+    // Anything that is not a plain `/`-separated relative path (absolute
+    // paths, Windows prefixes, backslashes, empty/`.`/`..` components) is
+    // rejected instead of normalized.
+    crate::manifest::validate_rel_path(&entry.rel_path)
+        .map_err(|e| ProtocolError::Unexpected(format!("invalid rel_path: {e}")))?;
     Ok(())
 }
 

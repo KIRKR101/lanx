@@ -1,7 +1,7 @@
 //! Receiver-side destination resolution. Decides whether `--out` should be
 //! treated as a file path or as a directory based on manifest cardinality.
 
-use crate::manifest::{rel_to_path, Manifest};
+use crate::manifest::{rel_to_path, Manifest, ManifestError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -165,13 +165,20 @@ pub enum DestError {
     Io(#[from] std::io::Error),
     #[error("manifest has no files")]
     Empty,
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
 }
 
 /// Resolve the destination path for each manifest file.
 ///
+/// Every `rel_path` is validated as a strict relative path (see
+/// `manifest::validate_rel_path`) before any directory is created, so a
+/// hostile manifest fails without touching the filesystem.
+///
 /// # Errors
 ///
 /// Returns `DestError::Empty` if the manifest has no files,
+/// `DestError::Manifest` if any `rel_path` is not a strict relative path,
 /// `DestError::MultiFileOutIsFile` if multiple files are being received
 /// but `out` points to an existing file, or `DestError::Io` if a parent
 /// directory cannot be created.
@@ -179,6 +186,7 @@ pub fn resolve_destinations(manifest: &Manifest, out: &Path) -> Result<Destinati
     if manifest.files.is_empty() {
         return Err(DestError::Empty);
     }
+    crate::manifest::validate_manifest_paths(manifest)?;
     let is_single = manifest.files.len() == 1;
     let out_is_dir = out.is_dir();
     let out_exists = out.exists();
@@ -523,5 +531,43 @@ mod tests {
         std::fs::write(&d.paths[&1], b"x").unwrap();
         let conflicts = existing_conflicts(&m, &d);
         assert_eq!(conflicts, vec![d.paths[&1].clone()]);
+    }
+
+    #[test]
+    fn hostile_manifest_is_rejected_before_creating_dirs() {
+        for rel in [
+            "../evil.bin",
+            "/abs.bin",
+            "a/../../evil.bin",
+            "C:\\evil.bin",
+            "a\\b.bin",
+            "a//b.bin",
+            "a/./b.bin",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("dest");
+            let m = Manifest {
+                files: vec![FileEntry {
+                    id: 0,
+                    rel_path: rel.to_string(),
+                    size: 0,
+                    chunk_size: 1024,
+                    chunk_hashes: vec![],
+                }],
+                chunk_size: 1024,
+                source_root: PathBuf::new(),
+            };
+            assert!(
+                matches!(
+                    resolve_destinations(&m, &out),
+                    Err(DestError::Manifest(_))
+                ),
+                "{rel:?} must be rejected"
+            );
+            assert!(
+                !out.exists(),
+                "no directories must be created for hostile rel_path {rel:?}"
+            );
+        }
     }
 }

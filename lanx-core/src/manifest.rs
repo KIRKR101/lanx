@@ -31,6 +31,11 @@ const _: () = assert!(
 /// the resulting `PathBuf` uses `\`; on Unix, it uses `/`. Either way,
 /// `Path::join` on the receiver side won't get confused by embedded
 /// separators that came from a different platform.
+///
+/// Callers must validate untrusted wire input with [`validate_rel_path`]
+/// (or [`validate_manifest_paths`]) before calling this: it is a
+/// best-effort conversion that skips empty, `.`, and `..` components
+/// rather than rejecting them.
 #[must_use]
 pub fn rel_to_path(rel: &str) -> PathBuf {
     let mut out = PathBuf::new();
@@ -95,6 +100,79 @@ pub enum ManifestError {
     ChunkSizeTooLarge(u32, u32),
     #[error("manifest has {0} files, maximum is {1}")]
     TooManyFiles(usize, usize),
+    #[error("invalid rel_path: {0}")]
+    InvalidPath(String),
+}
+
+/// Validate a wire-form `rel_path` as a strict relative path.
+///
+/// Accepts only plain `/`-separated relative paths. Rejects absolute
+/// paths, Windows drive/UNC prefixes (e.g. `C:/x`, `C:rel`), backslash
+/// separators, empty paths, empty components (`a//b`, leading or
+/// trailing slashes), `.` and `..` components, and NUL bytes.
+///
+/// Hidden files (`.gitignore`, `a/.hidden/b`) are accepted: a leading
+/// dot is only rejected when it forms the whole component (`.`).
+///
+/// # Errors
+///
+/// Returns `ManifestError::InvalidPath` describing the first problem found.
+pub fn validate_rel_path(rel: &str) -> Result<(), ManifestError> {
+    if rel.is_empty() {
+        return Err(ManifestError::InvalidPath("empty rel_path".to_string()));
+    }
+    if rel.contains('\0') {
+        return Err(ManifestError::InvalidPath(format!(
+            "rel_path contains NUL: {rel:?}"
+        )));
+    }
+    if rel.contains('\\') {
+        return Err(ManifestError::InvalidPath(format!(
+            "rel_path contains backslash: {rel:?}"
+        )));
+    }
+    if rel.starts_with('/') {
+        return Err(ManifestError::InvalidPath(format!(
+            "rel_path is absolute: {rel:?}"
+        )));
+    }
+    let bytes = rel.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(ManifestError::InvalidPath(format!(
+            "rel_path has a Windows drive prefix: {rel:?}"
+        )));
+    }
+    for component in rel.split('/') {
+        if component.is_empty() {
+            return Err(ManifestError::InvalidPath(format!(
+                "rel_path has an empty component: {rel:?}"
+            )));
+        }
+        if component == "." {
+            return Err(ManifestError::InvalidPath(format!(
+                "rel_path contains '.' component: {rel:?}"
+            )));
+        }
+        if component == ".." {
+            return Err(ManifestError::InvalidPath(format!(
+                "rel_path contains '..' component: {rel:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate every entry's `rel_path` in a manifest as a strict relative
+/// path (see [`validate_rel_path`]).
+///
+/// # Errors
+///
+/// Returns the first `ManifestError::InvalidPath` encountered.
+pub fn validate_manifest_paths(manifest: &Manifest) -> Result<(), ManifestError> {
+    for f in &manifest.files {
+        validate_rel_path(&f.rel_path)?;
+    }
+    Ok(())
 }
 
 /// Build a manifest from a list of user-supplied paths (files and/or dirs).
@@ -588,6 +666,88 @@ mod tests {
     fn empty_input_is_error() {
         let r = build(&[], 1024);
         assert!(matches!(r, Err(ManifestError::Empty)));
+    }
+
+    #[test]
+    fn strict_path_validation_rejects_hostile_paths() {
+        for bad in [
+            "",
+            "/",
+            "/abs/path",
+            "a//b",
+            "/leading",
+            "trailing/",
+            "a/./b",
+            ".",
+            "./a",
+            "a/.",
+            "..",
+            "../a",
+            "a/../b",
+            "a/..",
+            "C:/win",
+            "C:rel",
+            "c:\\win",
+            "a\\b",
+            "\\unc\\share",
+            "a\0b",
+            "\\\\?\\C:\\x",
+        ] {
+            assert!(
+                validate_rel_path(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_path_validation_accepts_normal_paths() {
+        for good in [
+            "f.bin",
+            "hello.txt",
+            "a/b.bin",
+            "Piete de Hooch/figures/fig5.jpg",
+            "myrepo/sub/a.bin",
+            ".hidden",
+            ".gitignore",
+            "a/.hidden/b",
+            "a...b/c",
+            "a/b..c",
+            "a/b c/d",
+        ] {
+            assert!(
+                validate_rel_path(good).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_path_validation_reports_first_bad_entry() {
+        let m = Manifest {
+            files: vec![
+                FileEntry {
+                    id: 0,
+                    rel_path: "ok.bin".to_string(),
+                    size: 0,
+                    chunk_size: 1024,
+                    chunk_hashes: vec![],
+                },
+                FileEntry {
+                    id: 1,
+                    rel_path: "../evil.bin".to_string(),
+                    size: 0,
+                    chunk_size: 1024,
+                    chunk_hashes: vec![],
+                },
+            ],
+            chunk_size: 1024,
+            source_root: PathBuf::new(),
+        };
+        assert!(matches!(
+            validate_manifest_paths(&m),
+            Err(ManifestError::InvalidPath(_))
+        ));
     }
 
     #[test]

@@ -16,7 +16,9 @@ pub use destinations::{
     OverwritePolicy,
 };
 pub use hashing::{chunk_hashes, IncrementalHasher};
-pub use manifest::{build, FileEntry, FileId, Manifest};
+pub use manifest::{
+    build, validate_manifest_paths, validate_rel_path, FileEntry, FileId, Manifest, ManifestError,
+};
 pub use progress::{NoopProgress, Progress};
 pub use resume::ResumePlan;
 pub use transfer::{
