@@ -121,18 +121,13 @@ where
     Ok(local)
 }
 
-fn builder_with_psk(
+fn builder_with_psk<'a>(
     pattern: &str,
-    psk: Option<[u8; 32]>,
-) -> Result<snow::Builder<'static>, CryptoError> {
+    psk: Option<&'a [u8; 32]>,
+) -> Result<snow::Builder<'a>, CryptoError> {
     let mut builder = snow::Builder::new(pattern.parse()?);
     if let Some(key) = psk {
-        // `snow` borrows the PSK bytes through the builder, so the 32-byte
-        // copy must outlive the handshake. Leaking is bounded and
-        // acceptable here: one 32 B leak per connection, and a transfer
-        // makes only a handful of connections per process lifetime.
-        let leaked: &'static [u8] = Box::leak(Box::new(key));
-        builder = builder.psk(0, leaked);
+        builder = builder.psk(0, key);
     }
     Ok(builder)
 }
@@ -145,7 +140,7 @@ where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     let pattern = if psk.is_some() { PATTERN_PSK } else { PATTERN };
-    let mut state = builder_with_psk(pattern, psk)?.build_initiator()?;
+    let mut state = builder_with_psk(pattern, psk.as_ref())?.build_initiator()?;
     let mut payload = vec![0u8; 1024];
 
     // -> e
@@ -164,7 +159,7 @@ where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     let pattern = if psk.is_some() { PATTERN_PSK } else { PATTERN };
-    let mut state = builder_with_psk(pattern, psk)?.build_responder()?;
+    let mut state = builder_with_psk(pattern, psk.as_ref())?.build_responder()?;
     let mut payload = vec![0u8; 1024];
 
     // <- e

@@ -6,7 +6,7 @@ use super::{
     DEFAULT_MAX_RETRIES, PROTOCOL_VERSION,
 };
 use crate::destinations::{
-    existing_conflicts, resolve_destinations, resolve_destinations_with_policy, OverwritePolicy,
+    resolve_destinations, resolve_destinations_with_policy, OverwritePolicy,
 };
 use crate::hashing::IncrementalHasher;
 use crate::manifest::{FileEntry, Manifest, MAX_CHUNK_SIZE, MAX_MANIFEST_FILES};
@@ -264,6 +264,26 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
         return Ok(ReceiverReport::default());
     }
 
+    // Check fail-policy conflicts before resolving destinations, since
+    // resolution creates parent directories.
+    if cfg.overwrite_policy == OverwritePolicy::Fail {
+        let preview = crate::destinations::preview_conflicts(&sender_manifest, out_dir)
+            .map_err(|e| ProtocolError::Unexpected(format!("destinations: {e}")))?;
+        if preview.existing > 0 {
+            let dests = crate::destinations::destination_paths(&sender_manifest, out_dir);
+            let first = dests
+                .values()
+                .find(|path| std::fs::symlink_metadata(path).is_ok())
+                .map_or_else(
+                    || out_dir.display().to_string(),
+                    |path| path.display().to_string(),
+                );
+            return Err(ProtocolError::Unexpected(format!(
+                "destination exists: {first} (--on-conflict fail)"
+            )));
+        }
+    }
+
     // Resolve destinations and resume plan now that we know the manifest.
     let dests = if cfg.overwrite_policy == OverwritePolicy::RenameExisting {
         resolve_destinations_with_policy(&sender_manifest, out_dir, cfg.overwrite_policy)
@@ -271,15 +291,6 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
         resolve_destinations(&sender_manifest, out_dir)
     }
     .map_err(|e| ProtocolError::Unexpected(format!("destinations: {e}")))?;
-    if cfg.overwrite_policy == OverwritePolicy::Fail {
-        let conflicts = existing_conflicts(&sender_manifest, &dests);
-        if let Some(first) = conflicts.first() {
-            return Err(ProtocolError::Unexpected(format!(
-                "destination exists: {} (--on-conflict fail)",
-                first.display()
-            )));
-        }
-    }
     let mut plan = crate::resume::plan(&sender_manifest, &dests)
         .map_err(|e| ProtocolError::Unexpected(format!("resume plan: {e}")))?;
     match cfg.overwrite_policy {

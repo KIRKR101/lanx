@@ -61,10 +61,7 @@ pub struct ConflictPreview {
 /// paths, `DestError::MultiFileOutIsFile` when multiple files are being
 /// received but `out` points to an existing file, or
 /// `DestError::PathTooLong` for over-long destinations.
-pub fn preview_conflicts(
-    manifest: &Manifest,
-    out: &Path,
-) -> Result<ConflictPreview, DestError> {
+pub fn preview_conflicts(manifest: &Manifest, out: &Path) -> Result<ConflictPreview, DestError> {
     crate::manifest::validate_manifest_paths(manifest)?;
     if manifest.files.len() > 1 && out.exists() && !out.is_dir() {
         return Err(DestError::MultiFileOutIsFile);
@@ -120,7 +117,10 @@ pub fn preview_conflicts(
 /// validate before previewing; the receiver does this at wire receipt,
 /// before approval.
 #[must_use]
-pub fn destination_paths(manifest: &Manifest, out: &Path) -> HashMap<crate::manifest::FileId, PathBuf> {
+pub fn destination_paths(
+    manifest: &Manifest,
+    out: &Path,
+) -> HashMap<crate::manifest::FileId, PathBuf> {
     let mut map = HashMap::new();
     if manifest.files.is_empty() {
         return map;
@@ -172,10 +172,7 @@ pub fn next_available_path(path: &Path) -> PathBuf {
     if path.file_name().is_some_and(|n| n.to_str().is_none()) {
         let mut n = 1u32;
         loop {
-            let mut name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_os_string();
+            let mut name = path.file_name().unwrap_or_default().to_os_string();
             name.push(format!(".{n}"));
             let candidate = match parent {
                 Some(p) if !p.as_os_str().is_empty() => p.join(name.as_os_str()),
@@ -576,8 +573,8 @@ mod tests {
         let m = mfiles(2);
         let d = resolve_destinations(&m, &out).unwrap();
         std::fs::write(&d.paths[&0], b"existing").unwrap();
-        let renamed = resolve_destinations_with_policy(&m, &out, OverwritePolicy::RenameExisting)
-            .unwrap();
+        let renamed =
+            resolve_destinations_with_policy(&m, &out, OverwritePolicy::RenameExisting).unwrap();
         assert_eq!(
             renamed.paths[&0].file_name().unwrap().to_str().unwrap(),
             "f0.1.bin"
@@ -746,10 +743,7 @@ mod tests {
                 source_root: PathBuf::new(),
             };
             assert!(
-                matches!(
-                    resolve_destinations(&m, &out),
-                    Err(DestError::Manifest(_))
-                ),
+                matches!(resolve_destinations(&m, &out), Err(DestError::Manifest(_))),
                 "{rel:?} must be rejected"
             );
             assert!(

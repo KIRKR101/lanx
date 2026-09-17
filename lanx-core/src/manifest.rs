@@ -292,11 +292,7 @@ pub fn validate_manifest_paths(manifest: &Manifest) -> Result<(), ManifestError>
 ///
 /// Returns `ManifestError::InvalidPath` naming both colliding entries.
 pub fn validate_manifest_no_collisions(manifest: &Manifest) -> Result<(), ManifestError> {
-    let rels: Vec<&str> = manifest
-        .files
-        .iter()
-        .map(|f| f.rel_path.as_str())
-        .collect();
+    let rels: Vec<&str> = manifest.files.iter().map(|f| f.rel_path.as_str()).collect();
     check_no_collisions(&rels, |_| String::new())
 }
 
@@ -344,7 +340,11 @@ fn check_no_collisions<R: AsRef<str>>(
                 origin(i)
             )));
         }
-        let key = rel.to_lowercase();
+        // APFS/HFS+ commonly compares filenames in a decomposed Unicode form.
+        // Normalize before folding so NFC and NFD spellings cannot overwrite
+        // each other on macOS.
+        use unicode_normalization::UnicodeNormalization;
+        let key: String = rel.nfd().collect::<String>().to_lowercase();
         if let Some(&first_idx) = folded_first.get(&key) {
             let first = rels[first_idx].as_ref();
             if first != rel {
@@ -431,10 +431,15 @@ pub fn build_with_filters_cached(
             }
         }
     }
-    let manifest = build_with_filters(inputs, chunk_size, filters)?;
+    let unfiltered = build(inputs, chunk_size)?;
+    let mut manifest = unfiltered.clone();
+    apply_filters(&mut manifest, filters);
+    if manifest.files.is_empty() {
+        return Err(ManifestError::Empty);
+    }
     let cache = ManifestCache {
         fingerprint,
-        manifest: manifest.clone(),
+        manifest: unfiltered,
         source_root: manifest.source_root.clone(),
     };
     if let Ok(encoded) = serde_json::to_vec_pretty(&cache) {
@@ -547,7 +552,10 @@ fn matches_filter(pattern: &str, path: &str) -> bool {
         false
     }
     matches(pattern.as_bytes(), path.as_bytes())
-        || (!pattern.contains('/') && path.split('/').any(|part| matches(pattern.as_bytes(), part.as_bytes())))
+        || (!pattern.contains('/')
+            && path
+                .split('/')
+                .any(|part| matches(pattern.as_bytes(), part.as_bytes())))
 }
 
 fn build_inner(
@@ -1253,10 +1261,7 @@ mod tests {
             "NUL .bin",
             "a/COM1 .log",
         ] {
-            assert!(
-                validate_rel_path(bad).is_err(),
-                "{bad:?} must be rejected"
-            );
+            assert!(validate_rel_path(bad).is_err(), "{bad:?} must be rejected");
         }
     }
 
@@ -1275,10 +1280,7 @@ mod tests {
             "a/b..c",
             "a/b c/d",
         ] {
-            assert!(
-                validate_rel_path(good).is_ok(),
-                "{good:?} must be accepted"
-            );
+            assert!(validate_rel_path(good).is_ok(), "{good:?} must be accepted");
         }
     }
 
@@ -1449,6 +1451,31 @@ mod tests {
         };
         assert!(matches!(
             validate_manifest_paths(&case),
+            Err(ManifestError::InvalidPath(_))
+        ));
+
+        let nfc_nfd = Manifest {
+            files: vec![
+                FileEntry {
+                    id: 0,
+                    rel_path: "caf\u{00e9}.txt".to_string(),
+                    size: 0,
+                    chunk_size: 1024,
+                    chunk_hashes: vec![],
+                },
+                FileEntry {
+                    id: 1,
+                    rel_path: "cafe\u{0301}.txt".to_string(),
+                    size: 0,
+                    chunk_size: 1024,
+                    chunk_hashes: vec![],
+                },
+            ],
+            chunk_size: 1024,
+            source_root: PathBuf::new(),
+        };
+        assert!(matches!(
+            validate_manifest_paths(&nfc_nfd),
             Err(ManifestError::InvalidPath(_))
         ));
     }

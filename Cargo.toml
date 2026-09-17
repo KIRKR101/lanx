@@ -30,6 +30,7 @@ tempfile = "3.10"
 if-addrs = "0.14"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+unicode-normalization = "0.1"
 lanx-core = { path = "lanx-core" }
 lanx-net = { path = "lanx-net" }
 
