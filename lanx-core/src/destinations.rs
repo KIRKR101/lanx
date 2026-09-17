@@ -12,6 +12,148 @@ pub struct Destinations {
     pub paths: HashMap<crate::manifest::FileId, PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverwritePolicy {
+    /// Default: resume partial files, skip complete ones.
+    #[default]
+    Resume,
+    /// Re-download every file from byte 0, replacing existing files.
+    Overwrite,
+    /// Never touch an existing destination path; skip those files.
+    SkipExisting,
+    /// Keep existing files; write incoming files to a numbered sibling
+    /// (`photo.jpg` -> `photo.1.jpg`) instead.
+    RenameExisting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictPreview {
+    /// Destination paths that already exist (any file type).
+    pub existing: usize,
+    /// Existing paths whose size matches the manifest (likely complete;
+    /// content is verified by hash during the transfer).
+    pub complete_by_size: usize,
+    /// Existing paths whose size differs (partial or changed files that
+    /// would be resumed or replaced).
+    pub resumable_by_size: usize,
+    /// Destination paths that do not exist yet.
+    pub new: usize,
+}
+
+/// Cheap stat-only preview of destination conflicts, without hashing.
+///
+/// Used by the receiver approval prompt to show existing/resumable/new
+/// counts *before* confirmation. Size equality is only a heuristic for
+/// "complete"; the real resume plan verifies content by hash after
+/// approval.
+#[must_use]
+pub fn preview_conflicts(manifest: &Manifest, out: &Path) -> ConflictPreview {
+    let paths = destination_paths(manifest, out);
+    let mut existing = 0;
+    let mut complete_by_size = 0;
+    let mut resumable_by_size = 0;
+    let mut new = 0;
+    for f in &manifest.files {
+        let Some(dest) = paths.get(&f.id) else {
+            continue;
+        };
+        match std::fs::symlink_metadata(dest) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => new += 1,
+            Err(_) => {
+                existing += 1;
+                resumable_by_size += 1;
+            }
+            Ok(meta) => {
+                existing += 1;
+                if meta.is_file() && meta.len() == f.size {
+                    complete_by_size += 1;
+                } else {
+                    resumable_by_size += 1;
+                }
+            }
+        }
+    }
+    ConflictPreview {
+        existing,
+        complete_by_size,
+        resumable_by_size,
+        new,
+    }
+}
+
+/// Compute destination paths without creating any directories.
+///
+/// Pure: safe to call from the approval prompt before the user confirms.
+#[must_use]
+pub fn destination_paths(manifest: &Manifest, out: &Path) -> HashMap<crate::manifest::FileId, PathBuf> {
+    let mut map = HashMap::new();
+    if manifest.files.is_empty() {
+        return map;
+    }
+    let is_single = manifest.files.len() == 1;
+    let out_is_dir = out.is_dir();
+    let out_exists = out.exists();
+    match (is_single, out_is_dir, out_exists) {
+        (false, _, true) if !out_is_dir => return map,
+        (false, _, _) => {
+            for f in &manifest.files {
+                map.insert(f.id, out.join(rel_to_path(&f.rel_path)));
+            }
+        }
+        (true, true, _) => {
+            let entry = &manifest.files[0];
+            map.insert(entry.id, out.join(rel_to_path(&entry.rel_path)));
+        }
+        (true, false, false) => {
+            let entry = &manifest.files[0];
+            let dest = if path_ends_with_separator(out) {
+                out.join(rel_to_path(&entry.rel_path))
+            } else {
+                out.to_path_buf()
+            };
+            map.insert(entry.id, dest);
+        }
+        (true, false, true) => {
+            let entry = &manifest.files[0];
+            map.insert(entry.id, out.to_path_buf());
+        }
+    }
+    map
+}
+
+/// Pick the first unused sibling for `path` by incrementing a numeric
+/// suffix before the extension: `photo.jpg` -> `photo.1.jpg` ->
+/// `photo.2.jpg`. Extensionless `file` becomes `file.1`.
+#[must_use]
+pub fn next_available_path(path: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(path).is_err() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let (stem, ext) = match file_name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, Some(e)),
+        _ => (file_name, None),
+    };
+    let mut n = 1u32;
+    loop {
+        let candidate_name = match ext {
+            Some(e) => format!("{stem}.{n}.{e}"),
+            None => format!("{stem}.{n}"),
+        };
+        let candidate = match parent {
+            Some(p) if !p.as_os_str().is_empty() => p.join(candidate_name),
+            _ => PathBuf::from(candidate_name),
+        };
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
 #[derive(Debug, Error)]
 pub enum DestError {
     #[error("--out points to an existing file but multiple files are being received")]
@@ -91,6 +233,47 @@ pub fn resolve_destinations(manifest: &Manifest, out: &Path) -> Result<Destinati
             Ok(Destinations { paths: map })
         }
     }
+}
+
+/// Resolve destinations, applying an [`OverwritePolicy`].
+///
+/// Only [`OverwritePolicy::RenameExisting`] changes the paths: every
+/// destination that already exists is remapped to the first unused
+/// numbered sibling. The other policies keep the default paths; they
+/// are enforced later against the resume plan (overwrite from byte 0,
+/// or skip existing files).
+///
+/// Parent directories are created for the final paths, like
+/// [`resolve_destinations`].
+///
+/// # Errors
+///
+/// Same errors as [`resolve_destinations`].
+pub fn resolve_destinations_with_policy(
+    manifest: &Manifest,
+    out: &Path,
+    policy: OverwritePolicy,
+) -> Result<Destinations, DestError> {
+    let mut dests = resolve_destinations(manifest, out)?;
+    if policy != OverwritePolicy::RenameExisting {
+        return Ok(dests);
+    }
+    // Deterministic order so numbered siblings are stable across runs.
+    let mut ids: Vec<crate::manifest::FileId> = dests.paths.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let current = dests.paths[&id].clone();
+        if std::fs::symlink_metadata(&current).is_ok() {
+            let renamed = next_available_path(&current);
+            if let Some(parent) = renamed.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            dests.paths.insert(id, renamed);
+        }
+    }
+    Ok(dests)
 }
 
 fn path_ends_with_separator(p: &Path) -> bool {
@@ -215,5 +398,93 @@ mod tests {
                 && p1_parts.last().map(String::as_str) == Some("fig5.jpg"),
             "expected path under <out>/Piete de Hooch/figures/fig5.jpg, got {p1_parts:?}"
         );
+    }
+
+    #[test]
+    fn rename_preserves_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("photo.jpg");
+        std::fs::write(&existing, b"x").unwrap();
+        assert_eq!(
+            next_available_path(&existing),
+            dir.path().join("photo.1.jpg")
+        );
+    }
+
+    #[test]
+    fn rename_increments_until_unused() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("photo.jpg");
+        std::fs::write(&existing, b"x").unwrap();
+        std::fs::write(dir.path().join("photo.1.jpg"), b"x").unwrap();
+        assert_eq!(
+            next_available_path(&existing),
+            dir.path().join("photo.2.jpg")
+        );
+    }
+
+    #[test]
+    fn rename_handles_extensionless_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("file");
+        std::fs::write(&existing, b"x").unwrap();
+        assert_eq!(next_available_path(&existing), dir.path().join("file.1"));
+    }
+
+    #[test]
+    fn rename_policy_remaps_only_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dest");
+        let m = mfiles(2);
+        let d = resolve_destinations(&m, &out).unwrap();
+        std::fs::write(&d.paths[&0], b"existing").unwrap();
+        let renamed = resolve_destinations_with_policy(&m, &out, OverwritePolicy::RenameExisting)
+            .unwrap();
+        assert_eq!(
+            renamed.paths[&0].file_name().unwrap().to_str().unwrap(),
+            "f0.1.bin"
+        );
+        assert_eq!(renamed.paths[&1], d.paths[&1]);
+    }
+
+    #[test]
+    fn preview_counts_existing_resumable_and_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dest");
+        let m = Manifest {
+            files: vec![
+                FileEntry {
+                    id: 0,
+                    rel_path: "same.bin".to_string(),
+                    size: 3,
+                    chunk_size: 1024,
+                    chunk_hashes: vec![],
+                },
+                FileEntry {
+                    id: 1,
+                    rel_path: "partial.bin".to_string(),
+                    size: 10,
+                    chunk_size: 1024,
+                    chunk_hashes: vec![],
+                },
+                FileEntry {
+                    id: 2,
+                    rel_path: "missing.bin".to_string(),
+                    size: 5,
+                    chunk_size: 1024,
+                    chunk_hashes: vec![],
+                },
+            ],
+            chunk_size: 1024,
+            source_root: PathBuf::new(),
+        };
+        let d = resolve_destinations(&m, &out).unwrap();
+        std::fs::write(&d.paths[&0], b"abc").unwrap();
+        std::fs::write(&d.paths[&1], b"ab").unwrap();
+        let preview = preview_conflicts(&m, &out);
+        assert_eq!(preview.existing, 2);
+        assert_eq!(preview.complete_by_size, 1);
+        assert_eq!(preview.resumable_by_size, 1);
+        assert_eq!(preview.new, 1);
     }
 }

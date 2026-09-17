@@ -1,6 +1,7 @@
 //! `lanx recv`: connect to sender, receive files.
 
 use anyhow::{bail, Context, Result};
+use lanx_core::destinations::{preview_conflicts, OverwritePolicy};
 use lanx_core::manifest::Manifest;
 use lanx_core::progress::Progress;
 use lanx_core::progress::TransferSummary;
@@ -13,7 +14,7 @@ use lanx_net::pairing::{parse_target, resolve_target, Target};
 use lanx_net::relay::{send_relay_hello, RelayHello, RelayRole};
 use lanx_net::tcp::DEFAULT_SEND_PORT;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -40,6 +41,7 @@ struct TryOnceConfig {
     approver: Arc<dyn ManifestApprover>,
     progress: Arc<dyn Progress>,
     parallel: u16,
+    overwrite_policy: OverwritePolicy,
     agreed_parallel_tx: Option<tokio::sync::mpsc::UnboundedSender<u16>>,
 }
 
@@ -51,15 +53,52 @@ struct TryOnceConfig {
 ///
 /// Returns an error if the target cannot be resolved, the connection
 /// fails, or the transfer encounters a protocol error.
-pub async fn run(
-    target: String,
-    out: PathBuf,
-    accept: bool,
-    retry_forever: bool,
-    discovery_timeout: Duration,
-    parallel: u16,
-    relay: Option<String>,
-) -> Result<()> {
+/// Options for one `lanx recv` invocation.
+pub struct RecvOptions {
+    pub target: String,
+    pub out: PathBuf,
+    pub accept: bool,
+    pub overwrite: bool,
+    pub skip_existing: bool,
+    pub rename_existing: bool,
+    pub dry_run: bool,
+    pub retry_forever: bool,
+    pub discovery_timeout: Duration,
+    pub parallel: u16,
+    pub relay: Option<String>,
+}
+
+pub async fn run(opts: RecvOptions) -> Result<()> {
+    let RecvOptions {
+        target,
+        out,
+        accept,
+        overwrite,
+        skip_existing,
+        rename_existing,
+        dry_run,
+        retry_forever,
+        discovery_timeout,
+        parallel,
+        relay,
+    } = opts;
+    let overwrite_policy = if overwrite {
+        OverwritePolicy::Overwrite
+    } else if skip_existing {
+        OverwritePolicy::SkipExisting
+    } else if rename_existing {
+        OverwritePolicy::RenameExisting
+    } else {
+        OverwritePolicy::Resume
+    };
+    if [overwrite, skip_existing, rename_existing]
+        .iter()
+        .filter(|&&b| b)
+        .count()
+        > 1
+    {
+        bail!("--overwrite, --skip-existing and --rename-existing are mutually exclusive");
+    }
     if accept {
         eprintln!(
             "  {} {}",
@@ -67,6 +106,13 @@ pub async fn run(
             ui::yellow("auto-accept: accepting without prompting"),
         );
         eprintln!("    {}", ui::dim("only use this when you trust the sender"),);
+    }
+    if dry_run {
+        eprintln!(
+            "  {} {}",
+            ui::yellow("!"),
+            ui::yellow("dry run: showing what would be received without writing files"),
+        );
     }
 
     let parsed = parse_target(&target).context("parse target")?;
@@ -124,11 +170,17 @@ pub async fn run(
 
     let progress: Arc<dyn Progress> = IndicatifProgress::new("Receiving");
 
-    let base_approver: Arc<dyn ManifestApprover> = if accept {
+    let base_approver: Arc<dyn ManifestApprover> = if dry_run {
+        Arc::new(DryRunApprover {
+            out_dir: out.clone(),
+            overwrite_policy,
+        })
+    } else if accept {
         Arc::new(AutoAccept)
     } else {
         Arc::new(StdinApprover {
             out_dir: out.clone(),
+            overwrite_policy,
         })
     };
     let approver: Arc<dyn ManifestApprover> = if parallel > 1 {
@@ -150,6 +202,7 @@ pub async fn run(
         approver,
         progress: progress.clone(),
         parallel,
+        overwrite_policy,
         agreed_parallel_tx: Some(agreed_tx),
     };
     loop {
@@ -225,6 +278,14 @@ pub async fn run(
             Ok(report) => {
                 if report.rejected {
                     eprintln!();
+                    if dry_run {
+                        eprintln!(
+                            "  {} {}",
+                            ui::dim("dry run complete:"),
+                            ui::dim("no files were written"),
+                        );
+                        return Ok(());
+                    }
                     eprintln!(
                         "  {} {}",
                         ui::red(ui::fail_sym()),
@@ -338,6 +399,7 @@ async fn try_once(
         max_retries: DEFAULT_MAX_RETRIES,
         connection_index,
         parallel: cfg.parallel,
+        overwrite_policy: cfg.overwrite_policy,
         agreed_parallel_tx: cfg.agreed_parallel_tx.clone(),
     };
 
@@ -382,6 +444,45 @@ async fn aggregate_reports(
 /// from stdin. Used unless `--accept` is passed.
 struct StdinApprover {
     out_dir: PathBuf,
+    overwrite_policy: OverwritePolicy,
+}
+
+/// Prints the transfer contents without accepting it. Used for `--dry-run`.
+struct DryRunApprover {
+    out_dir: PathBuf,
+    overwrite_policy: OverwritePolicy,
+}
+
+/// Shared conflict summary printed before confirmation: how many
+/// destination files already exist, how many look resumable vs complete
+/// by size, and how many are new. Size equality is a heuristic; content
+/// is verified by hash during the real transfer.
+fn print_conflict_preview(manifest: &Manifest, out_dir: &Path, overwrite_policy: OverwritePolicy) {
+    let preview = preview_conflicts(manifest, out_dir);
+    if preview.existing == 0 && preview.new == 0 {
+        return;
+    }
+    eprintln!(
+        "    {}",
+        ui::dim(&format!(
+            "{} existing ({} complete, {} resumable), {} new",
+            preview.existing,
+            preview.complete_by_size,
+            preview.resumable_by_size,
+            preview.new,
+        )),
+    );
+    let note = match overwrite_policy {
+        OverwritePolicy::Resume => None,
+        OverwritePolicy::Overwrite => Some("overwrite: existing files will be replaced"),
+        OverwritePolicy::SkipExisting => Some("skip-existing: existing files will be left untouched"),
+        OverwritePolicy::RenameExisting => {
+            Some("rename-existing: incoming files will be written to numbered siblings")
+        }
+    };
+    if let Some(note) = note {
+        eprintln!("    {}", ui::dim(note));
+    }
 }
 
 impl ManifestApprover for StdinApprover {
@@ -424,6 +525,7 @@ impl ManifestApprover for StdinApprover {
         if !out_is_default {
             eprintln!("    {}  {}", ui::dim("Destination"), self.out_dir.display(),);
         }
+        print_conflict_preview(manifest, &self.out_dir, self.overwrite_policy);
 
         eprintln!();
         eprint!("  {} Accept? [y/N]: ", ui::cyan("?"));
@@ -444,6 +546,40 @@ impl ManifestApprover for StdinApprover {
             Err(e) => Approval::Reject {
                 reason: format!("failed to read stdin: {e}"),
             },
+        }
+    }
+}
+
+impl ManifestApprover for DryRunApprover {
+    fn approve(&self, manifest: &Manifest, summary: &TransferSummary) -> Approval {
+        eprintln!("  {} Incoming transfer (dry run)", ui::cyan(ui::down_sym()));
+        eprintln!(
+            "    {}",
+            ui::bold(&ui::count_line(summary.file_count, summary.total_bytes)),
+        );
+        eprintln!();
+        let rel_paths: Vec<String> = manifest.files.iter().map(|f| f.rel_path.clone()).collect();
+        let display = ui::display_names(&rel_paths);
+        for (entry, name) in manifest
+            .files
+            .iter()
+            .zip(display.iter())
+            .take(MANIFEST_PREVIEW_LIMIT)
+        {
+            eprintln!("{}", ui::contents_row(name, entry.size));
+        }
+        let remaining = summary.file_count.saturating_sub(MANIFEST_PREVIEW_LIMIT);
+        if remaining > 0 {
+            eprintln!("  {}", ui::dim(&format!("... and {remaining} more")));
+        }
+        let out_is_default = self.out_dir.as_os_str() == ".";
+        if !out_is_default {
+            eprintln!("    {}  {}", ui::dim("Destination"), self.out_dir.display(),);
+        }
+        print_conflict_preview(manifest, &self.out_dir, self.overwrite_policy);
+        eprintln!();
+        Approval::Reject {
+            reason: "dry run: transfer not accepted".to_string(),
         }
     }
 }

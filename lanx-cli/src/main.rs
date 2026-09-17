@@ -62,6 +62,19 @@ enum Command {
         /// Accept the incoming transfer automatically without prompting.
         #[arg(long)]
         accept: bool,
+        /// Overwrite existing destination files instead of resuming them.
+        #[arg(long, conflicts_with_all = ["skip_existing", "rename_existing"])]
+        overwrite: bool,
+        /// Skip files whose destination already exists, leaving them untouched.
+        #[arg(long, conflicts_with_all = ["overwrite", "rename_existing"])]
+        skip_existing: bool,
+        /// Keep existing files; write incoming files to numbered siblings
+        /// (`photo.jpg` becomes `photo.1.jpg`).
+        #[arg(long, conflicts_with_all = ["overwrite", "skip_existing"])]
+        rename_existing: bool,
+        /// Show what would be received without writing any files.
+        #[arg(long)]
+        dry_run: bool,
         /// Retry forever on connection drop.
         #[arg(long)]
         retry_forever: bool,
@@ -144,20 +157,28 @@ fn main() -> Result<()> {
                 target,
                 out,
                 accept,
+                overwrite,
+                skip_existing,
+                rename_existing,
+                dry_run,
                 retry_forever,
                 discovery_timeout,
                 parallel,
                 relay,
             } => {
-                cmd::recv::run(
+                cmd::recv::run(cmd::recv::RecvOptions {
                     target,
                     out,
                     accept,
+                    overwrite,
+                    skip_existing,
+                    rename_existing,
+                    dry_run,
                     retry_forever,
-                    Duration::from_secs(discovery_timeout),
+                    discovery_timeout: Duration::from_secs(discovery_timeout),
                     parallel,
                     relay,
-                )
+                })
                 .await
             }
             Command::Relay {

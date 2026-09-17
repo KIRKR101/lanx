@@ -10,7 +10,10 @@ pub mod resume;
 pub mod sidecar;
 pub mod transfer;
 
-pub use destinations::{resolve_destinations, Destinations};
+pub use destinations::{
+    destination_paths, next_available_path, preview_conflicts, resolve_destinations,
+    resolve_destinations_with_policy, ConflictPreview, Destinations, OverwritePolicy,
+};
 pub use hashing::{chunk_hashes, IncrementalHasher};
 pub use manifest::{build, FileEntry, FileId, Manifest};
 pub use progress::{NoopProgress, Progress};

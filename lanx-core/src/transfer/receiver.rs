@@ -5,7 +5,7 @@ use super::{
     read_frame, supports_protocol_version, write_frame, ControlMsg, HelloInfo, ProtocolError,
     DEFAULT_MAX_RETRIES, PROTOCOL_VERSION,
 };
-use crate::destinations::resolve_destinations;
+use crate::destinations::{resolve_destinations, resolve_destinations_with_policy, OverwritePolicy};
 use crate::hashing::IncrementalHasher;
 use crate::manifest::{FileEntry, Manifest, MAX_CHUNK_SIZE, MAX_MANIFEST_FILES};
 use crate::progress::{Progress, TransferSummary};
@@ -95,6 +95,9 @@ pub struct ReceiverConfig {
     /// Number of parallel TCP connections requested by this receiver.
     /// The sender may cap this value.
     pub parallel: u16,
+    /// What to do when a destination file already exists. `Resume`
+    /// (default) resumes partial files and skips complete ones.
+    pub overwrite_policy: OverwritePolicy,
     /// Optional channel to communicate the agreed parallelism count
     /// back to the coordinator.
     pub agreed_parallel_tx: Option<tokio::sync::mpsc::UnboundedSender<u16>>,
@@ -106,6 +109,7 @@ impl Default for ReceiverConfig {
             max_retries: DEFAULT_MAX_RETRIES,
             connection_index: 0,
             parallel: 1,
+            overwrite_policy: OverwritePolicy::Resume,
             agreed_parallel_tx: None,
         }
     }
@@ -259,10 +263,48 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
     }
 
     // Resolve destinations and resume plan now that we know the manifest.
-    let dests = resolve_destinations(&sender_manifest, out_dir)
-        .map_err(|e| ProtocolError::Unexpected(format!("destinations: {e}")))?;
+    let dests = if cfg.overwrite_policy == OverwritePolicy::RenameExisting {
+        resolve_destinations_with_policy(&sender_manifest, out_dir, cfg.overwrite_policy)
+    } else {
+        resolve_destinations(&sender_manifest, out_dir)
+    }
+    .map_err(|e| ProtocolError::Unexpected(format!("destinations: {e}")))?;
     let mut plan = crate::resume::plan(&sender_manifest, &dests)
         .map_err(|e| ProtocolError::Unexpected(format!("resume plan: {e}")))?;
+    match cfg.overwrite_policy {
+        OverwritePolicy::Resume | OverwritePolicy::RenameExisting => {}
+        OverwritePolicy::Overwrite => {
+            // Forget resume state: every file is re-downloaded from byte 0
+            // (opening with offset 0 truncates the destination).
+            plan.complete.clear();
+            plan.accepted = sender_manifest.files.iter().map(|f| f.id).collect();
+            plan.offsets = plan.accepted.iter().map(|&id| (id, 0)).collect();
+            plan.hashers = plan
+                .accepted
+                .iter()
+                .map(|&id| (id, IncrementalHasher::new()))
+                .collect();
+        }
+        OverwritePolicy::SkipExisting => {
+            // Any destination path that already exists is left untouched.
+            let mut skipped = Vec::new();
+            for id in std::mem::take(&mut plan.accepted) {
+                let exists = dests
+                    .paths
+                    .get(&id)
+                    .is_some_and(|p| std::fs::symlink_metadata(p).is_ok());
+                if exists {
+                    plan.offsets.remove(&id);
+                    plan.hashers.remove(&id);
+                    plan.complete.insert(id);
+                    skipped.push(id);
+                } else {
+                    plan.accepted.push(id);
+                }
+            }
+            let _ = skipped;
+        }
+    }
 
     // Send ManifestAck for only the files assigned to this connection.
     let accepted: Vec<_> = plan
