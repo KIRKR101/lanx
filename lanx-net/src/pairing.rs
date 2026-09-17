@@ -39,10 +39,12 @@ pub fn parse_target(s: &str) -> Result<Target, TargetError> {
 
 fn looks_like_code(s: &str) -> bool {
     // Trimmed by caller; also trim here defensively for direct callers.
-    // Format: digit-word-word (3 dash-separated segments, last two are words).
+    // Format: digit-word-...-word (a single ASCII digit plus 2-5 words).
+    // Accepts legacy 2-word codes and new longer codes from
+    // `--code-words`. Wordlist membership is NOT enforced (see below).
     let s = s.trim();
     let parts: Vec<_> = s.split('-').collect();
-    if parts.len() != 3 {
+    if parts.len() < 3 || parts.len() > 6 {
         return false;
     }
     // The prefix must be one ASCII digit.
@@ -54,8 +56,9 @@ fn looks_like_code(s: &str) -> bool {
     // wordlist, but a user may mistype or use a future expanded list.
     // If the code doesn't match any sender, discovery will time out
     // with a clear message.
-    parts[1].chars().all(|c| c.is_ascii_alphabetic())
-        && parts[2].chars().all(|c| c.is_ascii_alphabetic())
+    parts[1..]
+        .iter()
+        .all(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic()))
 }
 
 /// Resolve a `Target` into a concrete `SocketAddr`.
@@ -87,6 +90,14 @@ mod tests {
     #[test]
     fn valid_code_accepted() {
         assert!(matches!(parse_target("7-cobalt-fox"), Ok(Target::Code(_))));
+        assert!(matches!(
+            parse_target("7-cobalt-fox-tundra"),
+            Ok(Target::Code(_))
+        ));
+        assert!(matches!(
+            parse_target("7-cobalt-fox-tundra-river-lake"),
+            Ok(Target::Code(_))
+        ));
     }
 
     #[test]

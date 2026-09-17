@@ -1,9 +1,20 @@
-//! Encrypted transport using the Noise protocol (`Noise_NN_25519_ChaChaPoly_BLAKE2s`).
+//! Encrypted transport using the Noise protocol.
+//!
+//! Two patterns are supported:
+//!
+//! * `Noise_NN_25519_ChaChaPoly_BLAKE2s` — unauthenticated, used only for
+//!   direct `ip:port` transfers where there is no pairing code to bind.
+//! * `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` — the pairing code (plus an
+//!   optional `--psk` passphrase) is derived into a 32-byte PSK
+//!   (`lanx-net/src/discovery.rs:code_to_psk`) and mixed into the
+//!   handshake. A peer that does not know the code cannot complete the
+//!   handshake: active MITM and relay-guessing attacks fail here instead
+//!   of later. The pairing ID broadcast/relayed in the clear is only a
+//!   public lookup key.
 //!
 //! This module wraps a raw TCP (or any `AsyncRead + AsyncWrite`) stream in a
 //! confidential, forward-secret channel before any `lanx` control messages are
-//! exchanged. Authentication is limited to the peer being present on the same
-//! channel at handshake time. The pairing code is not used as a key.
+//! exchanged.
 //!
 //! The design uses a pump task: the caller gets a `tokio::io::DuplexStream`
 //! that implements `AsyncRead + AsyncWrite`, while a background task reads
@@ -17,8 +28,11 @@ use snow::{HandshakeState, TransportState};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Noise pattern used for the encrypted transport.
+/// Noise pattern used for unauthenticated direct transfers.
 const PATTERN: &str = "Noise_NN_25519_ChaChaPoly_BLAKE2s";
+/// Noise pattern used when a pairing-code PSK is available. The PSK is
+/// mixed at token 0, so a wrong guess fails the handshake immediately.
+const PATTERN_PSK: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 
 /// Maximum plaintext bytes in a single Noise transport message. Each message
 /// carries a 16-byte Poly1305 tag, so the largest safe payload is 65535 - 16.
@@ -46,11 +60,27 @@ pub enum CryptoError {
 /// Perform the Noise handshake as the initiator (typically the receiver,
 /// since it dials the sender), then spawn a pump task and return a duplex
 /// stream that encrypts/decrypts transparently.
+///
+/// This is the unauthenticated variant, used only for direct `ip:port`
+/// transfers with no pairing code. Code-based transfers must use
+/// [`wrap_initiator_with_psk`].
 pub async fn wrap_initiator<S>(stream: S) -> Result<tokio::io::DuplexStream, CryptoError>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
-    let (state, stream) = handshake_initiator(stream).await?;
+    wrap_initiator_with_psk(stream, None).await
+}
+
+/// PSK-authenticated initiator: the handshake fails unless the peer
+/// derived the same PSK (i.e. knows the pairing code + passphrase).
+pub async fn wrap_initiator_with_psk<S>(
+    stream: S,
+    psk: Option<[u8; 32]>,
+) -> Result<tokio::io::DuplexStream, CryptoError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
+    let (state, stream) = handshake_initiator(stream, psk).await?;
     let (local, peer) = tokio::io::duplex(256 * 1024);
     tokio::spawn(async move {
         if let Err(e) = run_pump(state, stream, peer).await {
@@ -63,11 +93,25 @@ where
 /// Perform the Noise handshake as the responder (typically the sender, since
 /// it accepts the incoming TCP connection), then spawn a pump task and return
 /// a duplex stream that encrypts/decrypts transparently.
+///
+/// Unauthenticated variant for direct `ip:port` transfers; code-based
+/// transfers must use [`wrap_responder_with_psk`].
 pub async fn wrap_responder<S>(stream: S) -> Result<tokio::io::DuplexStream, CryptoError>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
-    let (state, stream) = handshake_responder(stream).await?;
+    wrap_responder_with_psk(stream, None).await
+}
+
+/// PSK-authenticated responder; see [`wrap_initiator_with_psk`].
+pub async fn wrap_responder_with_psk<S>(
+    stream: S,
+    psk: Option<[u8; 32]>,
+) -> Result<tokio::io::DuplexStream, CryptoError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
+    let (state, stream) = handshake_responder(stream, psk).await?;
     let (local, peer) = tokio::io::duplex(256 * 1024);
     tokio::spawn(async move {
         if let Err(e) = run_pump(state, stream, peer).await {
@@ -77,11 +121,31 @@ where
     Ok(local)
 }
 
-async fn handshake_initiator<S>(mut stream: S) -> Result<(TransportState, S), CryptoError>
+fn builder_with_psk(
+    pattern: &str,
+    psk: Option<[u8; 32]>,
+) -> Result<snow::Builder<'static>, CryptoError> {
+    let mut builder = snow::Builder::new(pattern.parse()?);
+    if let Some(key) = psk {
+        // `snow` borrows the PSK bytes through the builder, so the 32-byte
+        // copy must outlive the handshake. Leaking is bounded and
+        // acceptable here: one 32 B leak per connection, and a transfer
+        // makes only a handful of connections per process lifetime.
+        let leaked: &'static [u8] = Box::leak(Box::new(key));
+        builder = builder.psk(0, leaked);
+    }
+    Ok(builder)
+}
+
+async fn handshake_initiator<S>(
+    mut stream: S,
+    psk: Option<[u8; 32]>,
+) -> Result<(TransportState, S), CryptoError>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    let mut state = snow::Builder::new(PATTERN.parse()?).build_initiator()?;
+    let pattern = if psk.is_some() { PATTERN_PSK } else { PATTERN };
+    let mut state = builder_with_psk(pattern, psk)?.build_initiator()?;
     let mut payload = vec![0u8; 1024];
 
     // -> e
@@ -92,11 +156,15 @@ where
     Ok((state.into_transport_mode()?, stream))
 }
 
-async fn handshake_responder<S>(mut stream: S) -> Result<(TransportState, S), CryptoError>
+async fn handshake_responder<S>(
+    mut stream: S,
+    psk: Option<[u8; 32]>,
+) -> Result<(TransportState, S), CryptoError>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    let mut state = snow::Builder::new(PATTERN.parse()?).build_responder()?;
+    let pattern = if psk.is_some() { PATTERN_PSK } else { PATTERN };
+    let mut state = builder_with_psk(pattern, psk)?.build_responder()?;
     let mut payload = vec![0u8; 1024];
 
     // <- e
@@ -273,6 +341,62 @@ mod tests {
         let resp_read = resp.await.unwrap();
         assert_eq!(init_read, b"hello from responder");
         assert_eq!(resp_read, b"hello from initiator");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn psk_round_trip_with_matching_psk() {
+        let psk = [7u8; 32];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let init = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut enc = wrap_initiator_with_psk(stream, Some(psk)).await.unwrap();
+            enc.write_all(b"psk hello").await.unwrap();
+            enc.flush().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = enc.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            buf
+        });
+
+        let resp = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut enc = wrap_responder_with_psk(stream, Some(psk)).await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = enc.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            enc.write_all(b"psk ack").await.unwrap();
+            enc.flush().await.unwrap();
+            buf
+        });
+
+        assert_eq!(init.await.unwrap(), b"psk ack");
+        assert_eq!(resp.await.unwrap(), b"psk hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn psk_mismatch_fails_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let init = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            wrap_initiator_with_psk(stream, Some([1u8; 32]))
+                .await
+                .map(|_| ())
+        });
+
+        let resp = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            wrap_responder_with_psk(stream, Some([2u8; 32]))
+                .await
+                .map(|_| ())
+        });
+
+        // At least one side must fail; typically both do.
+        let (a, b) = tokio::join!(init, resp);
+        assert!(a.unwrap().is_err() || b.unwrap().is_err());
     }
 
     /// Clean peer shutdown returns `None`; a truncated frame returns an error.

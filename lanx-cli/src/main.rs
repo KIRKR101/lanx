@@ -59,11 +59,33 @@ enum Command {
         /// The argument is the relay's sender-bind address (e.g. "192.168.1.100:53318").
         #[arg(long)]
         relay: Option<String>,
+        /// Number of words in the pairing code (2-5, default 3).
+        /// More words = more entropy against guessing (~8.2 bits each);
+        /// use 4+ with public relays.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(2..=5))]
+        code_words: u8,
+        /// Extra passphrase strengthening the Noise handshake PSK.
+        /// Also read from the `LANX_PSK` env var when unset. The relay
+        /// and network never see it; both sides must match.
+        #[arg(long)]
+        psk: Option<String>,
+        /// Accept direct `ip:port` receivers without the pairing code
+        /// (unauthenticated `Noise_NN`). This disables code discovery and
+        /// is only valid for direct transfers on trusted networks.
+        #[arg(long)]
+        allow_insecure_direct: bool,
     },
     /// Receive files.
     Recv {
-        /// Pairing code (e.g. "7-cobalt-fox") or ip:port.
+        /// Pairing code (e.g. "7-cobalt-fox-tundra") or ip:port.
         target: String,
+        /// Pairing code for `ip:port` targets. Discovery-code and relay
+        /// targets already carry the code, so `--code` with those is an
+        /// error. A bare `ip:port` without `--code` connects
+        /// unauthenticated (and fails against senders that did not pass
+        /// `--allow-insecure-direct`).
+        #[arg(long)]
+        code: Option<String>,
         /// Output directory or file (see README for resolution rules).
         #[arg(long, default_value = ".")]
         out: PathBuf,
@@ -111,6 +133,11 @@ enum Command {
         /// The argument is the relay's receiver-bind address (e.g. "192.168.1.100:53319").
         #[arg(long)]
         relay: Option<String>,
+        /// Extra passphrase strengthening the Noise handshake PSK.
+        /// Also read from the `LANX_PSK` env var when unset. Must match
+        /// the sender's value.
+        #[arg(long)]
+        psk: Option<String>,
     },
     /// Run a relay server that bridges sender and receiver connections.
     Relay {
@@ -163,6 +190,9 @@ fn main() -> Result<()> {
                 port,
                 parallel,
                 relay,
+                code_words,
+                psk,
+                allow_insecure_direct,
             } => {
                 cmd::send::run(
                     paths,
@@ -173,11 +203,15 @@ fn main() -> Result<()> {
                     parallel,
                     relay,
                     verbose,
+                    code_words,
+                    psk,
+                    allow_insecure_direct,
                 )
                 .await
             }
             Command::Recv {
                 target,
+                code,
                 out,
                 accept,
                 overwrite,
@@ -191,9 +225,11 @@ fn main() -> Result<()> {
                 discovery_timeout,
                 parallel,
                 relay,
+                psk,
             } => {
                 cmd::recv::run(cmd::recv::RecvOptions {
                     target,
+                    code,
                     out,
                     accept,
                     overwrite,
@@ -207,6 +243,7 @@ fn main() -> Result<()> {
                     discovery_timeout: Duration::from_secs(discovery_timeout),
                     parallel,
                     relay,
+                    psk,
                 })
                 .await
             }

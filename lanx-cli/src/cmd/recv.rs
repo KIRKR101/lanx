@@ -9,7 +9,7 @@ use lanx_core::transfer::receiver::{
     run_receiver, Approval, AutoAccept, ManifestApprover, ReceiverConfig, SharedApprover,
 };
 use lanx_core::transfer::DEFAULT_MAX_RETRIES;
-use lanx_net::discovery::code_to_hash;
+use lanx_net::discovery::{code_to_pairing_id, code_to_psk, code_word_count};
 use lanx_net::pairing::{parse_target, resolve_target, Target};
 use lanx_net::relay::{send_relay_hello, RelayHello, RelayRole};
 use lanx_net::tcp::DEFAULT_SEND_PORT;
@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
+use crate::json_progress::JsonProgress;
 use crate::progress::IndicatifProgress;
 use crate::ui;
-use crate::json_progress::JsonProgress;
 
 /// Conflict behavior for non-interactive use (`--on-conflict`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -32,6 +32,51 @@ pub enum OnConflict {
     Overwrite,
     /// Abort if any destination file already exists.
     Fail,
+}
+
+/// Pairing ID plus handshake PSK. `None`/`None` means unauthenticated
+/// (bare `ip:port` with no `--code`).
+type PairingKeys = (Option<[u8; 32]>, Option<[u8; 32]>);
+
+/// Decide the pairing ID and handshake PSK from the target and `--code`.
+///
+/// * Code target (discovery/relay): both derive from the target code.
+///   `--code` alongside is a hard error — the code is already the target.
+/// * `ip:port` + `--code`: both derive from the flag value (validated as
+///   a code, with an example on junk input).
+/// * Bare `ip:port`: `(None, None)` — unauthenticated `Noise_NN`, which
+///   fails against senders without `--allow-insecure-direct`.
+///
+/// Pure (no I/O) so it unit-tests cleanly.
+///
+/// # Errors
+///
+/// Returns an error if `--code` is combined with a code target or if the
+/// flag value is not shaped like a pairing code.
+pub fn resolve_handshake_psk(
+    target: &Target,
+    code_flag: Option<&str>,
+    passphrase: Option<&str>,
+) -> Result<PairingKeys> {
+    match (target, code_flag) {
+        (Target::Code(_), Some(_)) => {
+            bail!("--code is only for ip:port targets; the pairing code is already the target")
+        }
+        (Target::Code(code), None) => Ok((
+            Some(code_to_pairing_id(code)),
+            Some(code_to_psk(code, passphrase)),
+        )),
+        (Target::Addr(_), Some(flag)) => match parse_target(flag) {
+            Ok(Target::Code(_)) => Ok((
+                Some(code_to_pairing_id(flag)),
+                Some(code_to_psk(flag, passphrase)),
+            )),
+            _ => bail!(
+                "--code must look like a pairing code (e.g. 7-cobalt-fox-tundra), got {flag:?}"
+            ),
+        },
+        (Target::Addr(_), None) => Ok((None, None)),
+    }
 }
 
 /// Resolve the effective [`OverwritePolicy`] from the granular flags and
@@ -83,6 +128,12 @@ struct TryOnceConfig {
     addr: std::net::SocketAddr,
     relay_addr: Option<String>,
     code_hash: Option<[u8; 32]>,
+    handshake_psk: Option<[u8; 32]>,
+    /// True when `--code` was given for an `ip:port` target. A handshake
+    /// failure then means either a wrong code *or* a policy mismatch
+    /// (sender runs plain `--allow-insecure-direct` while we offered
+    /// PSK), so the hint must cover both.
+    addr_target_with_code: bool,
     out: PathBuf,
     approver: Arc<dyn ManifestApprover>,
     progress: Arc<dyn Progress>,
@@ -102,6 +153,7 @@ struct TryOnceConfig {
 /// Options for one `lanx recv` invocation.
 pub struct RecvOptions {
     pub target: String,
+    pub code: Option<String>,
     pub out: PathBuf,
     pub accept: bool,
     pub overwrite: bool,
@@ -115,11 +167,13 @@ pub struct RecvOptions {
     pub discovery_timeout: Duration,
     pub parallel: u16,
     pub relay: Option<String>,
+    pub psk: Option<String>,
 }
 
 pub async fn run(opts: RecvOptions) -> Result<()> {
     let RecvOptions {
         target,
+        code: code_flag,
         out,
         accept,
         overwrite,
@@ -133,6 +187,7 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
         discovery_timeout,
         parallel,
         relay,
+        psk,
     } = opts;
     let overwrite_policy = resolve_policy(overwrite, skip_existing, rename_existing, on_conflict)?;
     // `--json` and `--quiet` suppress informational stderr; warnings and
@@ -156,12 +211,37 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
 
     let parsed = parse_target(&target).context("parse target")?;
     if relay.is_some() && !matches!(parsed, Target::Code(_)) {
-        bail!("--relay requires a pairing code (e.g. 7-cobalt-fox), not an ip:port address");
+        bail!("--relay requires a pairing code (e.g. 7-cobalt-fox-tundra), not an ip:port address");
     }
-    let code_hash = match &parsed {
-        Target::Code(code) => Some(code_to_hash(code)),
-        _ => None,
+    let passphrase = crate::cmd::resolve_passphrase(psk);
+    if let Some(ref relay_addr) = relay {
+        crate::cmd::warn_if_public_relay(relay_addr);
+    }
+    // Pairing ID + PSK from the target code or `--code` (see
+    // `resolve_handshake_psk`). Bare `ip:port` stays unauthenticated.
+    let (code_hash, handshake_psk) =
+        resolve_handshake_psk(&parsed, code_flag.as_deref(), passphrase.as_deref())?;
+    let addr_target_with_code = matches!(&parsed, Target::Addr(_)) && code_flag.is_some();
+    // The code the user effectively paired with, for strength warnings.
+    let effective_code: Option<&str> = match &parsed {
+        Target::Code(code) => Some(code),
+        Target::Addr(_) => code_flag.as_deref(),
     };
+    if let Some(code) = effective_code {
+        if code_word_count(code) < 3 && human {
+            eprintln!(
+                "  {} {}",
+                ui::yellow("!"),
+                ui::yellow("short pairing code (<3 words, weak against guessing); ask the sender for a longer code for sensitive transfers"),
+            );
+        }
+    } else if human {
+        eprintln!(
+            "  {} {}",
+            ui::yellow("!"),
+            ui::yellow("unauthenticated: no pairing code given; the sender must pass --allow-insecure-direct, and anyone on the path can impersonate either side"),
+        );
+    }
 
     // Keep the code for re-resolution on retries: a sender can restart
     // onto another port (stable port occupied, --port changed), which
@@ -248,6 +328,8 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
         addr,
         relay_addr: relay_addr.clone(),
         code_hash,
+        handshake_psk,
+        addr_target_with_code,
         out: out.clone(),
         approver,
         progress: progress.clone(),
@@ -438,14 +520,33 @@ async fn try_once(
     }
 
     // Wrap the TCP stream in a Noise-encrypted channel before any lanx
-    // control messages are exchanged.
+    // control messages are exchanged. Code-based transfers use the
+    // PSK-authenticated pattern; a wrong code/passphrase fails here with
+    // guidance, while bare ip:port stays plain and fails against
+    // senders that did not pass --allow-insecure-direct.
+    let (timeout_hint, fail_hint) = if cfg.addr_target_with_code {
+        (
+            "noise handshake timed out (code was supplied but the sender may be using --allow-insecure-direct, or the code/passphrase is wrong)",
+            "noise handshake (code was supplied but the sender may be using --allow-insecure-direct, or the code/passphrase is wrong)",
+        )
+    } else if cfg.handshake_psk.is_some() {
+        (
+            "noise handshake timed out (wrong code/passphrase, or sender gone?)",
+            "noise handshake (wrong code/passphrase?)",
+        )
+    } else {
+        (
+            "noise handshake timed out (sender may require a pairing code: rerun with --code <code> from the sender screen)",
+            "noise handshake (sender may require a pairing code: rerun with --code <code> from the sender screen)",
+        )
+    };
     let enc = tokio::time::timeout(
         NOISE_HANDSHAKE_TIMEOUT,
-        lanx_core::crypto::wrap_initiator(stream),
+        lanx_core::crypto::wrap_initiator_with_psk(stream, cfg.handshake_psk),
     )
     .await
-    .context("noise handshake timed out")?
-    .context("noise handshake")?;
+    .context(timeout_hint)?
+    .context(fail_hint)?;
 
     let (mut r, w) = tokio::io::split(enc);
     let mut w = tokio::io::BufWriter::new(w);
@@ -531,20 +632,21 @@ fn print_conflict_preview(manifest: &Manifest, out_dir: &Path, overwrite_policy:
         "    {}",
         ui::dim(&format!(
             "{} existing ({} complete, {} resumable), {} new",
-            preview.existing,
-            preview.complete_by_size,
-            preview.resumable_by_size,
-            preview.new,
+            preview.existing, preview.complete_by_size, preview.resumable_by_size, preview.new,
         )),
     );
     let note = match overwrite_policy {
         OverwritePolicy::Resume => None,
         OverwritePolicy::Overwrite => Some("overwrite: existing files will be replaced"),
-        OverwritePolicy::SkipExisting => Some("skip-existing: existing files will be left untouched"),
+        OverwritePolicy::SkipExisting => {
+            Some("skip-existing: existing files will be left untouched")
+        }
         OverwritePolicy::RenameExisting => {
             Some("rename-existing: incoming files will be written to numbered siblings")
         }
-        OverwritePolicy::Fail => Some("on-conflict fail: aborting would trigger if any file exists"),
+        OverwritePolicy::Fail => {
+            Some("on-conflict fail: aborting would trigger if any file exists")
+        }
     };
     if let Some(note) = note {
         eprintln!("    {}", ui::dim(note));
@@ -736,5 +838,54 @@ mod tests {
         assert!(resolve_policy(true, true, false, None).is_err());
         assert!(resolve_policy(true, false, false, Some(OnConflict::Skip)).is_err());
         assert!(resolve_policy(false, true, false, Some(OnConflict::Fail)).is_err());
+    }
+
+    #[test]
+    fn psk_from_code_target() {
+        let t = parse_target("7-cobalt-fox-tundra").unwrap();
+        let (id, psk) = resolve_handshake_psk(&t, None, None).unwrap();
+        assert!(id.is_some() && psk.is_some());
+        assert_eq!(id.unwrap(), code_to_pairing_id("7-cobalt-fox-tundra"));
+    }
+
+    #[test]
+    fn psk_from_addr_plus_code_flag() {
+        let t = parse_target("192.168.1.5:29320").unwrap();
+        let (id, psk) = resolve_handshake_psk(&t, Some("7-cobalt-fox-tundra"), None).unwrap();
+        assert!(id.is_some() && psk.is_some());
+        // Same code via flag or target derives the same keys.
+        let t2 = parse_target("7-cobalt-fox-tundra").unwrap();
+        let (id2, psk2) = resolve_handshake_psk(&t2, None, None).unwrap();
+        assert_eq!(id, id2);
+        assert_eq!(psk, psk2);
+    }
+
+    #[test]
+    fn bare_addr_is_unauthenticated() {
+        let t = parse_target("192.168.1.5:29320").unwrap();
+        let (id, psk) = resolve_handshake_psk(&t, None, None).unwrap();
+        assert!(id.is_none() && psk.is_none());
+    }
+
+    #[test]
+    fn code_flag_with_code_target_rejected() {
+        let t = parse_target("7-cobalt-fox-tundra").unwrap();
+        assert!(resolve_handshake_psk(&t, Some("7-cobalt-fox-tundra"), None).is_err());
+    }
+
+    #[test]
+    fn junk_code_flag_rejected() {
+        let t = parse_target("192.168.1.5:29320").unwrap();
+        assert!(resolve_handshake_psk(&t, Some("not-a-code"), None).is_err());
+        assert!(resolve_handshake_psk(&t, Some("192.168.1.6:1234"), None).is_err());
+    }
+
+    #[test]
+    fn passphrase_changes_psk_but_not_id() {
+        let t = parse_target("7-cobalt-fox-tundra").unwrap();
+        let (id1, psk1) = resolve_handshake_psk(&t, None, None).unwrap();
+        let (id2, psk2) = resolve_handshake_psk(&t, None, Some("pw")).unwrap();
+        assert_eq!(id1, id2);
+        assert_ne!(psk1, psk2);
     }
 }

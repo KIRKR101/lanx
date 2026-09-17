@@ -40,25 +40,28 @@ lanx send ~/Pictures/Wallpapers/
 ```
 
 lanx will print a pairing code, the address it's listening on, and a
-copy-pasteable receiver command:
+copy-pasteable receiver command (the `--code` is required: the direct
+listener verifies it in the encrypted handshake):
 
 ```text
-code   7-cobalt-fox
-listen 192.168.1.42:29320
-recv   lanx recv 192.168.1.42:29320
+code   7-cobalt-fox-tundra  (~28 bits)
+direct lanx recv 192.168.1.42:29320 --code 7-cobalt-fox-tundra
 ```
 
 On the receiving machine:
 
 ```sh
-lanx recv 7-cobalt-fox
+lanx recv 7-cobalt-fox-tundra
 ```
 
-Machines on the same network can find each other automatically, so you normally don't need to enter an IP address. You can also connect directly:
+Machines on the same network can find each other automatically, so you normally don't need to enter an IP address. You can also connect directly with the command the sender printed:
 
 ```sh
-lanx recv 192.168.1.42:29320 --out ~/Desktop
+lanx recv 192.168.1.42:29320 --code 7-cobalt-fox-tundra --out ~/Desktop
 ```
+
+A bare `lanx recv ip:port` without `--code` only works against senders
+started with `--allow-insecure-direct` (trusted networks only).
 
 Before starting, lanx shows the incoming files and asks for confirmation. Use `--accept` to skip this.
 
@@ -82,6 +85,9 @@ Use `--zip` to send the input as a single archive instead.
 | `--parallel N` | Transfer using N parallel connections (default: 1) |
 | `--relay addr` | Transfer through a relay |
 | `--chunk-size bytes` | Set the hashing chunk size (default: 1 MiB) |
+| `--code-words N` | Pairing code words, 2-5 (default: 3; use 4+ with relays) |
+| `--psk phrase` | Extra passphrase for the handshake (`LANX_PSK` env also works) |
+| `--allow-insecure-direct` | Direct-only mode: accept bare `ip:port` receivers without the pairing code; disables discovery (trusted networks only) |
 
 ### `lanx recv`
 
@@ -93,6 +99,7 @@ Use `--zip` to send the input as a single archive instead.
 | `--discovery-timeout secs` | Network discovery timeout (default: 30 seconds) |
 | `--parallel N` | Transfer using N parallel connections |
 | `--relay addr` | Transfer through a relay |
+| `--psk phrase` | Handshake passphrase, must match sender (`LANX_PSK` env also works) |
 
 ## Resuming transfers
 
@@ -112,16 +119,50 @@ Then pass its address to the sender and receiver:
 
 ```sh
 lanx send ~/photos/ --relay 198.51.100.1:53318
-lanx recv 7-cobalt-fox --relay 198.51.100.1:53319
+lanx recv 7-cobalt-fox-tundra --relay 198.51.100.1:53319
 ```
 
 The relay only forwards traffic; transfers remain encrypted between the sender and receiver.
 
 By default, relay connections use port `53318` for senders and `53319` for receivers. These can be changed with `--sender-bind` and `--receiver-bind`.
 
+Sender registrations are acknowledged: a second sender for the same pairing
+ID is rejected (`re-register` by re-running `send` for a fresh code) so an
+attacker cannot steal a waiting receiver. Pending senders expire after 5
+minutes, and receivers that repeatedly guess wrong IDs are rate-limited
+per IP.
+
 ## Pairing codes
 
-Pairing codes such as `7-cobalt-fox` make it easier to connect to another machine without entering its IP address. The code is used for discovery, not as a password. Transfers themselves are protected by a Noise-encrypted connection.
+Pairing codes such as `7-cobalt-fox-tundra` replace manual IP entry. The
+broadcast/relayed pairing ID is a *public identifier*; secrecy comes from
+a PSK derived from the code and mixed into the `Noise_NNpsk0` handshake —
+a peer that does not know the code cannot complete the handshake.
+
+* Default codes are `digit + 3 words` (~28 bits). Use `lanx send
+  --code-words 4` (~36 bits) on untrusted networks or with relays.
+* For internet relays, additionally set `--psk <passphrase>` (or
+  `LANX_PSK` env) on both sides; the passphrase is never transmitted.
+* The relay rate-limits failed guesses per IP and rejects sender
+  takeover, but a public relay still sees *which* pairing IDs are active.
+  `lanx` warns when `--relay` points at a non-LAN address.
+* Direct `ip:port` transfers also verify the code by default — paste the
+  full command the sender printed (it includes `--code`). Bare `ip:port`
+  without a code requires the sender to opt into `--allow-insecure-direct`
+  and stays unauthenticated: prefer pairing codes on untrusted networks.
+* `--allow-insecure-direct` disables code discovery and prints bare direct
+  commands only. It cannot be combined with `--relay`.
+* For a direct `ip:port --code` target, retries stay pinned to that explicit
+  address; discovery is only re-run for pairing-code targets.
+* An empty `--psk ""` is treated as unset. Use a non-empty passphrase when
+  adding an out-of-band secret.
+
+Relay operators should deploy the sender and receiver services in lock-step:
+the current sender registration protocol adds one acknowledgement byte after
+the sender hello, so mixed old/new relay peers are not wire-compatible.
+Pending sender IDs can remain occupied for up to 5 minutes after a crashed
+sender; codes are fresh-random each run, so this is an availability cost, not
+code reuse.
 
 ## Firewalls
 

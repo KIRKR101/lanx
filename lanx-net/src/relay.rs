@@ -1,21 +1,26 @@
 //! TURN-like relay server that pairs sender and receiver TCP connections
-//! by a shared code hash. The relay does not interpret the lanx protocol;
+//! by a shared pairing ID. The relay does not interpret the lanx protocol;
 //! it only forwards bytes between the two sockets once paired.
 //!
 //! # Security note
 //!
-//! The `RelayHello` (containing the BLAKE3 code hash) is sent in plaintext
-//! before the Noise handshake wraps the connection. The relay needs the raw
-//! hash to pair sender and receiver, so encrypting it is not feasible
-//! without relay participation in the key derivation.
+//! The `RelayHello` (containing the pairing ID derived via
+//! `code_to_pairing_id`) is sent in plaintext before the Noise handshake
+//! wraps the connection. The relay needs the raw ID to pair sender and
+//! receiver, so encrypting it is not feasible without relay participation
+//! in the key derivation. Treat the pairing ID as *public*: secrecy comes
+//! from the PSK mixed into the `Noise_NNpsk0` handshake
+//! (`code_to_psk`), which the relay never sees.
 //!
-//! Pairing codes have ~18.6 bits of entropy (10 × 197 × 197 combinations).
-//! An observer on the network path can capture the code hash and brute-force
-//! all possible codes offline. The Noise handshake then encrypts file
-//! contents, but the human-readable pairing code itself is exposed.
+//! Guessing mitigations in this file: receivers that guess wrong wait up
+//! to `RECEIVER_WAIT_SECS` and are rate-limited per IP
+//! (`MAX_FAILED_ATTEMPTS_PER_WINDOW`); a second sender cannot evict the
+//! first for the same ID (`RelayError::CodeInUse`, surfaced to the sender
+//! via the one-byte `RELAY_ACK_*` reply); lookup timing is negligible
+//! next to the wait plus network jitter.
 //!
-//! Internet-facing deployments should use longer codes or authenticate peers
-//! with an out-of-band PSK.
+//! Internet-facing deployments should additionally use `--code-words 4`
+//! (or higher) and an out-of-band `--psk` passphrase.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -35,14 +40,17 @@ pub enum RelayRole {
 
 /// First message a peer sends after connecting to the relay.
 ///
-/// The relay pairs senders and receivers by `code_hash` and receives no
-/// human-readable pairing code.
+/// The relay pairs senders and receivers by `code_hash` (a public pairing
+/// ID from `code_to_pairing_id`) and receives no human-readable pairing
+/// code and no handshake PSK.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelayHello {
     /// Whether this peer is a sender or receiver.
     pub role: RelayRole,
-    /// BLAKE3 hash of the pairing code. Both sender and receiver compute
-    /// the same hash from the human-readable code.
+    /// Public pairing ID. Both sender and receiver compute the same ID
+    /// from the human-readable code. Observable by the relay and the
+    /// network path; guessing the underlying code still requires
+    /// completing the PSK-bound Noise handshake.
     pub code_hash: [u8; 32],
 }
 
@@ -55,8 +63,11 @@ struct Pending {
 }
 
 /// Maximum age (in seconds) before a pending sender entry is considered stale.
-/// Pending senders older than this are evicted before pairing.
-const PENDING_TTL_SECS: u64 = 10;
+/// 5 minutes: comfortably covers human out-of-band code relay (phone/chat)
+/// while still bounding memory via `MAX_PENDING_SENDERS`. Must stay well
+/// above `RECEIVER_WAIT_SECS` so a receiver arriving shortly after the
+/// sender always finds it.
+const PENDING_TTL_SECS: u64 = 300;
 
 /// Maximum number of pending senders in the map. Prevents unbounded memory
 /// growth from rapid sender registration floods.
@@ -78,6 +89,68 @@ const TRANSFER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// unbounded memory growth from fork/bomb attacks.
 const MAX_ACTIVE_SESSIONS: usize = 256;
 
+/// Maximum failed pairing attempts per IP within `RATE_LIMIT_WINDOW`
+/// before the relay starts rejecting with [`RelayError::RateLimited`].
+/// Legitimate use needs ~1 attempt; guessing needs thousands, so a tight
+/// budget mostly hurts attackers. The 11th failure inside the window is
+/// rejected; counts only *failed* looks (no sender found), not
+/// successful pairings.
+const MAX_FAILED_ATTEMPTS_PER_WINDOW: u32 = 10;
+/// Sliding window for the per-IP failure budget.
+const RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Cap on tracked IPs. `record_failure` prunes expired/empty entries once
+/// past this so a long-running public relay can't accumulate one entry
+/// per scanner IP forever.
+const MAX_TRACKED_IPS: usize = 1024;
+
+/// Sender registration reply, one byte written by the server right after
+/// the sender's hello. Lets a rejected sender tell "code already in use,
+/// re-run send" apart from a generic connection failure.
+pub const RELAY_ACK_OK: u8 = 0;
+/// Pairing ID already registered by another live sender.
+pub const RELAY_ACK_IN_USE: u8 = 1;
+/// Server at capacity (`MAX_PENDING_SENDERS`).
+pub const RELAY_ACK_FULL: u8 = 2;
+
+/// Per-IP failure counters for relay guessing rate limiting.
+#[derive(Debug, Default)]
+struct AttemptTracker {
+    /// IP -> timestamps of recent *failed* pairing looks.
+    failures: HashMap<std::net::IpAddr, Vec<std::time::Instant>>,
+}
+
+impl AttemptTracker {
+    /// Record a failure; returns true if the IP is now over budget
+    /// (more than `MAX_FAILED_ATTEMPTS_PER_WINDOW` fresh failures).
+    fn record_failure(&mut self, ip: std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        if self.failures.len() > MAX_TRACKED_IPS {
+            // Prune dead keys so scanner churn can't grow the map forever.
+            self.failures.retain(|_, v| {
+                v.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
+                !v.is_empty()
+            });
+        }
+        let entries = self.failures.entry(ip).or_default();
+        entries.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
+        entries.push(now);
+        entries.len() as u32 > MAX_FAILED_ATTEMPTS_PER_WINDOW
+    }
+
+    fn is_limited(&self, ip: &std::net::IpAddr) -> bool {
+        if let Some(entries) = self.failures.get(ip) {
+            let now = std::time::Instant::now();
+            let fresh = entries
+                .iter()
+                .filter(|t| now.duration_since(**t) < RATE_LIMIT_WINDOW)
+                .count() as u32;
+            fresh > MAX_FAILED_ATTEMPTS_PER_WINDOW
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RelayError {
     #[error("io: {0}")]
@@ -90,24 +163,34 @@ pub enum RelayError {
     UnexpectedRole(RelayRole),
     #[error("no sender found for code hash")]
     NoSender,
+    #[error("code already registered by another sender; retry when it expires")]
+    CodeInUse,
+    #[error("too many failed pairing attempts; slow down and retry")]
+    RateLimited,
+    #[error("server at capacity; try again later")]
+    Capacity,
 }
 
 /// A TURN-like relay server that pairs sender and receiver TCP connections
-/// by a shared code hash. The relay does not interpret the lanx protocol;
+/// by a shared pairing ID. The relay does not interpret the lanx protocol;
 /// it only forwards bytes between the two sockets once paired.
 ///
 /// # Session limits
 ///
 /// At most [`MAX_ACTIVE_SESSIONS`] concurrent paired transfers are
-/// allowed. Additional receiver connections are rejected until a slot
-/// frees up.
+/// allowed. The slot is reserved at pairing time (not at accept), so
+/// unauthenticated receivers waiting for a sender hold nothing.
+/// Receivers that repeatedly guess wrong IDs are rate-limited
+/// per IP (`MAX_FAILED_ATTEMPTS_PER_WINDOW` per `RATE_LIMIT_WINDOW`).
 pub struct RelayServer {
     sender_listener: TcpListener,
     receiver_listener: TcpListener,
-    /// Pending sender connections keyed by code hash.
+    /// Pending sender connections keyed by pairing ID.
     pending_senders: Arc<Mutex<HashMap<[u8; 32], Pending>>>,
     /// Count of active paired sessions (for connection limiting).
     active_sessions: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-IP failed-guess counters for rate limiting receivers.
+    attempts: Arc<Mutex<AttemptTracker>>,
 }
 
 impl RelayServer {
@@ -125,6 +208,7 @@ impl RelayServer {
             receiver_listener,
             pending_senders: Arc::new(Mutex::new(HashMap::new())),
             active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            attempts: Arc::new(Mutex::new(AttemptTracker::default())),
         })
     }
 
@@ -169,22 +253,16 @@ impl RelayServer {
                 result = self.receiver_listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
-                            // Reserve a session slot and reject connections over the limit.
-                            let prev = self.active_sessions.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                            if prev >= MAX_ACTIVE_SESSIONS {
-                                self.active_sessions.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                                tracing::warn!(
-                                    addr = %addr,
-                                    active = prev,
-                                    "rejecting receiver: max sessions reached"
-                                );
-                                drop(stream);
-                                continue;
-                            }
+                            // No slot reserved here: receivers only take a
+                            // session slot once actually paired (see
+                            // `handle_receiver`), so unauthenticated
+                            // guessers idling through the wait cannot
+                            // exhaust `MAX_ACTIVE_SESSIONS`.
                             let pending = self.pending_senders.clone();
                             let sessions = self.active_sessions.clone();
+                            let attempts = self.attempts.clone();
                             receiver_set.spawn(async move {
-                                if let Err(e) = handle_receiver(stream, addr, pending, sessions).await {
+                                if let Err(e) = handle_receiver(stream, addr, pending, sessions, attempts).await {
                                     tracing::warn!(addr = %addr, error = %e, "receiver handler error");
                                 }
                             });
@@ -248,6 +326,19 @@ pub async fn send_relay_hello(
     Ok(())
 }
 
+/// Read the one-byte sender registration reply (see `RELAY_ACK_*`).
+/// The server sends this right after a sender hello; receivers get no
+/// reply (they block until paired or the wait expires).
+///
+/// # Errors
+///
+/// Returns `RelayError::Io` if the byte cannot be read.
+pub async fn read_relay_ack(stream: &mut (impl AsyncReadExt + Unpin)) -> Result<u8, RelayError> {
+    let mut buf = [0u8; 1];
+    stream.read_exact(&mut buf).await?;
+    Ok(buf[0])
+}
+
 async fn handle_sender(
     mut stream: TcpStream,
     addr: SocketAddr,
@@ -264,35 +355,96 @@ async fn handle_sender(
 
     tracing::info!(addr = %addr, "sender connected, waiting for receiver");
 
-    let mut map = pending.lock().await;
-    // Clean up stale entries before checking for duplicates.
-    map.retain(|_, pending| pending.connected_at.elapsed().as_secs() < PENDING_TTL_SECS);
-    // If the map is full after cleanup, reject the new sender to prevent
-    // unbounded memory growth from registration floods.
-    if !map.contains_key(&hello.code_hash) && map.len() >= MAX_PENDING_SENDERS {
-        tracing::warn!(
-            addr = %addr,
-            pending_count = map.len(),
-            "rejecting sender: too many pending registrations"
-        );
-        return Err(RelayError::FrameTooLarge(0)); // reuse error variant for capacity
+    // Decide under the lock, then do network I/O unlocked: holding the
+    // map mutex across `write_all` would let one stalled sender block
+    // all other registrations and pairings. Re-check under a second
+    // lock before inserting (a rival may have won the race; losers get
+    // `CodeInUse`, never an eviction).
+    enum Decision {
+        Accept,
+        InUse,
+        Full(usize),
     }
-    // Replace an existing sender for this code hash and log the eviction.
-    if let Some(old) = map.insert(
-        hello.code_hash,
-        Pending {
-            stream,
-            addr,
-            connected_at: std::time::Instant::now(),
-        },
-    ) {
-        tracing::warn!(
-            old_addr = %old.addr,
-            new_addr = %addr,
-            code_hash = ?hello.code_hash,
-            "evicting stale sender for code hash"
+    let decision = {
+        let mut map = pending.lock().await;
+        // Clean up stale entries before checking for duplicates.
+        map.retain(|_, pending| pending.connected_at.elapsed().as_secs() < PENDING_TTL_SECS);
+        if map.contains_key(&hello.code_hash) {
+            Decision::InUse
+        } else if map.len() >= MAX_PENDING_SENDERS {
+            Decision::Full(map.len())
+        } else {
+            Decision::Accept
+        }
+    };
+    // Helper: tell the sender *why* registration failed before dropping
+    // the stream, so "code already registered" doesn't look like a
+    // generic connection failure.
+    async fn ack(stream: &mut TcpStream, byte: u8) -> std::io::Result<()> {
+        stream.write_all(&[byte]).await
+    }
+    match decision {
+        Decision::Full(count) => {
+            tracing::warn!(
+                addr = %addr,
+                pending_count = count,
+                "rejecting sender: too many pending registrations"
+            );
+            if let Err(e) = ack(&mut stream, RELAY_ACK_FULL).await {
+                tracing::debug!(?e, "failed to send relay ack");
+            }
+            return Err(RelayError::Capacity);
+        }
+        Decision::InUse => {
+            // Never evict a live sender: a second registration for the
+            // same ID is either a sender restart (old one is stale and
+            // was already reaped above) or a hijack attempt. Reject it
+            // so an attacker cannot steal a receiver waiting on someone
+            // else's code.
+            tracing::warn!(
+                addr = %addr,
+                "rejecting sender: pairing ID already registered"
+            );
+            if let Err(e) = ack(&mut stream, RELAY_ACK_IN_USE).await {
+                tracing::debug!(?e, "failed to send relay ack");
+            }
+            return Err(RelayError::CodeInUse);
+        }
+        Decision::Accept => {}
+    }
+    if let Err(e) = ack(&mut stream, RELAY_ACK_OK).await {
+        tracing::debug!(?e, "failed to send relay ack");
+        return Err(RelayError::Io(e));
+    }
+    {
+        let mut map = pending.lock().await;
+        map.retain(|_, pending| pending.connected_at.elapsed().as_secs() < PENDING_TTL_SECS);
+        if map.contains_key(&hello.code_hash) {
+            // Lost a registration race after the ack: report in-use
+            // rather than evicting the winner. (The ack already said OK;
+            // the sender will see the Noise handshake stall and retry
+            // with a fresh code — no silent hijack either way.)
+            tracing::warn!(
+                addr = %addr,
+                "lost sender registration race; reporting in-use"
+            );
+            return Err(RelayError::CodeInUse);
+        }
+        if map.len() >= MAX_PENDING_SENDERS {
+            tracing::warn!(
+                addr = %addr,
+                "lost sender registration race; server filled meanwhile"
+            );
+            return Err(RelayError::Capacity);
+        }
+        map.insert(
+            hello.code_hash,
+            Pending {
+                stream,
+                addr,
+                connected_at: std::time::Instant::now(),
+            },
         );
-        drop(old);
     }
     Ok(())
 }
@@ -316,12 +468,8 @@ async fn handle_receiver(
     addr: SocketAddr,
     pending: Arc<Mutex<HashMap<[u8; 32], Pending>>>,
     active_sessions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    attempts: Arc<Mutex<AttemptTracker>>,
 ) -> Result<(), RelayError> {
-    let guard = SessionGuard {
-        sessions: active_sessions,
-        active: true,
-    };
-
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(?e, "TCP_NODELAY failed on receiver");
     }
@@ -331,9 +479,22 @@ async fn handle_receiver(
         return Err(RelayError::UnexpectedRole(hello.role));
     }
 
+    // Pre-check the per-IP guess budget before the (slow) wait loop so a
+    // scanner burning through IDs gets cut off fast.
+    {
+        let tracker = attempts.lock().await;
+        if tracker.is_limited(&addr.ip()) {
+            tracing::warn!(addr = %addr, "rate-limiting receiver: too many failed attempts");
+            return Err(RelayError::RateLimited);
+        }
+    }
+
     // Poll for a matching sender, cleaning up stale entries. The
     // receiver waits up to RECEIVER_WAIT_SECS so a sender that connects
-    // slightly after the receiver still pairs successfully.
+    // slightly after the receiver still pairs successfully. A wrong
+    // guess costs the full wait, so each guess is expensive and
+    // rate-limited (see AttemptTracker); hash-lookup timing is
+    // negligible next to the 30 s wait plus network jitter.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(RECEIVER_WAIT_SECS);
     loop {
         let sender = {
@@ -349,6 +510,33 @@ async fn handle_receiver(
                     receiver = %addr,
                     "pairing sender and receiver"
                 );
+                // Reserve the session slot only now that pairing
+                // succeeded: waiting receivers hold nothing, so guessers
+                // cannot exhaust sessions by idling. If full, return the
+                // sender to pending (fresh timestamp) so a later retry
+                // can still find it.
+                let prev = active_sessions.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                if prev >= MAX_ACTIVE_SESSIONS {
+                    active_sessions.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    tracing::warn!(
+                        receiver = %addr,
+                        active = prev,
+                        "rejecting paired receiver: max sessions reached"
+                    );
+                    pending.lock().await.insert(
+                        hello.code_hash,
+                        Pending {
+                            stream: sender.stream,
+                            addr: sender.addr,
+                            connected_at: std::time::Instant::now(),
+                        },
+                    );
+                    return Err(RelayError::Capacity);
+                }
+                let guard = SessionGuard {
+                    sessions: active_sessions,
+                    active: true,
+                };
                 let moved_guard = guard;
                 tokio::spawn(async move {
                     let _g = moved_guard;
@@ -379,6 +567,12 @@ async fn handle_receiver(
             }
             None => {
                 tracing::info!(addr = %addr, "no sender found after waiting, receiver disconnected");
+                // Failed guess: count it toward the per-IP budget.
+                let limited = attempts.lock().await.record_failure(addr.ip());
+                if limited {
+                    tracing::warn!(addr = %addr, "receiver IP now rate-limited after repeated failures");
+                    return Err(RelayError::RateLimited);
+                }
                 return Err(RelayError::NoSender);
             }
         }
@@ -460,5 +654,66 @@ mod tests {
         let payload = postcard::to_allocvec(&receiver).unwrap();
         let decoded: RelayRole = postcard::from_bytes(&payload).unwrap();
         assert_eq!(receiver, decoded);
+    }
+
+    #[tokio::test]
+    async fn relay_ack_round_trip() {
+        let (mut a, mut b) = tokio::io::duplex(16);
+        a.write_all(&[RELAY_ACK_IN_USE]).await.unwrap();
+        assert_eq!(read_relay_ack(&mut b).await.unwrap(), RELAY_ACK_IN_USE);
+        assert_ne!(RELAY_ACK_OK, RELAY_ACK_IN_USE);
+        assert_ne!(RELAY_ACK_OK, RELAY_ACK_FULL);
+        assert_ne!(RELAY_ACK_IN_USE, RELAY_ACK_FULL);
+    }
+
+    #[test]
+    fn error_variants_render_distinctly() {
+        // Guards against reusing one variant for another (e.g. capacity
+        // reported as a frame error): each must identify its own cause.
+        let capacity = RelayError::Capacity.to_string();
+        let in_use = RelayError::CodeInUse.to_string();
+        let limited = RelayError::RateLimited.to_string();
+        let no_sender = RelayError::NoSender.to_string();
+        assert!(capacity.contains("capacity"), "got: {capacity}");
+        assert_ne!(capacity, RelayError::FrameTooLarge(0).to_string());
+        assert_ne!(in_use, limited);
+        assert_ne!(in_use, no_sender);
+    }
+
+    #[test]
+    fn attempt_tracker_budgets_failures() {
+        let mut t = AttemptTracker::default();
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        assert!(!t.is_limited(&ip));
+        // Exactly the budget is still fine; the next one trips the limit.
+        for _ in 0..MAX_FAILED_ATTEMPTS_PER_WINDOW {
+            assert!(!t.record_failure(ip));
+        }
+        assert!(!t.is_limited(&ip));
+        assert!(t.record_failure(ip));
+        assert!(t.is_limited(&ip));
+        // Other IPs unaffected.
+        let other: std::net::IpAddr = "192.0.2.2".parse().unwrap();
+        assert!(!other.eq(&ip));
+        assert!(!t.is_limited(&other));
+    }
+
+    #[test]
+    fn attempt_tracker_prunes_dead_keys() {
+        let mut t = AttemptTracker::default();
+        // Simulate a scanner wave: many IPs with long-expired failures.
+        let stale =
+            std::time::Instant::now() - RATE_LIMIT_WINDOW - std::time::Duration::from_secs(1);
+        for i in 0..(MAX_TRACKED_IPS + 10) {
+            let ip: std::net::IpAddr = format!("10.{}.{}.1", (i >> 8) & 0xff, i & 0xff)
+                .parse()
+                .unwrap();
+            t.failures.insert(ip, vec![stale]);
+        }
+        assert!(t.failures.len() > MAX_TRACKED_IPS);
+        // Next failure triggers the prune; all stale keys are reaped.
+        let fresh: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        t.record_failure(fresh);
+        assert_eq!(t.failures.len(), 1);
     }
 }

@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use lanx_core::manifest::{build, rel_to_path, validate_rel_path};
 use lanx_core::transfer::sender::{run_sender, SenderConfig};
 use lanx_core::transfer::DEFAULT_MAX_RETRIES;
-use lanx_net::discovery::{code_to_hash, generate_code, start_broadcasting};
+use lanx_net::discovery::{
+    code_entropy_bits, code_to_pairing_id, code_to_psk, generate_code_with_words,
+    start_broadcasting,
+};
 use lanx_net::relay::{send_relay_hello, RelayHello, RelayRole};
 use lanx_net::tcp::{listen_default, GracefulListener, DEFAULT_SEND_PORT};
 use std::collections::HashMap;
@@ -27,18 +30,24 @@ fn spawn_stream(
     sources: HashMap<lanx_core::manifest::FileId, PathBuf>,
     progress: Arc<dyn lanx_core::progress::Progress>,
     cfg: SenderConfig,
+    psk: Option<[u8; 32]>,
 ) {
     set.spawn(async move {
         let enc = match tokio::time::timeout(
             Duration::from_secs(10),
-            lanx_core::crypto::wrap_responder(stream),
+            lanx_core::crypto::wrap_responder_with_psk(stream, psk),
         )
         .await
         {
             Ok(Ok(enc)) => enc,
             Ok(Err(e)) => {
+                let hint = if psk.is_some() {
+                    "receiver did not accept the PSK handshake (it may be using --allow-insecure-direct, or the code/passphrase is wrong)"
+                } else {
+                    "receiver used a wrong code, or connected with --code while this sender allows only bare direct connections"
+                };
                 return Err(lanx_core::transfer::ProtocolError::Unexpected(format!(
-                    "noise handshake: {e}"
+                    "noise handshake ({hint}): {e}"
                 )));
             }
             Err(_) => {
@@ -61,6 +70,14 @@ fn spawn_stream(
     });
 }
 
+fn should_start_discovery(
+    relay: Option<&str>,
+    no_discovery: bool,
+    allow_insecure_direct: bool,
+) -> bool {
+    relay.is_none() && !no_discovery && !allow_insecure_direct
+}
+
 /// Run the `lanx send` subcommand. Builds a manifest from the given
 /// paths, listens for a receiver (with optional UDP discovery), and
 /// streams the files.
@@ -79,7 +96,14 @@ pub async fn run(
     parallel: u16,
     relay: Option<String>,
     verbose: bool,
+    code_words: u8,
+    psk_opt: Option<String>,
+    allow_insecure_direct: bool,
 ) -> Result<()> {
+    if allow_insecure_direct && relay.is_some() {
+        anyhow::bail!("--allow-insecure-direct is only valid for direct transfers, not --relay");
+    }
+
     // Optional zip mode (explicit `--zip`). When set, the input is
     // packaged into a single `.zip` file in a temp dir and that single
     // file is what gets sent. Without `--zip`, directories are sent
@@ -143,12 +167,56 @@ pub async fn run(
         }
         None => listen_default().await?,
     };
-    let code = generate_code();
-    let code_hash = code_to_hash(&code);
+    let code = generate_code_with_words(code_words as usize);
+    let passphrase = crate::cmd::resolve_passphrase(psk_opt);
+    let code_hash = code_to_pairing_id(&code);
+    let handshake_psk = code_to_psk(&code, passphrase.as_deref());
 
     eprintln!();
     let label_w = 7;
-    ui::kv("code", &ui::bold(&code), label_w);
+    if allow_insecure_direct {
+        ui::kv(
+            "mode",
+            &ui::yellow("insecure direct: use the printed ip:port command"),
+            label_w,
+        );
+    } else {
+        let entropy = code_entropy_bits(&code);
+        ui::kv(
+            "code",
+            &format!(
+                "{}  {}",
+                ui::bold(&code),
+                ui::dim(&format!("(~{entropy:.0} bits)"))
+            ),
+            label_w,
+        );
+        if passphrase.is_some() {
+            eprintln!(
+                "  {} {}",
+                ui::dim("psk"),
+                ui::dim("passphrase set (strengthens handshake)")
+            );
+        }
+    }
+    if let Some(ref relay_addr) = relay {
+        crate::cmd::warn_if_public_relay(relay_addr);
+    }
+    // Direct-listener authentication policy. By default the direct port
+    // requires the pairing code (PSK-bound handshake); bare
+    // `lanx recv ip:port` receivers are told to rerun with `--code`.
+    // `--allow-insecure-direct` restores the old unauthenticated direct
+    // mode for trusted networks.
+    let direct_psk: Option<[u8; 32]> = if allow_insecure_direct {
+        eprintln!(
+            "  {} {}",
+            ui::yellow("!"),
+            ui::yellow("allowing unauthenticated direct receivers (--allow-insecure-direct)"),
+        );
+        None
+    } else {
+        Some(handshake_psk)
+    };
     if fell_back && relay.is_none() {
         eprintln!(
             "  {} {}",
@@ -183,21 +251,31 @@ pub async fn run(
             }
         }
         let indent = " ".repeat(label_w + 1);
+        // The printed direct command carries --code so it pastes and just
+        // works: the direct listener requires the PSK-bound handshake
+        // unless --allow-insecure-direct was passed.
+        let direct_cmd = |ip: &std::net::Ipv4Addr| {
+            if allow_insecure_direct {
+                format!("lanx recv {ip}:{}", addr.port())
+            } else {
+                format!("lanx recv {ip}:{} --code {code}", addr.port())
+            }
+        };
         let mut first = true;
         for ip in &addrs {
             if first {
-                ui::kv(
-                    "direct",
-                    &format!("lanx recv {ip}:{}", addr.port()),
-                    label_w,
-                );
+                ui::kv("direct", &direct_cmd(ip), label_w);
                 first = false;
             } else {
-                eprintln!("{indent}lanx recv {ip}:{}", addr.port());
+                eprintln!("{indent}{}", direct_cmd(ip));
             }
         }
         if addrs.is_empty() || verbose {
-            let cmd = format!("lanx recv 127.0.0.1:{}", addr.port());
+            let cmd = if allow_insecure_direct {
+                format!("lanx recv 127.0.0.1:{}", addr.port())
+            } else {
+                format!("lanx recv 127.0.0.1:{} --code {code}", addr.port())
+            };
             if first {
                 ui::kv("direct", &cmd, label_w);
             } else if verbose {
@@ -208,7 +286,7 @@ pub async fn run(
     }
 
     let mut disc = None;
-    if relay.is_none() && !no_discovery {
+    if should_start_discovery(relay.as_deref(), no_discovery, allow_insecure_direct) {
         match start_broadcasting(addr.port(), &code).await {
             Ok(h) => disc = Some(h),
             Err(e) => {
@@ -257,12 +335,35 @@ pub async fn run(
                 tracing::debug!(?e, "TCP_NODELAY failed");
             }
 
-            // Send hello to register with the relay.
+            // Send hello to register with the relay, then read the
+            // one-byte ack so "code already registered" doesn't look
+            // like a generic connection failure.
             let hello = RelayHello {
                 role: RelayRole::Sender,
                 code_hash,
             };
             send_relay_hello(&mut stream, &hello).await?;
+            let ack = tokio::time::timeout(
+                Duration::from_secs(10),
+                lanx_net::relay::read_relay_ack(&mut stream),
+            )
+            .await
+            .context("relay registration ack timed out")?
+            .context("read relay registration ack")?;
+            match ack {
+                lanx_net::relay::RELAY_ACK_OK => {}
+                lanx_net::relay::RELAY_ACK_IN_USE => {
+                    anyhow::bail!(
+                        "relay reports this pairing ID is already registered (another sender is waiting on it); \
+                         re-run `send` for a fresh code"
+                    )
+                }
+                _ => {
+                    anyhow::bail!(
+                        "relay rejected sender registration (server at capacity?); try again later"
+                    )
+                }
+            }
 
             eprintln!(
                 "  {} {}",
@@ -278,6 +379,7 @@ pub async fn run(
                 sources.clone(),
                 progress.clone(),
                 cfg.clone(),
+                Some(handshake_psk),
             );
         } else {
             // Fresh grace window for this round: after a failed session the
@@ -327,6 +429,7 @@ pub async fn run(
                 sources.clone(),
                 progress.clone(),
                 cfg.clone(),
+                direct_psk,
             );
 
             // Wait to negotiate parallelism on connection 0. If it fails or exits early,
@@ -358,6 +461,7 @@ pub async fn run(
                                 sources.clone(),
                                 progress.clone(),
                                 cfg.clone(),
+                                direct_psk,
                             );
                         }
                         Err(e) => {
@@ -563,4 +667,29 @@ fn add_directory_to_zip(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_start_discovery;
+
+    #[test]
+    fn insecure_direct_disables_discovery() {
+        assert!(!should_start_discovery(None, false, true));
+    }
+
+    #[test]
+    fn normal_direct_mode_discovers_unless_disabled() {
+        assert!(should_start_discovery(None, false, false));
+        assert!(!should_start_discovery(None, true, false));
+    }
+
+    #[test]
+    fn relay_mode_never_discovers() {
+        assert!(!should_start_discovery(
+            Some("127.0.0.1:53318"),
+            false,
+            false
+        ));
+    }
 }
