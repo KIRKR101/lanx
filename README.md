@@ -22,8 +22,7 @@ your PATH if you want to run `lanx` from any directory:
 cargo install --path lanx-cli
 ```
 
-Tagged releases include Linux, macOS, and Windows archives. You can also use
-`cargo-binstall lanx-cli` when a published package is available.
+Tagged releases include Linux, macOS, and Windows archives.
 
 ## Quick start
 
@@ -399,18 +398,6 @@ When the default port is busy, lanx prints the selected ephemeral port and the
 firewall command for that run. Direct addresses skip UDP discovery but still
 need the sender's TCP port. A relay needs its sender and receiver listener
 ports open instead.
-
-## Protocol compatibility
-
-The current wire protocol version is `4`. Sender and receiver exchange the
-version in their first messages and stop before sending a manifest when the
-peer does not support it.
-
-The protocol uses length-prefixed postcard control frames. It streams a
-manifest between `ManifestStart` and `ManifestEnd`, then sends file data using
-`FileStart` and `ChunkHeader` messages. Sender, receiver, and relay builds
-should come from the same release when using relay registration, because relay
-registration includes a challenge and a sender acknowledgement.
 
 ## Tests
 
