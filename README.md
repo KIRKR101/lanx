@@ -86,6 +86,7 @@ Use `--zip` to send the input as a single archive instead.
 | `--exclude PATTERN` | Exclude matching paths; repeatable (`*`, `?`, and `**` are supported) |
 | `--include PATTERN` | Include only matching paths; repeatable |
 | `--hidden` | Include hidden files and directories |
+| `--no-cache` | Disable the local manifest cache |
 | `--parallel N` | Transfer using N parallel connections (default: 1) |
 | `--relay addr` | Transfer through a relay |
 | `--chunk-size bytes` | Set the hashing chunk size (default: 1 MiB) |

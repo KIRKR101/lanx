@@ -1,7 +1,9 @@
 //! `lanx send`: build manifest, listen for receiver, transfer.
 
 use anyhow::{Context, Result};
-use lanx_core::manifest::{build_with_filters, rel_to_path, validate_rel_path, FilterOptions};
+use lanx_core::manifest::{
+    build_with_filters_cached, rel_to_path, validate_rel_path, FilterOptions,
+};
 use lanx_core::transfer::sender::{run_sender, SenderConfig};
 use lanx_core::transfer::DEFAULT_MAX_RETRIES;
 use lanx_net::discovery::{
@@ -97,6 +99,7 @@ pub async fn run(
     exclude: Vec<String>,
     include: Vec<String>,
     hidden: bool,
+    no_cache: bool,
     parallel: u16,
     relay: Option<String>,
     verbose: bool,
@@ -137,7 +140,7 @@ pub async fn run(
             exclude,
             include,
         };
-        move || build_with_filters(&paths, chunk_size, &filters)
+        move || build_with_filters_cached(&paths, chunk_size, &filters, no_cache)
     })
     .await
     .context("hash task panicked")??;

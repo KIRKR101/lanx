@@ -395,11 +395,72 @@ pub fn build_with_filters(
     filters: &FilterOptions,
 ) -> Result<Manifest, ManifestError> {
     let mut manifest = build(inputs, chunk_size)?;
+    apply_filters(&mut manifest, filters);
+    if manifest.files.is_empty() {
+        return Err(ManifestError::Empty);
+    }
+    for (id, file) in manifest.files.iter_mut().enumerate() {
+        file.id = id as FileId;
+    }
+    Ok(manifest)
+}
+
+/// Build a filtered manifest using `.lanx/manifest-cache.json` in the current
+/// directory. The cache is deliberately an optimization: unreadable, stale,
+/// or unwritable cache data falls back to a normal build.
+pub fn build_with_filters_cached(
+    inputs: &[PathBuf],
+    chunk_size: u32,
+    filters: &FilterOptions,
+    no_cache: bool,
+) -> Result<Manifest, ManifestError> {
+    if no_cache {
+        return build_with_filters(inputs, chunk_size, filters);
+    }
+    let cache_path = PathBuf::from(".lanx/manifest-cache.json");
+    let fingerprint = input_fingerprint(inputs, chunk_size)?;
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+        if let Ok(cache) = serde_json::from_slice::<ManifestCache>(&bytes) {
+            if cache.fingerprint == fingerprint {
+                let mut manifest = cache.manifest;
+                manifest.source_root = cache.source_root;
+                apply_filters(&mut manifest, filters);
+                if !manifest.files.is_empty() {
+                    return Ok(manifest);
+                }
+            }
+        }
+    }
+    let manifest = build_with_filters(inputs, chunk_size, filters)?;
+    let cache = ManifestCache {
+        fingerprint,
+        manifest: manifest.clone(),
+        source_root: manifest.source_root.clone(),
+    };
+    if let Ok(encoded) = serde_json::to_vec_pretty(&cache) {
+        if let Some(parent) = cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = cache_path.with_extension("json.tmp");
+        if std::fs::write(&tmp, encoded).is_ok() {
+            let _ = std::fs::rename(tmp, cache_path);
+        }
+    }
+    Ok(manifest)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestCache {
+    fingerprint: String,
+    manifest: Manifest,
+    source_root: PathBuf,
+}
+
+fn apply_filters(manifest: &mut Manifest, filters: &FilterOptions) {
     manifest.files.retain(|entry| {
+        let components = entry.rel_path.split('/');
         let hidden = !filters.include_hidden
-            && entry
-                .rel_path
-                .split('/')
+            && components
                 .skip(1)
                 .any(|component| component.starts_with('.'));
         let excluded = filters
@@ -413,13 +474,42 @@ pub fn build_with_filters(
                 .any(|pattern| matches_filter(pattern, &entry.rel_path));
         !hidden && !excluded && included
     });
-    if manifest.files.is_empty() {
-        return Err(ManifestError::Empty);
-    }
     for (id, file) in manifest.files.iter_mut().enumerate() {
         file.id = id as FileId;
     }
-    Ok(manifest)
+}
+
+fn input_fingerprint(inputs: &[PathBuf], chunk_size: u32) -> Result<String, ManifestError> {
+    let mut paths = Vec::new();
+    for input in inputs {
+        collect_metadata(input, &mut paths)?;
+    }
+    paths.sort();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&chunk_size.to_le_bytes());
+    for record in paths {
+        hasher.update(record.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn collect_metadata(path: &Path, records: &mut Vec<String>) -> Result<(), ManifestError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    records.push(format!("{}|{}|{}", path.display(), meta.len(), modified));
+    if meta.is_dir() {
+        let mut children: Vec<_> = std::fs::read_dir(path)?.filter_map(Result::ok).collect();
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            collect_metadata(&child.path(), records)?;
+        }
+    }
+    Ok(())
 }
 
 /// Small dependency-free glob matcher. `*` matches within one component,

@@ -64,6 +64,9 @@ enum Command {
         /// Include hidden files and directories (included by default when no filters are set).
         #[arg(long)]
         hidden: bool,
+        /// Disable the on-disk manifest cache.
+        #[arg(long)]
+        no_cache: bool,
         /// Number of parallel TCP connections to use.
         #[arg(long, default_value_t = 1)]
         parallel: u16,
@@ -204,6 +207,7 @@ fn main() -> Result<()> {
                 exclude,
                 include,
                 hidden,
+                no_cache,
                 parallel,
                 relay,
                 code_words,
@@ -220,6 +224,7 @@ fn main() -> Result<()> {
                     exclude,
                     include,
                     hidden,
+                    no_cache,
                     parallel,
                     relay,
                     verbose,
