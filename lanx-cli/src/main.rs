@@ -5,6 +5,7 @@ use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 mod cmd;
+mod doctor;
 mod iface;
 mod json_progress;
 mod progress;
@@ -24,6 +25,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Generate shell completion scripts.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Check local networking and relay prerequisites.
+    Doctor {
+        /// Optional relay address to test (for example 192.168.1.10:53318).
+        #[arg(long)]
+        relay: Option<String>,
+        /// Sender TCP port to check.
+        #[arg(long, default_value_t = lanx_net::tcp::DEFAULT_SEND_PORT)]
+        port: u16,
+    },
     /// Send one or more files/directories.
     Send {
         /// Files or directories to send.
@@ -197,6 +213,12 @@ fn main() -> Result<()> {
     let verbose = cli.verbose > 0;
     runtime.block_on(async move {
         match cli.command {
+            Command::Completions { shell } => {
+                use clap::CommandFactory;
+                clap_complete::generate(shell, &mut Cli::command(), "lanx", &mut std::io::stdout());
+                Ok(())
+            }
+            Command::Doctor { relay, port } => doctor::run(relay, port).await,
             Command::Send {
                 paths,
                 chunk_size,

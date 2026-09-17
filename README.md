@@ -31,6 +31,14 @@ cargo build --release
 
 The binary will be at `target/release/lanx` (`lanx.exe` on Windows). Copy it somewhere on your PATH if you want to use it globally.
 
+Tagged GitHub releases include Linux, macOS, and Windows archives. You can also
+install from source with `cargo install --path lanx-cli` or use
+`cargo-binstall lanx-cli` when a published package is available.
+
+Generate completions with, for example, `lanx completions zsh > _lanx`.
+Run `lanx doctor` to check local interfaces, discovery and sender ports,
+permissions, and optionally relay reachability with `--relay HOST:PORT`.
+
 ## Usage
 
 On the machine sending the files:
