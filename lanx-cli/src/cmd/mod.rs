@@ -67,16 +67,14 @@ pub fn set_relay(host: String) -> anyhow::Result<()> {
     }
     for port in [DEFAULT_RELAY_SENDER_PORT, DEFAULT_RELAY_RECEIVER_PORT] {
         let address = format_relay_address(&host, port);
-        match address.to_socket_addrs() {
-            Ok(addresses)
-                if addresses.into_iter().any(|address| {
-                    std::net::TcpStream::connect_timeout(
-                        &address,
-                        std::time::Duration::from_secs(3),
-                    )
+        let reachable = address.to_socket_addrs().map_or(false, |mut addresses| {
+            addresses.any(|address| {
+                std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(3))
                     .is_ok()
-                }) => {}
-            _ => eprintln!("warning: relay is not reachable at {address}"),
+            })
+        });
+        if !reachable {
+            eprintln!("warning: relay is not reachable at {address}");
         }
     }
     let path = config_path()?;
@@ -139,6 +137,15 @@ pub fn relay_auth_token() -> Option<String> {
     std::env::var("LANX_RELAY_AUTH_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
+}
+
+pub fn relay_connect_hint(relay: &str, role: &str) -> String {
+    format!(
+        "connect to relay {relay} ({role} endpoint) failed; verify `lanx relay` is running \
+         and the relay firewall exposes both listener ports; if registration fails after \
+         connection, check that the auth token matches; \
+         test the relay with `lanx doctor --relay <sender-host>:53318`"
+    )
 }
 
 /// Warn when a relay target is not LAN-local: the pairing ID is visible

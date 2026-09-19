@@ -386,6 +386,16 @@ lanx doctor
 lanx doctor --port 51234 --relay 198.51.100.1:53318
 ```
 
+The relay check tests both the sender listener (`53318`) and receiver listener
+(`53319`). For custom listener ports, pass the receiver address explicitly:
+
+```sh
+lanx doctor --relay relay.example.com:6000 --relay-receiver relay.example.com:6001
+```
+
+If a transfer cannot connect to a relay, Lanx reports which endpoint failed
+and suggests checking the relay process, firewall ports, and auth token.
+
 Generate completion files for your shell:
 
 ```sh

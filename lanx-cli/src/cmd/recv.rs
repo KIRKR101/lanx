@@ -481,7 +481,9 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
 /// Hint shown when a TCP connect times out. Kept in one place so the
 /// `ufw` text cannot drift from the README.
 fn firewall_hint(cfg: &TryOnceConfig) -> String {
-    if cfg.relay_addr.is_none() && cfg.addr.port() != DEFAULT_SEND_PORT {
+    if let Some(relay_addr) = &cfg.relay_addr {
+        crate::cmd::relay_connect_hint(relay_addr, "receiver")
+    } else if cfg.addr.port() != DEFAULT_SEND_PORT {
         format!(
             "connect {} timed out: the sender is listening on {} for this transfer \
              (not the default port {DEFAULT_SEND_PORT}, so the stable firewall rule \
@@ -510,7 +512,7 @@ async fn try_once(
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&cfg.addr))
         .await
         .with_context(|| firewall_hint(cfg))?
-        .with_context(|| format!("connect {}", cfg.addr))?;
+        .with_context(|| firewall_hint(cfg))?;
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(?e, "TCP_NODELAY failed");
     }
@@ -519,14 +521,18 @@ async fn try_once(
     // starting the Noise handshake. This must not run in direct mode
     // where code_hash is also Some (all pairing codes produce a hash).
     if let (Some(relay_addr), Some(hash)) = (&cfg.relay_addr, cfg.code_hash) {
-        let challenge = read_relay_challenge(&mut stream).await?;
+        let challenge = read_relay_challenge(&mut stream)
+            .await
+            .context("relay did not send an authentication challenge")?;
         let hello = RelayHello {
             role: RelayRole::Receiver,
             code_hash: hash,
             auth_token: crate::cmd::relay_auth_token()
                 .map(|token| relay_auth_proof(&token, &challenge, &hash)),
         };
-        send_relay_hello(&mut stream, &hello).await?;
+        send_relay_hello(&mut stream, &hello)
+            .await
+            .context("failed to register receiver with relay; check relay auth settings")?;
         tracing::info!("sent relay hello to {}", relay_addr);
     }
 

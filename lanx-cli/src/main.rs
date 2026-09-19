@@ -36,6 +36,9 @@ enum Command {
         /// Optional relay address to test (for example 192.168.1.10:53318).
         #[arg(long)]
         relay: Option<String>,
+        /// Optional receiver listener address when it is not sender port + 1.
+        #[arg(long)]
+        relay_receiver: Option<String>,
         /// Sender TCP port to check.
         #[arg(long, default_value_t = lanx_net::tcp::DEFAULT_SEND_PORT)]
         port: u16,
@@ -249,7 +252,11 @@ fn main() -> Result<()> {
                 clap_complete::generate(shell, &mut Cli::command(), "lanx", &mut std::io::stdout());
                 Ok(())
             }
-            Command::Doctor { relay, port } => doctor::run(relay, port).await,
+            Command::Doctor {
+                relay,
+                relay_receiver,
+                port,
+            } => doctor::run(relay, relay_receiver, port).await,
             Command::Send {
                 paths,
                 chunk_size,

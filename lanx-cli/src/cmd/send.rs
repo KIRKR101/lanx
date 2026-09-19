@@ -354,7 +354,7 @@ pub async fn run(
 
             let mut stream = TcpStream::connect(relay_addr)
                 .await
-                .with_context(|| format!("connect to relay {relay_addr}"))?;
+                .with_context(|| crate::cmd::relay_connect_hint(relay_addr, "sender"))?;
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::debug!(?e, "TCP_NODELAY failed");
             }
@@ -362,21 +362,25 @@ pub async fn run(
             // Send hello to register with the relay, then read the
             // one-byte ack so "code already registered" doesn't look
             // like a generic connection failure.
-            let challenge = read_relay_challenge(&mut stream).await?;
+            let challenge = read_relay_challenge(&mut stream)
+                .await
+                .context("relay did not send an authentication challenge")?;
             let hello = RelayHello {
                 role: RelayRole::Sender,
                 code_hash,
                 auth_token: crate::cmd::relay_auth_token()
                     .map(|token| relay_auth_proof(&token, &challenge, &code_hash)),
             };
-            send_relay_hello(&mut stream, &hello).await?;
+            send_relay_hello(&mut stream, &hello)
+                .await
+                .context("failed to register sender with relay; check relay auth settings")?;
             let ack = tokio::time::timeout(
                 Duration::from_secs(10),
                 lanx_net::relay::read_relay_ack(&mut stream),
             )
             .await
-            .context("relay registration ack timed out")?
-            .context("read relay registration ack")?;
+            .context("relay registration timed out; check relay reachability and auth settings")?
+            .context("relay closed before sender registration completed")?;
             match ack {
                 lanx_net::relay::RELAY_ACK_OK => {}
                 lanx_net::relay::RELAY_ACK_IN_USE => {
