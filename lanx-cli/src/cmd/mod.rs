@@ -1,5 +1,117 @@
 pub mod recv;
 pub mod relay;
+
+use std::net::ToSocketAddrs;
+
+const DEFAULT_RELAY_SENDER_PORT: u16 = 53318;
+const DEFAULT_RELAY_RECEIVER_PORT: u16 = 53319;
+
+pub fn resolve_relay(
+    value: Option<Option<String>>,
+    receiver: bool,
+) -> anyhow::Result<Option<String>> {
+    match value {
+        Some(Some(address)) => Ok(Some(address)),
+        Some(None) => {
+            let host = saved_relay()?;
+            let port = if receiver {
+                DEFAULT_RELAY_RECEIVER_PORT
+            } else {
+                DEFAULT_RELAY_SENDER_PORT
+            };
+            let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                format!("[{host}]")
+            } else {
+                host
+            };
+            Ok(Some(format!("{host}:{port}")))
+        }
+        None => Ok(None),
+    }
+}
+
+fn config_path() -> anyhow::Result<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("APPDATA is not set"))?
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+            })
+            .ok_or_else(|| anyhow::anyhow!("XDG_CONFIG_HOME or HOME is not set"))?
+    };
+    Ok(base.join("lanx").join("relay"))
+}
+
+fn saved_relay() -> anyhow::Result<String> {
+    let path = config_path()?;
+    let value = std::fs::read_to_string(&path)
+        .map_err(|_| anyhow::anyhow!("no relay configured; run `lanx relay set <host>`"))?;
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("no relay configured; run `lanx relay set <host>`");
+    }
+    Ok(value.to_owned())
+}
+
+pub fn set_relay(host: String) -> anyhow::Result<()> {
+    if host.is_empty()
+        || host.contains('/')
+        || host.chars().any(char::is_whitespace)
+        || (host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err())
+    {
+        anyhow::bail!("invalid relay host: {host}");
+    }
+    for port in [DEFAULT_RELAY_SENDER_PORT, DEFAULT_RELAY_RECEIVER_PORT] {
+        let address = format_relay_address(&host, port);
+        match address.to_socket_addrs() {
+            Ok(addresses)
+                if addresses.into_iter().any(|address| {
+                    std::net::TcpStream::connect_timeout(
+                        &address,
+                        std::time::Duration::from_secs(3),
+                    )
+                    .is_ok()
+                }) => {}
+            _ => eprintln!("warning: relay is not reachable at {address}"),
+        }
+    }
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, format!("{host}\n"))?;
+    println!("saved relay: {host}");
+    Ok(())
+}
+
+fn format_relay_address(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+pub fn clear_relay() -> anyhow::Result<()> {
+    let path = config_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => println!("cleared saved relay"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("no saved relay")
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+pub fn show_relay() -> anyhow::Result<()> {
+    println!("{}", saved_relay()?);
+    Ok(())
+}
 pub mod send;
 
 /// Validate that parallel > 1 is not used with --relay.

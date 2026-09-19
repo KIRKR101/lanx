@@ -88,8 +88,8 @@ enum Command {
         parallel: u16,
         /// Connect to a relay server instead of listening directly.
         /// The argument is the relay's sender-bind address (e.g. "192.168.1.100:53318").
-        #[arg(long)]
-        relay: Option<String>,
+        #[arg(long, num_args = 0..=1)]
+        relay: Option<Option<String>>,
         /// Number of words in the pairing code (2-5, default 3).
         /// More words = more entropy against guessing (~8.2 bits each);
         /// use 4+ with public relays.
@@ -162,8 +162,8 @@ enum Command {
         parallel: u16,
         /// Connect through a relay server instead of direct connection.
         /// The argument is the relay's receiver-bind address (e.g. "192.168.1.100:53319").
-        #[arg(long)]
-        relay: Option<String>,
+        #[arg(long, num_args = 0..=1)]
+        relay: Option<Option<String>>,
         /// Extra passphrase strengthening the Noise handshake PSK.
         /// Also read from the `LANX_PSK` env var when unset. Must match
         /// the sender's value.
@@ -172,6 +172,8 @@ enum Command {
     },
     /// Run a relay server that bridges sender and receiver connections.
     Relay {
+        #[command(subcommand)]
+        action: Option<RelayCommand>,
         /// Address to listen on for sender connections.
         #[arg(long, default_value = "0.0.0.0:53318")]
         sender_bind: String,
@@ -190,10 +192,20 @@ enum Command {
         /// Log periodic operational metrics.
         #[arg(long)]
         metrics: bool,
-        /// Relay log level: error, warn, info, debug, or trace.
+        /// Relay log level: off, error, warn, info, debug, or trace.
         #[arg(long, default_value = "info")]
         log_level: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum RelayCommand {
+    /// Save a default relay host for `--relay`.
+    Set { host: String },
+    /// Remove the saved relay host.
+    Clear,
+    /// Print the saved relay host.
+    Show,
 }
 
 fn main() -> Result<()> {
@@ -255,6 +267,7 @@ fn main() -> Result<()> {
                 psk,
                 allow_insecure_direct,
             } => {
+                let relay = cmd::resolve_relay(relay, false)?;
                 cmd::send::run(
                     paths,
                     chunk_size,
@@ -293,6 +306,7 @@ fn main() -> Result<()> {
                 relay,
                 psk,
             } => {
+                let relay = cmd::resolve_relay(relay, true)?;
                 cmd::recv::run(cmd::recv::RecvOptions {
                     target,
                     code,
@@ -314,6 +328,7 @@ fn main() -> Result<()> {
                 .await
             }
             Command::Relay {
+                action,
                 sender_bind,
                 receiver_bind,
                 max_sessions,
@@ -322,6 +337,13 @@ fn main() -> Result<()> {
                 metrics,
                 log_level: _,
             } => {
+                if let Some(action) = action {
+                    return match action {
+                        RelayCommand::Set { host } => cmd::set_relay(host),
+                        RelayCommand::Clear => cmd::clear_relay(),
+                        RelayCommand::Show => cmd::show_relay(),
+                    };
+                }
                 cmd::relay::run(
                     sender_bind,
                     receiver_bind,

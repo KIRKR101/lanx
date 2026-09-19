@@ -297,6 +297,24 @@ alter traffic.
 
 ## Relays
 
+Save a default relay host once on each client machine. `--relay` without an
+address then uses it, with ports `53318` for senders and `53319` for receivers:
+
+```sh
+lanx relay set relay.example.com
+lanx send ~/photos --relay
+lanx recv 7-cobalt-fox-tundra --relay --accept
+```
+
+`relay set` checks both listener ports and warns if either is unreachable, but
+saves the host anyway so you can configure clients before bringing the relay
+online. Use `lanx relay show` to print it or `lanx relay clear` to remove it.
+An explicit `--relay host:port` still overrides the saved host.
+
+This setting only configures the default client destination; it does not run a
+relay in the background. Start the relay server with `lanx relay` on the relay
+machine itself.
+
 Run a relay on a machine reachable by both endpoints when direct connections
 are blocked:
 
@@ -348,10 +366,11 @@ lanx recv 7-cobalt-fox-tundra --relay 198.51.100.1:53319 --accept
 ```
 
 Use `--metrics` to log pending and active session counts, and choose a relay
-log level with `--log-level`:
+log level with `--log-level`. Use `off` to suppress relay tracing, including
+connection metadata and pairing events:
 
 ```sh
-lanx relay --metrics --log-level debug
+lanx relay --metrics --log-level off
 ```
 
 Pending sender registrations expire after five minutes. A second sender using
