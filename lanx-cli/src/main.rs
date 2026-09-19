@@ -53,8 +53,14 @@ enum Command {
         /// spaces/dots, and case-insensitive collisions (Report.txt vs
         /// report.txt) abort the whole send with an error instead of
         /// being skipped or renamed.
-        #[arg(required = true)]
+        #[arg(required = false)]
         paths: Vec<PathBuf>,
+        /// Send a short text payload instead of files.
+        #[arg(long, conflicts_with_all = ["zip", "exclude", "include", "hidden", "no_cache"])]
+        text: Option<String>,
+        /// Include an encrypted note with the transfer manifest.
+        #[arg(long)]
+        message: Option<String>,
         /// Chunk size in bytes (default 1 MiB).
         #[arg(long, default_value_t = lanx_core::manifest::DEFAULT_CHUNK_SIZE)]
         chunk_size: u32,
@@ -259,6 +265,8 @@ fn main() -> Result<()> {
             } => doctor::run(relay, relay_receiver, port).await,
             Command::Send {
                 paths,
+                text,
+                message,
                 chunk_size,
                 no_discovery,
                 zip,
@@ -277,6 +285,8 @@ fn main() -> Result<()> {
                 let relay = cmd::resolve_relay(relay, false)?;
                 cmd::send::run(
                     paths,
+                    text,
+                    message,
                     chunk_size,
                     no_discovery,
                     zip,

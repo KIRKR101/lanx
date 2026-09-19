@@ -438,6 +438,23 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
                     );
                     bail!("transfer declined by user");
                 }
+                if let Some(message) = report.message.as_deref() {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"event": "message", "message": message})
+                        );
+                    } else if !quiet {
+                        eprintln!("  {} {}", ui::dim("message"), ui::bold(&safe_text(message)));
+                    }
+                }
+                if let Some(text) = report.text.as_deref() {
+                    if json {
+                        println!("{}", serde_json::json!({"event": "text", "text": text}));
+                    } else {
+                        println!("{text}");
+                    }
+                }
                 // `summary` prints the styled completion line.
                 progress.summary(report.verified, report.failed, report.skipped);
                 if report.failed == 0 {
@@ -602,6 +619,12 @@ async fn aggregate_reports(
         report.failed += inner.failed;
         report.skipped += inner.skipped;
         report.rejected = report.rejected || inner.rejected;
+        if report.message.is_none() {
+            report.message = inner.message.clone();
+        }
+        if report.text.is_none() {
+            report.text = inner.text.clone();
+        }
     }
     while let Some(r) = set.join_next().await {
         let inner = r.context("connection task panicked")??;
@@ -609,6 +632,12 @@ async fn aggregate_reports(
         report.failed += inner.failed;
         report.skipped += inner.skipped;
         report.rejected = report.rejected || inner.rejected;
+        if report.message.is_none() {
+            report.message = inner.message;
+        }
+        if report.text.is_none() {
+            report.text = inner.text;
+        }
     }
     Ok(report)
 }
@@ -625,6 +654,10 @@ struct DryRunApprover {
     out_dir: PathBuf,
     overwrite_policy: OverwritePolicy,
     json: bool,
+}
+
+fn safe_text(value: &str) -> String {
+    value.escape_debug().to_string()
 }
 
 /// Shared conflict summary printed before confirmation: how many
@@ -686,6 +719,12 @@ impl ManifestApprover for StdinApprover {
             "    {}",
             ui::bold(&ui::count_line(summary.file_count, summary.total_bytes)),
         );
+        if let Some(message) = summary.message.as_deref() {
+            eprintln!("    {} {}", ui::dim("Message:"), safe_text(message));
+        }
+        if let Some(text) = summary.text.as_deref() {
+            eprintln!("    {} {}", ui::dim("Text:"), safe_text(text));
+        }
         eprintln!();
 
         // Same root-stripped `name  size` rows as the live progress
@@ -779,6 +818,12 @@ impl ManifestApprover for DryRunApprover {
             "    {}",
             ui::bold(&ui::count_line(summary.file_count, summary.total_bytes)),
         );
+        if let Some(message) = summary.message.as_deref() {
+            eprintln!("    {} {}", ui::dim("Message:"), safe_text(message));
+        }
+        if let Some(text) = summary.text.as_deref() {
+            eprintln!("    {} {}", ui::dim("Text:"), safe_text(text));
+        }
         eprintln!();
         let rel_paths: Vec<String> = manifest.files.iter().map(|f| f.rel_path.clone()).collect();
         let display = ui::display_names(&rel_paths);

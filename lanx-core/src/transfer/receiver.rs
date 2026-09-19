@@ -3,7 +3,7 @@
 
 use super::{
     read_frame, supports_protocol_version, write_frame, ControlMsg, HelloInfo, ProtocolError,
-    DEFAULT_MAX_RETRIES, PROTOCOL_VERSION,
+    DEFAULT_MAX_RETRIES, MAX_TRANSFER_MESSAGE_BYTES, MAX_TRANSFER_TEXT_BYTES, PROTOCOL_VERSION,
 };
 use crate::destinations::{
     resolve_destinations, resolve_destinations_with_policy, OverwritePolicy,
@@ -195,7 +195,7 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
     }
 
     // Read the streaming or single-frame manifest.
-    let sender_manifest = read_manifest(reader).await?;
+    let (sender_manifest, message, text) = read_manifest(reader).await?;
 
     // If the sender capped parallelism below our connection index, this
     // connection must not handle files because that would duplicate
@@ -208,7 +208,9 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
     };
 
     // Compute the summary for the UI and for the approval prompt.
-    let summary = TransferSummary::from_manifest(&sender_manifest);
+    let mut summary = TransferSummary::from_manifest(&sender_manifest);
+    summary.message = message.clone();
+    summary.text = text.clone();
 
     // Ask the application layer whether to accept this manifest. We do
     // this *before* computing the resume plan so the receiver doesn't
@@ -229,6 +231,8 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
             writer.flush().await?;
             return Ok(ReceiverReport {
                 rejected: true,
+                message,
+                text,
                 ..ReceiverReport::default()
             });
         }
@@ -261,7 +265,44 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
                 Err(e) => return Err(e),
             }
         }
-        return Ok(ReceiverReport::default());
+        return Ok(ReceiverReport {
+            message,
+            text,
+            ..ReceiverReport::default()
+        });
+    }
+
+    if let Some(text) = text {
+        if !sender_manifest.files.is_empty() {
+            return Err(ProtocolError::Unexpected(
+                "text transfers cannot include files".into(),
+            ));
+        }
+        write_frame(
+            writer,
+            &ControlMsg::ManifestAck {
+                accepted: vec![],
+                resume_offsets: std::collections::HashMap::new(),
+            },
+        )
+        .await?;
+        writer.flush().await?;
+        loop {
+            match read_frame(reader).await {
+                Ok(ControlMsg::Done) => break,
+                Ok(ControlMsg::Error { message }) => {
+                    return Err(ProtocolError::PeerError(message));
+                }
+                Ok(_) => {}
+                Err(ProtocolError::Io(e)) if is_benign_close(e.kind()) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        return Ok(ReceiverReport {
+            message,
+            text: Some(text),
+            ..ReceiverReport::default()
+        });
     }
 
     // Check fail-policy conflicts before resolving destinations, since
@@ -360,7 +401,11 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
         .map(|f| f.id)
         .collect();
 
-    let mut report = ReceiverReport::default();
+    let mut report = ReceiverReport {
+        message,
+        text: None,
+        ..ReceiverReport::default()
+    };
     for entry in &sender_manifest.files {
         if !assigned_ids.contains(&entry.id) {
             continue;
@@ -438,7 +483,7 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin
 /// Read the streaming manifest.
 async fn read_manifest<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
-) -> Result<Manifest, ProtocolError> {
+) -> Result<(Manifest, Option<String>, Option<String>), ProtocolError> {
     let first = read_frame(reader).await?;
     match first {
         ControlMsg::ManifestStart {
@@ -454,7 +499,7 @@ async fn read_streaming_manifest<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     expected_files: u64,
     expected_bytes: u64,
-) -> Result<Manifest, ProtocolError> {
+) -> Result<(Manifest, Option<String>, Option<String>), ProtocolError> {
     if expected_files > u64::try_from(MAX_MANIFEST_FILES).unwrap_or(u64::MAX) {
         return Err(ProtocolError::Unexpected(format!(
             "manifest has {expected_files} files, maximum is {MAX_MANIFEST_FILES}",
@@ -464,10 +509,33 @@ async fn read_streaming_manifest<R: tokio::io::AsyncRead + Unpin>(
     let mut files = Vec::new();
     let mut total_bytes = 0u64;
     let mut chunk_size: Option<u32> = None;
+    let mut message = None;
+    let mut text = None;
 
     loop {
         let msg = read_frame(reader).await?;
         match msg {
+            ControlMsg::ManifestNote {
+                message: note,
+                text: payload,
+            } => {
+                if message.is_some() || text.is_some() {
+                    return Err(ProtocolError::Unexpected("duplicate manifest note".into()));
+                }
+                if note
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_TRANSFER_MESSAGE_BYTES)
+                    || payload
+                        .as_ref()
+                        .is_some_and(|value| value.len() > MAX_TRANSFER_TEXT_BYTES)
+                {
+                    return Err(ProtocolError::Unexpected(
+                        "message or text exceeds the transfer size limit".into(),
+                    ));
+                }
+                message = note;
+                text = payload;
+            }
             ControlMsg::ManifestEntry(entry) => {
                 if files.len() >= MAX_MANIFEST_FILES {
                     return Err(ProtocolError::Unexpected(format!(
@@ -548,7 +616,7 @@ async fn read_streaming_manifest<R: tokio::io::AsyncRead + Unpin>(
         .map_err(|e| ProtocolError::Unexpected(format!("invalid rel_path: {e}")))?;
     crate::manifest::validate_manifest_ids(&manifest)
         .map_err(|e| ProtocolError::Unexpected(format!("invalid file id: {e}")))?;
-    Ok(manifest)
+    Ok((manifest, message, text))
 }
 
 fn validate_entry(entry: &FileEntry) -> Result<(), ProtocolError> {
@@ -584,6 +652,8 @@ pub struct ReceiverReport {
     /// True when the receiver declined the manifest before any file
     /// data was transferred.
     pub rejected: bool,
+    pub message: Option<String>,
+    pub text: Option<String>,
 }
 
 /// Maximum number of total attempts per file is `max_retries + 1`:

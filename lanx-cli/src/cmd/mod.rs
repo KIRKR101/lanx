@@ -67,7 +67,7 @@ pub fn set_relay(host: String) -> anyhow::Result<()> {
     }
     for port in [DEFAULT_RELAY_SENDER_PORT, DEFAULT_RELAY_RECEIVER_PORT] {
         let address = format_relay_address(&host, port);
-        let reachable = address.to_socket_addrs().map_or(false, |mut addresses| {
+        let reachable = address.to_socket_addrs().is_ok_and(|mut addresses| {
             addresses.any(|address| {
                 std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(3))
                     .is_ok()

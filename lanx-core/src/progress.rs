@@ -48,6 +48,10 @@ pub struct TransferSummary {
     /// - `Files` for a flat multi-file transfer, with no canonical name.
     /// - `SingleFile { name }` for a one-file transfer.
     pub display_name: String,
+    /// Optional sender-provided note shown before acceptance.
+    pub message: Option<String>,
+    /// Optional text payload for a text-only transfer.
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +86,8 @@ impl TransferSummary {
                 file_count: 0,
                 total_bytes: 0,
                 display_name: String::new(),
+                message: None,
+                text: None,
             };
         }
         if file_count == 1 {
@@ -97,6 +103,8 @@ impl TransferSummary {
                 file_count,
                 total_bytes,
                 display_name: name,
+                message: None,
+                text: None,
             };
         }
         // Multiple files with one shared first component form a folder.
@@ -121,6 +129,8 @@ impl TransferSummary {
                     file_count,
                     total_bytes,
                     display_name: first_name.to_string(),
+                    message: None,
+                    text: None,
                 };
             }
         }
@@ -129,6 +139,8 @@ impl TransferSummary {
             file_count,
             total_bytes,
             display_name: String::new(),
+            message: None,
+            text: None,
         }
     }
 }

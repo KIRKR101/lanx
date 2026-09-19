@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current control-protocol version. Peers must use the same value.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Versions this build can decode and execute.
 ///
@@ -34,6 +34,9 @@ pub const fn supports_protocol_version(version: u16) -> bool {
 /// Default maximum number of retries per file on hash mismatch. Both
 /// sender and receiver use this value so they agree on when to give up.
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+pub const MAX_TRANSFER_MESSAGE_BYTES: usize = 4096;
+pub const MAX_TRANSFER_TEXT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HelloInfo {
@@ -110,6 +113,11 @@ pub enum ControlMsg {
         message: String,
     },
     Done,
+    /// Optional metadata/content sent with the manifest before approval.
+    ManifestNote {
+        message: Option<String>,
+        text: Option<String>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -228,6 +236,17 @@ mod tests {
     fn manifest_end_round_trip() {
         let msg = ControlMsg::ManifestEnd {
             chunk_size: 1024 * 1024,
+        };
+        let encoded = postcard::to_allocvec(&msg).unwrap();
+        let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(format!("{msg:?}"), format!("{decoded:?}"));
+    }
+
+    #[test]
+    fn manifest_note_round_trip() {
+        let msg = ControlMsg::ManifestNote {
+            message: Some("JPG files attached".into()),
+            text: Some("hello".into()),
         };
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ControlMsg = postcard::from_bytes(&encoded).unwrap();

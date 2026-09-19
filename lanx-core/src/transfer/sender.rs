@@ -4,7 +4,7 @@
 
 use super::{
     read_frame, supports_protocol_version, write_frame, ControlMsg, HelloInfo, ProtocolError,
-    DEFAULT_MAX_RETRIES, PROTOCOL_VERSION,
+    DEFAULT_MAX_RETRIES, MAX_TRANSFER_MESSAGE_BYTES, MAX_TRANSFER_TEXT_BYTES, PROTOCOL_VERSION,
 };
 use crate::hashing::IncrementalHasher;
 use crate::manifest::{FileEntry, FileId, Manifest};
@@ -35,6 +35,8 @@ pub struct SenderConfig {
     /// Optional channel to communicate the agreed parallelism count
     /// back to the coordinator.
     pub agreed_parallel_tx: Option<tokio::sync::mpsc::UnboundedSender<u16>>,
+    pub message: Option<String>,
+    pub text: Option<String>,
 }
 
 impl Default for SenderConfig {
@@ -44,6 +46,8 @@ impl Default for SenderConfig {
             max_retries: DEFAULT_MAX_RETRIES,
             max_parallel: MAX_PARALLEL,
             agreed_parallel_tx: None,
+            message: None,
+            text: None,
         }
     }
 }
@@ -86,7 +90,9 @@ where
     // per-file bars and (if it wants) print a header. The receiver
     // fires the same event after it reads the manifest, so both sides
     // see consistent previews.
-    let summary = TransferSummary::from_manifest(manifest);
+    let mut summary = TransferSummary::from_manifest(manifest);
+    summary.message = cfg.message.clone();
+    summary.text = cfg.text.clone();
     progress.manifest_received(manifest, &summary);
 
     let first = read_frame(reader).await?;
@@ -137,6 +143,29 @@ where
         },
     )
     .await?;
+    if cfg.message.is_some() || cfg.text.is_some() {
+        if cfg
+            .message
+            .as_ref()
+            .is_some_and(|message| message.len() > MAX_TRANSFER_MESSAGE_BYTES)
+            || cfg
+                .text
+                .as_ref()
+                .is_some_and(|text| text.len() > MAX_TRANSFER_TEXT_BYTES)
+        {
+            return Err(ProtocolError::Unexpected(
+                "message or text exceeds the transfer size limit".into(),
+            ));
+        }
+        write_frame(
+            writer,
+            &ControlMsg::ManifestNote {
+                message: cfg.message.clone(),
+                text: cfg.text.clone(),
+            },
+        )
+        .await?;
+    }
     for entry in &manifest.files {
         write_frame(writer, &ControlMsg::ManifestEntry(entry.clone())).await?;
     }

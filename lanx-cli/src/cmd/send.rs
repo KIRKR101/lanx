@@ -92,6 +92,8 @@ fn should_start_discovery(
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     paths: Vec<PathBuf>,
+    text: Option<String>,
+    message: Option<String>,
     chunk_size: u32,
     no_discovery: bool,
     zip: bool,
@@ -108,6 +110,24 @@ pub async fn run(
     psk_opt: Option<String>,
     allow_insecure_direct: bool,
 ) -> Result<()> {
+    if paths.is_empty() && text.is_none() {
+        anyhow::bail!("provide at least one path or use --text");
+    }
+    if text.is_some() && !paths.is_empty() {
+        anyhow::bail!("--text cannot be combined with file paths");
+    }
+    if message
+        .as_ref()
+        .is_some_and(|value| value.len() > lanx_core::transfer::MAX_TRANSFER_MESSAGE_BYTES)
+    {
+        anyhow::bail!("--message is limited to 4096 bytes");
+    }
+    if text
+        .as_ref()
+        .is_some_and(|value| value.len() > lanx_core::transfer::MAX_TRANSFER_TEXT_BYTES)
+    {
+        anyhow::bail!("--text is limited to 1 MiB");
+    }
     if allow_insecure_direct && relay.is_some() {
         anyhow::bail!("--allow-insecure-direct is only valid for direct transfers, not --relay");
     }
@@ -133,27 +153,40 @@ pub async fn run(
         (None, paths)
     };
 
-    let hash_spinner = ui::spinner(&format!("hashing files{}", ui::ellipsis()));
-    let manifest = tokio::task::spawn_blocking({
-        let paths = effective_paths.clone();
-        let filters = FilterOptions {
-            include_hidden: hidden,
-            exclude,
-            include,
-        };
-        move || build_with_filters_cached(&paths, chunk_size, &filters, no_cache)
-    })
-    .await
-    .context("hash task panicked")??;
+    let manifest = if text.is_some() {
+        lanx_core::manifest::Manifest {
+            files: Vec::new(),
+            chunk_size,
+            source_root: PathBuf::new(),
+        }
+    } else {
+        let hash_spinner = ui::spinner(&format!("hashing files{}", ui::ellipsis()));
+        let manifest = tokio::task::spawn_blocking({
+            let paths = effective_paths.clone();
+            let filters = FilterOptions {
+                include_hidden: hidden,
+                exclude,
+                include,
+            };
+            move || build_with_filters_cached(&paths, chunk_size, &filters, no_cache)
+        })
+        .await
+        .context("hash task panicked")??;
+        hash_spinner.finish_and_clear();
+        manifest
+    };
     let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
-    hash_spinner.finish_and_clear();
     let n_files = manifest.files.len();
-    eprintln!(
-        "  {} {} {}",
-        ui::green(ui::ok_sym()),
-        ui::dim("hashed"),
-        ui::count_line(n_files, total_bytes),
-    );
+    if text.is_some() {
+        eprintln!("  {} {}", ui::green(ui::ok_sym()), ui::dim("text ready"));
+    } else {
+        eprintln!(
+            "  {} {} {}",
+            ui::green(ui::ok_sym()),
+            ui::dim("hashed"),
+            ui::count_line(n_files, total_bytes),
+        );
+    }
 
     // Reconstruct source paths from the manifest's canonicalized
     // `source_root`. This avoids the brittleness of computing
@@ -337,6 +370,8 @@ pub async fn run(
             max_retries: DEFAULT_MAX_RETRIES,
             max_parallel: parallel,
             agreed_parallel_tx: Some(agreed_tx),
+            message: message.clone(),
+            text: text.clone(),
         };
 
         let mut set = tokio::task::JoinSet::new();

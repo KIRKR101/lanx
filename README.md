@@ -62,6 +62,24 @@ lanx recv 192.168.1.42:29320 --code 7-cobalt-fox-tundra --out ~/Desktop
 The receiver previews the incoming files and asks for confirmation before it
 writes anything. Use `--accept` or its alias `--yes` to skip that prompt.
 
+Attach a short encrypted note to a file transfer:
+
+```sh
+lanx send *.jpg --message "JPG files attached"
+```
+
+The receiver sees the note with the manifest preview before accepting.
+
+Send text instead of files:
+
+```sh
+lanx send --text "hello from lanx"
+lanx recv <pairing-code> --accept
+```
+
+The receiver prints the text after accepting. Text is limited to 1 MiB and
+messages to 4 KiB; neither is sent before the encrypted session is established.
+
 ## Sending
 
 Send several files and directories in one transfer. Directory names stay in

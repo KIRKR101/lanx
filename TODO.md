@@ -61,7 +61,7 @@
 
 - [ ] Support stdin as a sender input: `lanx send -`.
 - [ ] Support stdout as a receiver output: `lanx recv <code> --stdout`.
-- [ ] Add short text transfer support: `lanx send --text '...'`.
+- [x] Add short text transfer support: `lanx send --text '...'`.
 
 ## Deliberately deferred
 
