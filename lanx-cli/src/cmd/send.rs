@@ -497,6 +497,26 @@ pub async fn run(
             );
             eprintln!();
 
+            // Wait until a receiver pairs (the receiver's first Noise frame)
+            // before the 10 s Noise handshake starts: registration produces
+            // no traffic, so the handshake timeout must not run while
+            // no receiver is there. Bounded by the server's 5-minute
+            // pending TTL.
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(Duration::from_secs(300), stream.peek(&mut probe)).await {
+                Ok(Ok(0)) => {
+                    anyhow::bail!("relay connection closed while waiting for receiver");
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    return Err(anyhow::Error::new(e)
+                        .context("relay connection failed while waiting for receiver"));
+                }
+                Err(_) => {
+                    anyhow::bail!("no receiver connected via relay {relay_addr} within 5 minutes");
+                }
+            }
+
             spawn_stream(
                 &mut set,
                 stream,

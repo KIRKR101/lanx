@@ -423,6 +423,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peek_pends_with_no_data() {
+        // The relay sender waits on `peek()` for pairing bytes; it must not
+        // fire spuriously on an idle connected socket.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (_server, _) = listener.accept().await.expect("accept");
+        let mut probe = [0u8; 1];
+        let fired = tokio::time::timeout(Duration::from_millis(500), client.peek(&mut probe)).await;
+        assert!(fired.is_err(), "peek fired with no data pending");
+    }
+
+    #[tokio::test]
     async fn connect_with_fallback_reaches_local_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
