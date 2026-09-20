@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 
 pub async fn run(relay: Option<String>, relay_receiver: Option<String>, port: u16) -> Result<()> {
     println!("lanx doctor");
@@ -73,23 +73,13 @@ fn resolve_socket_addrs(address: &str) -> Result<Vec<SocketAddr>> {
 }
 
 async fn check_relay_endpoint(role: &str, label: &str, addresses: &[SocketAddr]) {
-    let mut last_error = String::from("connection failed");
-    for address in addresses {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            TcpStream::connect(address),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {
-                println!("OK    relay {role} endpoint reachable: {label}");
-                return;
-            }
-            Ok(Err(error)) => last_error = error.to_string(),
-            Err(_) => last_error = String::from("connection timed out"),
+    // Try every resolved address (IPv4/IPv6 fallback) before reporting.
+    match lanx_net::tcp::connect_addrs(addresses, std::time::Duration::from_secs(3)).await {
+        Ok(_) => println!("OK    relay {role} endpoint reachable: {label}"),
+        Err(error) => {
+            println!("WARN  relay {role} endpoint unreachable: {label}: {error}");
         }
     }
-    println!("WARN  relay {role} endpoint unreachable: {label}: {last_error}");
 }
 
 async fn check_tcp_port(port: u16) {

@@ -387,9 +387,10 @@ pub async fn run(
             );
             eprintln!();
 
-            let mut stream = TcpStream::connect(relay_addr)
-                .await
-                .with_context(|| crate::cmd::relay_connect_hint(relay_addr, "sender"))?;
+            let (mut stream, _) =
+                lanx_net::tcp::connect_with_fallback(relay_addr, Duration::from_secs(10))
+                    .await
+                    .with_context(|| crate::cmd::relay_connect_hint(relay_addr, "sender"))?;
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::debug!(?e, "TCP_NODELAY failed");
             }
