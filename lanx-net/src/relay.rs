@@ -1052,7 +1052,7 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_binds_keep_two_port_mode() {
-        let server = RelayServer::new("127.0.0.1:0".to_string(), "127.0.0.2:0".to_string())
+        let server = RelayServer::new("127.0.0.1:0".to_string(), "0.0.0.0:0".to_string())
             .await
             .expect("bind split");
         assert!(!server.is_unified());
@@ -1153,7 +1153,7 @@ mod tests {
         let sender_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind sender test listener");
-        let receiver_listener = tokio::net::TcpListener::bind("127.0.0.2:0")
+        let receiver_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind receiver test listener");
         let sender_addr = sender_listener.local_addr().expect("sender addr");
