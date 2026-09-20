@@ -38,6 +38,22 @@ pub async fn run(
     check_writable(Path::new("."));
 
     if let Some(relay) = relay {
+        // `--relay auto` checks every fallback route in selection order:
+        // direct (the sender port above already covers it), then the
+        // saved relay, then each public pool entry.
+        if relay.eq_ignore_ascii_case("auto") {
+            for candidate in crate::cmd::auto_relay_candidates(true) {
+                let addresses = resolve_socket_addrs(&candidate).await.unwrap_or_default();
+                check_relay_endpoint("relay", &candidate, &candidate, &addresses, &proxy).await;
+            }
+            if crate::cmd::auto_relay_candidates(true).is_empty() {
+                println!(
+                    "WARN  no saved or public relays configured for --relay auto ({})",
+                    crate::cmd::empty_pool_warning()
+                );
+            }
+            return Ok(());
+        }
         // Resolve asynchronously (DNS + both families); with a proxy the
         // relay hostname stays proxy-side and these addresses are only
         // used to infer the default receiver port.

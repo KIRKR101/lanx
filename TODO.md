@@ -4,23 +4,23 @@
 
 ### Priority 1: reachability
 
-- [ ] Add automatic connection selection: direct LAN discovery, saved relay,
+- [x] Add automatic connection selection: direct LAN discovery, saved relay,
       then a public relay fallback when explicitly enabled.
-- [ ] Add a single-port relay mode before adding fallback transports; preserve
+- [x] Add a single-port relay mode before adding fallback transports; preserve
       the current two-port mode for compatibility during migration.
       - Acceptance: sender and receiver can share one TCP listener without
         ambiguity, and existing two-port relays still work.
-- [ ] Add `--relay auto` as explicit opt-in; do not change the current direct
+- [x] Add `--relay auto` as explicit opt-in; do not change the current direct
       default until relay fallback is proven stable.
       - Selection order: direct discovery, saved relay, then the public pool.
       - An empty public pool means no public fallback; print a clear warning
         and explain how to configure one.
-- [ ] Add a configurable public relay pool, stored in the normal Lanx config
+- [x] Add a configurable public relay pool, stored in the normal Lanx config
       rather than an ad hoc working-directory file.
       - Acceptance: entries support hostnames and ports, invalid entries are
         ignored with a warning, and failed relays are skipped.
-- [ ] Add IPv4/IPv6 fallback for direct and relay connections.
-- [ ] Add SOCKS5 proxy support, including Tor-friendly proxy-side DNS.
+- [x] Add IPv4/IPv6 fallback for direct and relay connections.
+- [x] Add SOCKS5 proxy support, including Tor-friendly proxy-side DNS.
       - Acceptance: both relay control and transfer traffic work through a
         SOCKS5 proxy without requiring local DNS resolution of the relay.
 

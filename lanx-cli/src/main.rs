@@ -34,6 +34,7 @@ enum Command {
     /// Check local networking and relay prerequisites.
     Doctor {
         /// Optional relay address to test (for example 192.168.1.10:53318).
+        /// `auto` checks the saved relay and every public pool entry.
         #[arg(long)]
         relay: Option<String>,
         /// Optional receiver listener address when it is not sender port + 1.
