@@ -218,6 +218,25 @@ enum RelayCommand {
     Clear,
     /// Print the saved relay host.
     Show,
+    /// Manage the public relay pool used by `--relay auto` fallback.
+    /// Entries are unified `host:port` addresses (single-port relays);
+    /// a missing port defaults to 53318.
+    Pool {
+        #[command(subcommand)]
+        action: PoolCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PoolCommand {
+    /// Add a relay to the public pool.
+    Add { addr: String },
+    /// Remove a relay from the public pool.
+    Remove { addr: String },
+    /// List the public pool entries.
+    List,
+    /// Delete all public pool entries.
+    Clear,
 }
 
 fn main() -> Result<()> {
@@ -362,6 +381,12 @@ fn main() -> Result<()> {
                         RelayCommand::Set { host } => cmd::set_relay(host),
                         RelayCommand::Clear => cmd::clear_relay(),
                         RelayCommand::Show => cmd::show_relay(),
+                        RelayCommand::Pool { action } => match action {
+                            PoolCommand::Add { addr } => cmd::add_public_relay(addr),
+                            PoolCommand::Remove { addr } => cmd::remove_public_relay(addr),
+                            PoolCommand::List => cmd::list_public_pool(),
+                            PoolCommand::Clear => cmd::clear_public_pool(),
+                        },
                     };
                 }
                 cmd::relay::run(
