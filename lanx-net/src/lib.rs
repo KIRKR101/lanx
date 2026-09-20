@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod interfaces;
 pub mod pairing;
 pub mod relay;
+pub mod socks;
 pub mod tcp;
 
 pub use discovery::{

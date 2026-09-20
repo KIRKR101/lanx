@@ -42,6 +42,10 @@ enum Command {
         /// Sender TCP port to check.
         #[arg(long, default_value_t = lanx_net::tcp::DEFAULT_SEND_PORT)]
         port: u16,
+        /// SOCKS5 proxy for relay checks (socks5://[user[:pass]@]host:port).
+        /// Also read from `LANX_PROXY`. Relay hostnames resolve proxy-side.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Send one or more files/directories.
     Send {
@@ -114,6 +118,14 @@ enum Command {
         /// is only valid for direct transfers on trusted networks.
         #[arg(long)]
         allow_insecure_direct: bool,
+        /// SOCKS5 proxy for relay traffic
+        /// (socks5://[user[:pass]@]host:port, e.g. Tor at
+        /// 127.0.0.1:9050). Also read from `LANX_PROXY`. Relay control
+        /// and transfer traffic both go through it; relay hostnames
+        /// resolve proxy-side, never via local DNS. Direct transfers
+        /// ignore it.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Receive files.
     Recv {
@@ -178,6 +190,14 @@ enum Command {
         /// the sender's value.
         #[arg(long)]
         psk: Option<String>,
+        /// SOCKS5 proxy for relay traffic
+        /// (socks5://[user[:pass]@]host:port, e.g. Tor at
+        /// 127.0.0.1:9050). Also read from `LANX_PROXY`. Relay control
+        /// and transfer traffic both go through it; relay hostnames
+        /// resolve proxy-side, never via local DNS. Direct transfers
+        /// ignore it.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Run a relay server that bridges sender and receiver connections.
     Relay {
@@ -284,7 +304,11 @@ fn main() -> Result<()> {
                 relay,
                 relay_receiver,
                 port,
-            } => doctor::run(relay, relay_receiver, port).await,
+                proxy,
+            } => {
+                let proxy = cmd::resolve_proxy(proxy)?;
+                doctor::run(relay, relay_receiver, port, proxy).await
+            }
             Command::Send {
                 paths,
                 text,
@@ -303,8 +327,10 @@ fn main() -> Result<()> {
                 code_words,
                 psk,
                 allow_insecure_direct,
+                proxy,
             } => {
                 let relay = cmd::resolve_relay(relay, false)?;
+                let proxy = cmd::resolve_proxy(proxy)?;
                 cmd::send::run(
                     paths,
                     text,
@@ -324,6 +350,7 @@ fn main() -> Result<()> {
                     code_words,
                     psk,
                     allow_insecure_direct,
+                    proxy,
                 )
                 .await
             }
@@ -344,8 +371,10 @@ fn main() -> Result<()> {
                 parallel,
                 relay,
                 psk,
+                proxy,
             } => {
                 let relay = cmd::resolve_relay(relay, true)?;
+                let proxy = cmd::resolve_proxy(proxy)?;
                 cmd::recv::run(cmd::recv::RecvOptions {
                     target,
                     code,
@@ -363,6 +392,7 @@ fn main() -> Result<()> {
                     parallel,
                     relay,
                     psk,
+                    proxy,
                 })
                 .await
             }

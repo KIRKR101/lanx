@@ -28,7 +28,7 @@ pub enum TcpError {
 
 /// Split a `host:port` target into its host and port parts. Accepts
 /// `host:port`, IPv4 `ip:port`, and bracketed `[v6]:port` forms.
-fn split_host_port(target: &str) -> Result<(&str, u16), std::io::Error> {
+pub fn split_host_port(target: &str) -> Result<(&str, u16), std::io::Error> {
     let target = target.trim();
     if let Some(rest) = target.strip_prefix('[') {
         let (host, port) = rest.split_once("]:").ok_or_else(|| {

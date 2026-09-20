@@ -109,6 +109,7 @@ pub async fn run(
     code_words: u8,
     psk_opt: Option<String>,
     allow_insecure_direct: bool,
+    proxy: Option<lanx_net::socks::Socks5Config>,
 ) -> Result<()> {
     if paths.is_empty() && text.is_none() {
         anyhow::bail!("provide at least one path or use --text");
@@ -387,8 +388,8 @@ pub async fn run(
             );
             eprintln!();
 
-            let (mut stream, _) =
-                lanx_net::tcp::connect_with_fallback(relay_addr, Duration::from_secs(10))
+            let mut stream =
+                lanx_net::socks::dial_relay(relay_addr, proxy.as_ref(), Duration::from_secs(10))
                     .await
                     .with_context(|| crate::cmd::relay_connect_hint(relay_addr, "sender"))?;
             if let Err(e) = stream.set_nodelay(true) {

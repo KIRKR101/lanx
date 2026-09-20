@@ -129,6 +129,7 @@ const RERESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8)
 struct TryOnceConfig {
     addr: std::net::SocketAddr,
     relay_addr: Option<String>,
+    proxy: Option<lanx_net::socks::Socks5Config>,
     code_hash: Option<[u8; 32]>,
     handshake_psk: Option<[u8; 32]>,
     /// True when `--code` was given for an `ip:port` target. A handshake
@@ -170,6 +171,7 @@ pub struct RecvOptions {
     pub parallel: u16,
     pub relay: Option<String>,
     pub psk: Option<String>,
+    pub proxy: Option<lanx_net::socks::Socks5Config>,
 }
 
 pub async fn run(opts: RecvOptions) -> Result<()> {
@@ -190,6 +192,7 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
         parallel,
         relay,
         psk,
+        proxy,
     } = opts;
     let overwrite_policy = resolve_policy(overwrite, skip_existing, rename_existing, on_conflict)?;
     // `--json` and `--quiet` suppress informational stderr; warnings and
@@ -255,12 +258,12 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
         _ => None,
     };
 
-    // Determine the actual address to connect to.
+    // Determine the actual address to connect to. Relay targets stay as
+    // `host:port` strings: they resolve at dial time (IPv4/IPv6 fallback,
+    // or proxy-side DNS when a proxy is set), so hostnames work here.
     let (addr, relay_addr) = if let Some(ref relay_addr) = relay {
-        // Relay mode: connect to the relay server.
-        let addr: std::net::SocketAddr = relay_addr
-            .parse()
-            .with_context(|| format!("invalid relay address: {relay_addr}"))?;
+        // Relay mode: the relay address dials at `try_once` time.
+        let addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("placeholder addr");
         (addr, Some(relay_addr.clone()))
     } else {
         // Direct mode: resolve the target address.
@@ -329,6 +332,7 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
     let mut try_cfg = TryOnceConfig {
         addr,
         relay_addr: relay_addr.clone(),
+        proxy: proxy.clone(),
         code_hash,
         handshake_psk,
         addr_target_with_code,
@@ -526,10 +530,19 @@ async fn try_once(
     cfg: &TryOnceConfig,
     connection_index: u16,
 ) -> Result<lanx_core::transfer::receiver::ReceiverReport> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&cfg.addr))
-        .await
-        .with_context(|| firewall_hint(cfg))?
-        .with_context(|| firewall_hint(cfg))?;
+    // Relay targets (control + transfer share one stream) dial with
+    // IPv4/IPv6 fallback, or through the SOCKS5 proxy with proxy-side
+    // DNS so the relay hostname never needs local resolution.
+    let mut stream = if let Some(target) = &cfg.relay_addr {
+        lanx_net::socks::dial_relay(target, cfg.proxy.as_ref(), CONNECT_TIMEOUT)
+            .await
+            .with_context(|| firewall_hint(cfg))?
+    } else {
+        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&cfg.addr))
+            .await
+            .with_context(|| firewall_hint(cfg))?
+            .with_context(|| firewall_hint(cfg))?
+    };
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(?e, "TCP_NODELAY failed");
     }

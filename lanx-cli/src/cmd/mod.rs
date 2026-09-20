@@ -320,6 +320,24 @@ pub fn relay_auth_token() -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
+/// Resolve the SOCKS5 proxy: explicit `--proxy` wins, otherwise the
+/// `LANX_PROXY` env var when set and non-empty. Accepts
+/// `socks5://[user[:pass]@]host:port` (or `socks5h://`, same behavior)
+/// and bare `host:port`. Returns `None` for direct connections.
+pub fn resolve_proxy(opt: Option<String>) -> anyhow::Result<Option<lanx_net::socks::Socks5Config>> {
+    let raw = match opt {
+        Some(value) if !value.is_empty() => value,
+        Some(_) => return Ok(None),
+        None => match std::env::var("LANX_PROXY") {
+            Ok(value) if !value.is_empty() => value,
+            _ => return Ok(None),
+        },
+    };
+    lanx_net::socks::parse_socks5_proxy(&raw)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("invalid proxy {raw:?}: {e}"))
+}
+
 pub fn relay_connect_hint(relay: &str, role: &str) -> String {
     format!(
         "connect to relay {relay} ({role} endpoint) failed; verify `lanx relay` is running \
@@ -428,5 +446,18 @@ mod tests {
     fn missing_pool_file_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(load_pool_from(&dir.path().join("absent")).is_empty());
+    }
+
+    #[test]
+    fn proxy_parsing_accepts_urls_and_bare_endpoints() {
+        let cfg = resolve_proxy(Some("socks5://127.0.0.1:9050".to_string())).expect("url");
+        assert_eq!(
+            cfg.expect("some").proxy_target,
+            "127.0.0.1:9050".to_string()
+        );
+        let cfg = resolve_proxy(Some("127.0.0.1:9050".to_string())).expect("bare");
+        assert!(cfg.is_some());
+        assert!(resolve_proxy(Some(String::new())).expect("empty").is_none());
+        assert!(resolve_proxy(Some("http://proxy:1080".to_string())).is_err());
     }
 }
