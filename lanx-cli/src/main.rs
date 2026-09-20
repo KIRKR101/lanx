@@ -34,6 +34,7 @@ enum Command {
     /// Check local networking and relay prerequisites.
     Doctor {
         /// Optional relay address to test (for example 192.168.1.10:53318).
+        /// `auto` checks the saved relay and every public pool entry.
         #[arg(long)]
         relay: Option<String>,
         /// Optional receiver listener address when it is not sender port + 1.
@@ -42,6 +43,10 @@ enum Command {
         /// Sender TCP port to check.
         #[arg(long, default_value_t = lanx_net::tcp::DEFAULT_SEND_PORT)]
         port: u16,
+        /// SOCKS5 proxy for relay checks (socks5://[user[:pass]@]host:port).
+        /// Also read from `LANX_PROXY`. Relay hostnames resolve proxy-side.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Send one or more files/directories.
     Send {
@@ -97,6 +102,9 @@ enum Command {
         parallel: u16,
         /// Connect to a relay server instead of listening directly.
         /// The argument is the relay's sender-bind address (e.g. "192.168.1.100:53318").
+        /// `--relay auto` offers direct discovery, the saved relay, then
+        /// the public pool (`lanx relay pool add <host:port>`), in order.
+        /// The default stays direct-only; auto is the explicit opt-in.
         #[arg(long, num_args = 0..=1)]
         relay: Option<Option<String>>,
         /// Number of words in the pairing code (2-5, default 3).
@@ -114,6 +122,14 @@ enum Command {
         /// is only valid for direct transfers on trusted networks.
         #[arg(long)]
         allow_insecure_direct: bool,
+        /// SOCKS5 proxy for relay traffic
+        /// (socks5://[user[:pass]@]host:port, e.g. Tor at
+        /// 127.0.0.1:9050). Also read from `LANX_PROXY`. Relay control
+        /// and transfer traffic both go through it; relay hostnames
+        /// resolve proxy-side, never via local DNS. Direct transfers
+        /// ignore it.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Receive files.
     Recv {
@@ -171,6 +187,9 @@ enum Command {
         parallel: u16,
         /// Connect through a relay server instead of direct connection.
         /// The argument is the relay's receiver-bind address (e.g. "192.168.1.100:53319").
+        /// `--relay auto` tries direct discovery, the saved relay, then
+        /// the public pool (`lanx relay pool add <host:port>`), in order.
+        /// The default stays direct-only; auto is the explicit opt-in.
         #[arg(long, num_args = 0..=1)]
         relay: Option<Option<String>>,
         /// Extra passphrase strengthening the Noise handshake PSK.
@@ -178,15 +197,26 @@ enum Command {
         /// the sender's value.
         #[arg(long)]
         psk: Option<String>,
+        /// SOCKS5 proxy for relay traffic
+        /// (socks5://[user[:pass]@]host:port, e.g. Tor at
+        /// 127.0.0.1:9050). Also read from `LANX_PROXY`. Relay control
+        /// and transfer traffic both go through it; relay hostnames
+        /// resolve proxy-side, never via local DNS. Direct transfers
+        /// ignore it.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Run a relay server that bridges sender and receiver connections.
     Relay {
         #[command(subcommand)]
         action: Option<RelayCommand>,
-        /// Address to listen on for sender connections.
+        /// Address to listen on for sender connections. Pass the same
+        /// value as `--receiver-bind` for single-port mode: one listener
+        /// serves both roles, dispatched by the client's hello.
         #[arg(long, default_value = "0.0.0.0:53318")]
         sender_bind: String,
-        /// Address to listen on for receiver connections.
+        /// Address to listen on for receiver connections. Pass the same
+        /// value as `--sender-bind` for single-port mode.
         #[arg(long, default_value = "0.0.0.0:53319")]
         receiver_bind: String,
         /// Maximum number of active paired sessions.
@@ -215,6 +245,25 @@ enum RelayCommand {
     Clear,
     /// Print the saved relay host.
     Show,
+    /// Manage the public relay pool used by `--relay auto` fallback.
+    /// Entries are unified `host:port` addresses (single-port relays);
+    /// a missing port defaults to 53318.
+    Pool {
+        #[command(subcommand)]
+        action: PoolCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PoolCommand {
+    /// Add a relay to the public pool.
+    Add { addr: String },
+    /// Remove a relay from the public pool.
+    Remove { addr: String },
+    /// List the public pool entries.
+    List,
+    /// Delete all public pool entries.
+    Clear,
 }
 
 fn main() -> Result<()> {
@@ -262,7 +311,11 @@ fn main() -> Result<()> {
                 relay,
                 relay_receiver,
                 port,
-            } => doctor::run(relay, relay_receiver, port).await,
+                proxy,
+            } => {
+                let proxy = cmd::resolve_proxy(proxy)?;
+                doctor::run(relay, relay_receiver, port, proxy).await
+            }
             Command::Send {
                 paths,
                 text,
@@ -281,8 +334,10 @@ fn main() -> Result<()> {
                 code_words,
                 psk,
                 allow_insecure_direct,
+                proxy,
             } => {
-                let relay = cmd::resolve_relay(relay, false)?;
+                let relay = cmd::resolve_relay_mode(relay, false)?;
+                let proxy = cmd::resolve_proxy(proxy)?;
                 cmd::send::run(
                     paths,
                     text,
@@ -302,6 +357,7 @@ fn main() -> Result<()> {
                     code_words,
                     psk,
                     allow_insecure_direct,
+                    proxy,
                 )
                 .await
             }
@@ -322,8 +378,10 @@ fn main() -> Result<()> {
                 parallel,
                 relay,
                 psk,
+                proxy,
             } => {
-                let relay = cmd::resolve_relay(relay, true)?;
+                let relay = cmd::resolve_relay_mode(relay, true)?;
+                let proxy = cmd::resolve_proxy(proxy)?;
                 cmd::recv::run(cmd::recv::RecvOptions {
                     target,
                     code,
@@ -341,6 +399,7 @@ fn main() -> Result<()> {
                     parallel,
                     relay,
                     psk,
+                    proxy,
                 })
                 .await
             }
@@ -359,6 +418,12 @@ fn main() -> Result<()> {
                         RelayCommand::Set { host } => cmd::set_relay(host),
                         RelayCommand::Clear => cmd::clear_relay(),
                         RelayCommand::Show => cmd::show_relay(),
+                        RelayCommand::Pool { action } => match action {
+                            PoolCommand::Add { addr } => cmd::add_public_relay(addr),
+                            PoolCommand::Remove { addr } => cmd::remove_public_relay(addr),
+                            PoolCommand::List => cmd::list_public_pool(),
+                            PoolCommand::Clear => cmd::clear_public_pool(),
+                        },
                     };
                 }
                 cmd::relay::run(

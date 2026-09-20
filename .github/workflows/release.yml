@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -33,6 +34,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - name: Verify release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != v* ]]; then
+            echo "Release builds must run from a v* tag, not $GITHUB_REF_NAME." >&2
+            exit 1
+          fi
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked
 

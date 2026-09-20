@@ -129,6 +129,7 @@ const RERESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8)
 struct TryOnceConfig {
     addr: std::net::SocketAddr,
     relay_addr: Option<String>,
+    proxy: Option<lanx_net::socks::Socks5Config>,
     code_hash: Option<[u8; 32]>,
     handshake_psk: Option<[u8; 32]>,
     /// True when `--code` was given for an `ip:port` target. A handshake
@@ -168,8 +169,9 @@ pub struct RecvOptions {
     pub retry_forever: bool,
     pub discovery_timeout: Duration,
     pub parallel: u16,
-    pub relay: Option<String>,
+    pub relay: crate::cmd::RelayMode,
     pub psk: Option<String>,
+    pub proxy: Option<lanx_net::socks::Socks5Config>,
 }
 
 pub async fn run(opts: RecvOptions) -> Result<()> {
@@ -190,6 +192,7 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
         parallel,
         relay,
         psk,
+        proxy,
     } = opts;
     let overwrite_policy = resolve_policy(overwrite, skip_existing, rename_existing, on_conflict)?;
     // `--json` and `--quiet` suppress informational stderr; warnings and
@@ -212,12 +215,24 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
     }
 
     let parsed = parse_target(&target).context("parse target")?;
-    if relay.is_some() && !matches!(parsed, Target::Code(_)) {
+    if !matches!(relay, crate::cmd::RelayMode::Direct) && !matches!(parsed, Target::Code(_)) {
         bail!("--relay requires a pairing code (e.g. 7-cobalt-fox-tundra), not an ip:port address");
     }
     let passphrase = crate::cmd::resolve_passphrase(psk);
-    if let Some(ref relay_addr) = relay {
-        crate::cmd::warn_if_public_relay(relay_addr);
+    match &relay {
+        crate::cmd::RelayMode::Explicit(relay_addr) => {
+            crate::cmd::warn_if_public_relay(relay_addr);
+        }
+        crate::cmd::RelayMode::Auto => {
+            if human {
+                eprintln!(
+                    "  {} {}",
+                    ui::dim("mode"),
+                    ui::bold("auto: direct, saved relay, public pool"),
+                );
+            }
+        }
+        crate::cmd::RelayMode::Direct => {}
     }
     // Pairing ID + PSK from the target code or `--code` (see
     // `resolve_handshake_psk`). Bare `ip:port` stays unauthenticated.
@@ -249,48 +264,63 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
     // onto another port (stable port occupied, --port changed), which
     // would otherwise leave the retry loop chasing a stale SocketAddr
     // forever. Target::Addr retries the same address; Target::Code
-    // re-resolves before each retry after the first.
+    // re-resolves before each retry after the first. (`--relay auto`
+    // consumes the clone below; the Direct arm may move `parsed`.)
     let code_for_rediscovery: Option<String> = match &parsed {
         Target::Code(code) => Some(code.clone()),
         _ => None,
     };
+    let auto_code: Option<String> = code_for_rediscovery.clone();
 
-    // Determine the actual address to connect to.
-    let (addr, relay_addr) = if let Some(ref relay_addr) = relay {
-        // Relay mode: connect to the relay server.
-        let addr: std::net::SocketAddr = relay_addr
-            .parse()
-            .with_context(|| format!("invalid relay address: {relay_addr}"))?;
-        (addr, Some(relay_addr.clone()))
-    } else {
-        // Direct mode: resolve the target address.
-        let needs_discovery = matches!(parsed, Target::Code(_));
-        let addr = if needs_discovery {
-            let s = ui::spinner(&format!("looking for sender{}", ui::ellipsis()));
-            let r = resolve_target(parsed, discovery_timeout).await;
-            s.finish_and_clear();
-            r.context("resolve target")?
-        } else {
-            resolve_target(parsed, discovery_timeout)
-                .await
-                .context("resolve target")?
-        };
-        (addr, None)
+    // Determine the actual address to connect to. Relay targets stay as
+    // `host:port` strings: they resolve at dial time (IPv4/IPv6 fallback,
+    // or proxy-side DNS when a proxy is set), so hostnames work here.
+    // (`--relay auto` resolves its own routes per attempt below; the
+    // placeholders here are unused on that path.)
+    let (addr, relay_addr) = match &relay {
+        crate::cmd::RelayMode::Explicit(relay_addr) => {
+            // Relay mode: the relay address dials at `try_once` time.
+            let addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("placeholder addr");
+            (addr, Some(relay_addr.clone()))
+        }
+        crate::cmd::RelayMode::Auto => {
+            let addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("placeholder addr");
+            (addr, None)
+        }
+        crate::cmd::RelayMode::Direct => {
+            // Direct mode: resolve the target address.
+            let needs_discovery = matches!(parsed, Target::Code(_));
+            let addr = if needs_discovery {
+                let s = ui::spinner(&format!("looking for sender{}", ui::ellipsis()));
+                let r = resolve_target(parsed, discovery_timeout).await;
+                s.finish_and_clear();
+                r.context("resolve target")?
+            } else {
+                resolve_target(parsed, discovery_timeout)
+                    .await
+                    .context("resolve target")?
+            };
+            (addr, None)
+        }
     };
 
-    if let Some(ref ra) = relay_addr {
-        if human {
-            eprintln!("  {} {} {}", ui::dim("relay"), ui::arrow(), ui::bold(ra));
+    // `--relay auto` prints its own per-route lines in `run_auto_recv`;
+    // the placeholders above must never surface here.
+    if !matches!(relay, crate::cmd::RelayMode::Auto) {
+        if let Some(ref ra) = relay_addr {
+            if human {
+                eprintln!("  {} {} {}", ui::dim("relay"), ui::arrow(), ui::bold(ra));
+            }
+        } else if human {
+            eprintln!(
+                "  {} found sender  {}",
+                ui::green(ui::ok_sym()),
+                ui::dim(&addr.to_string()),
+            );
         }
-    } else if human {
-        eprintln!(
-            "  {} found sender  {}",
-            ui::green(ui::ok_sym()),
-            ui::dim(&addr.to_string()),
-        );
-    }
-    if human {
-        eprintln!();
+        if human {
+            eprintln!();
+        }
     }
 
     let progress: Arc<dyn Progress> = if json {
@@ -322,6 +352,37 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
     };
 
     let parallel = parallel.max(1);
+    // `--relay auto` selects routes in order: direct discovery, saved
+    // relay, then the public pool. The default stays direct-only; auto
+    // is the explicit opt-in.
+    if matches!(relay, crate::cmd::RelayMode::Auto) {
+        let Some(code) = auto_code else {
+            bail!("--relay auto requires a pairing code (e.g. 7-cobalt-fox-tundra), not an ip:port address");
+        };
+        return run_auto_recv(AutoRecvParams {
+            code,
+            code_hash,
+            handshake_psk,
+            out: out.clone(),
+            approver,
+            progress,
+            overwrite_policy,
+            dry_run,
+            json,
+            quiet,
+            human,
+            retry_forever,
+            discovery_timeout,
+            parallel,
+            proxy,
+        })
+        .await;
+    }
+    let relay: Option<String> = match relay {
+        crate::cmd::RelayMode::Explicit(address) => Some(address),
+        crate::cmd::RelayMode::Direct => None,
+        crate::cmd::RelayMode::Auto => unreachable!("auto returns above"),
+    };
     crate::cmd::validate_parallel_relay(parallel, &relay)?;
     let max_attempts: u32 = if retry_forever { u32::MAX } else { 5 };
     let mut attempt: u32 = 0;
@@ -329,6 +390,7 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
     let mut try_cfg = TryOnceConfig {
         addr,
         relay_addr: relay_addr.clone(),
+        proxy: proxy.clone(),
         code_hash,
         handshake_psk,
         addr_target_with_code,
@@ -377,90 +439,10 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
                 }
             }
         }
-        let mut set = tokio::task::JoinSet::new();
-        // Spawn connection 0
-        {
-            let cfg = try_cfg.clone();
-            set.spawn(async move { try_once(&cfg, 0).await });
-        }
-
-        // Wait to negotiate parallelism on connection 0. If it fails or exits early,
-        // we fallback to agreed_parallel = 1.
-        let mut first_task_result: Option<Result<lanx_core::transfer::receiver::ReceiverReport>> =
-            None;
-        let agreed_parallel = tokio::select! {
-            Some(p) = agreed_rx.recv() => p,
-            res = set.join_next() => {
-                if let Some(r) = res {
-                    // Flatten JoinError -> anyhow::Error so aggregate_reports gets the right type.
-                    first_task_result = Some(r.context("connection task panicked").and_then(|x| x));
-                }
-                1
-            }
-        };
-
-        // If agreed_parallel > 1, spawn connections 1..agreed_parallel
-        if agreed_parallel > 1 {
-            for i in 1..agreed_parallel {
-                let mut cfg = try_cfg.clone();
-                // Avoid sending additional agreed_parallel notifications on extra connections
-                cfg.agreed_parallel_tx = None;
-                set.spawn(async move { try_once(&cfg, i).await });
-            }
-        }
-
-        let result = aggregate_reports(set, first_task_result).await;
+        let result = attempt_transfer(&try_cfg, &mut agreed_rx).await;
         match result {
             Ok(report) => {
-                if report.rejected {
-                    if dry_run {
-                        if json {
-                            progress.summary(0, 0, 0);
-                        }
-                        if human {
-                            eprintln!();
-                            eprintln!(
-                                "  {} {}",
-                                ui::dim("dry run complete:"),
-                                ui::dim("no files were written"),
-                            );
-                        }
-                        return Ok(());
-                    }
-                    if json {
-                        progress.summary(0, 0, 0);
-                    }
-                    eprintln!();
-                    eprintln!(
-                        "  {} {}",
-                        ui::red(ui::fail_sym()),
-                        ui::red("transfer declined"),
-                    );
-                    bail!("transfer declined by user");
-                }
-                if let Some(message) = report.message.as_deref() {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({"event": "message", "message": message})
-                        );
-                    } else if !quiet {
-                        eprintln!("  {} {}", ui::dim("message"), ui::bold(&safe_text(message)));
-                    }
-                }
-                if let Some(text) = report.text.as_deref() {
-                    if json {
-                        println!("{}", serde_json::json!({"event": "text", "text": text}));
-                    } else {
-                        println!("{text}");
-                    }
-                }
-                // `summary` prints the styled completion line.
-                progress.summary(report.verified, report.failed, report.skipped);
-                if report.failed == 0 {
-                    return Ok(());
-                }
-                bail!("{} file(s) failed verification", report.failed);
+                return finish_report(&report, &progress, dry_run, json, quiet, human);
             }
             Err(e) => {
                 eprintln!(
@@ -491,6 +473,377 @@ pub async fn run(opts: RecvOptions) -> Result<()> {
                 );
                 tokio::time::sleep(backoff).await;
             }
+        }
+    }
+}
+
+/// Run one transfer attempt: connection 0, parallelism negotiation,
+/// extra connections, then the aggregated report. Shared by the normal
+/// retry loop and every `--relay auto` route.
+async fn attempt_transfer(
+    try_cfg: &TryOnceConfig,
+    agreed_rx: &mut tokio::sync::mpsc::UnboundedReceiver<u16>,
+) -> Result<lanx_core::transfer::receiver::ReceiverReport> {
+    let mut set = tokio::task::JoinSet::new();
+    // Spawn connection 0
+    {
+        let cfg = try_cfg.clone();
+        set.spawn(async move { try_once(&cfg, 0).await });
+    }
+
+    // Wait to negotiate parallelism on connection 0. If it fails or exits early,
+    // we fallback to agreed_parallel = 1.
+    let mut first_task_result: Option<Result<lanx_core::transfer::receiver::ReceiverReport>> = None;
+    let agreed_parallel = tokio::select! {
+        Some(p) = agreed_rx.recv() => p,
+        res = set.join_next() => {
+            if let Some(r) = res {
+                // Flatten JoinError -> anyhow::Error so aggregate_reports gets the right type.
+                first_task_result = Some(r.context("connection task panicked").and_then(|x| x));
+            }
+            1
+        }
+    };
+
+    // If agreed_parallel > 1, spawn connections 1..agreed_parallel
+    if agreed_parallel > 1 {
+        for i in 1..agreed_parallel {
+            let mut cfg = try_cfg.clone();
+            // Avoid sending additional agreed_parallel notifications on extra connections
+            cfg.agreed_parallel_tx = None;
+            set.spawn(async move { try_once(&cfg, i).await });
+        }
+    }
+
+    aggregate_reports(set, first_task_result).await
+}
+
+/// Handle a completed transfer report: dry-run/declined paths, message
+/// and text output, and the final summary. Shared by the normal retry
+/// loop and `--relay auto` (a route that connects runs to completion;
+///
+/// only connection failures fall through to the next route).
+fn finish_report(
+    report: &lanx_core::transfer::receiver::ReceiverReport,
+    progress: &Arc<dyn Progress>,
+    dry_run: bool,
+    json: bool,
+    quiet: bool,
+    human: bool,
+) -> Result<()> {
+    if report.rejected {
+        if dry_run {
+            if json {
+                progress.summary(0, 0, 0);
+            }
+            if human {
+                eprintln!();
+                eprintln!(
+                    "  {} {}",
+                    ui::dim("dry run complete:"),
+                    ui::dim("no files were written"),
+                );
+            }
+            return Ok(());
+        }
+        if json {
+            progress.summary(0, 0, 0);
+        }
+        eprintln!();
+        eprintln!(
+            "  {} {}",
+            ui::red(ui::fail_sym()),
+            ui::red("transfer declined"),
+        );
+        bail!("transfer declined by user");
+    }
+    if let Some(message) = report.message.as_deref() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"event": "message", "message": message})
+            );
+        } else if !quiet {
+            eprintln!("  {} {}", ui::dim("message"), ui::bold(&safe_text(message)));
+        }
+    }
+    if let Some(text) = report.text.as_deref() {
+        if json {
+            println!("{}", serde_json::json!({"event": "text", "text": text}));
+        } else {
+            println!("{text}");
+        }
+    }
+    // `summary` prints the styled completion line.
+    progress.summary(report.verified, report.failed, report.skipped);
+    if report.failed == 0 {
+        return Ok(());
+    }
+    bail!("{} file(s) failed verification", report.failed);
+}
+
+/// Parameters for one `--relay auto` receiver run.
+struct AutoRecvParams {
+    code: String,
+    code_hash: Option<[u8; 32]>,
+    handshake_psk: Option<[u8; 32]>,
+    out: PathBuf,
+    approver: Arc<dyn ManifestApprover>,
+    progress: Arc<dyn Progress>,
+    overwrite_policy: OverwritePolicy,
+    dry_run: bool,
+    json: bool,
+    quiet: bool,
+    human: bool,
+    retry_forever: bool,
+    discovery_timeout: Duration,
+    parallel: u16,
+    proxy: Option<lanx_net::socks::Socks5Config>,
+}
+
+/// `--relay auto` receiver: try direct discovery, then the saved relay,
+/// then each public pool entry, in that order. The first route that
+/// connects runs to completion; only connection failures fall through.
+/// Every attempted route reports why it failed, and the final error
+/// names the next actionable setup step.
+async fn run_auto_recv(params: AutoRecvParams) -> Result<()> {
+    let AutoRecvParams {
+        code,
+        code_hash,
+        handshake_psk,
+        out,
+        approver,
+        progress,
+        overwrite_policy,
+        dry_run,
+        json,
+        quiet,
+        human,
+        retry_forever,
+        discovery_timeout,
+        parallel,
+        proxy,
+    } = params;
+
+    let saved: Option<String> = crate::cmd::saved_relay_for_auto();
+    let pool = crate::cmd::load_public_pool();
+    if pool.is_empty() && human {
+        eprintln!(
+            "  {} {}",
+            ui::yellow("!"),
+            ui::yellow(&crate::cmd::empty_pool_warning()),
+        );
+        eprintln!();
+    }
+
+    // Relay routes are single-connection: the relay pairs one sender
+    // with one receiver per code, so parallel extras would wait out the
+    // pairing window and fail. Direct keeps the requested parallelism.
+    let relay_parallel = 1u16;
+    let max_attempts: u32 = if retry_forever { u32::MAX } else { 5 };
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let mut failures: Vec<String> = Vec::new();
+
+        // Route 1: direct LAN discovery.
+        let direct_addr = {
+            let s = ui::spinner(&format!("looking for sender{}", ui::ellipsis()));
+            let r = resolve_target(Target::Code(code.clone()), discovery_timeout).await;
+            s.finish_and_clear();
+            match r {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    let reason = format!("direct discovery failed ({e})");
+                    eprintln!("  {} {}", ui::dim("route"), ui::dim(&reason));
+                    failures.push(reason);
+                    None
+                }
+            }
+        };
+        if let Some(addr) = direct_addr {
+            if human {
+                eprintln!(
+                    "  {} {} {}",
+                    ui::dim("route"),
+                    ui::arrow(),
+                    ui::bold(&format!("direct {addr}")),
+                );
+            }
+            let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
+            let cfg = TryOnceConfig {
+                addr,
+                relay_addr: None,
+                proxy: None,
+                code_hash,
+                handshake_psk,
+                addr_target_with_code: false,
+                out: out.clone(),
+                approver: approver.clone(),
+                progress: progress.clone(),
+                parallel,
+                overwrite_policy,
+                agreed_parallel_tx: Some(agreed_tx),
+            };
+            match attempt_transfer(&cfg, &mut agreed_rx).await {
+                Ok(report) => {
+                    return finish_report(&report, &progress, dry_run, json, quiet, human);
+                }
+                Err(e) => {
+                    let reason = format!("direct route failed ({e:#})");
+                    eprintln!(
+                        "  {} {} {}",
+                        ui::red(ui::fail_sym()),
+                        ui::dim("route"),
+                        ui::red(&reason),
+                    );
+                    failures.push(reason);
+                }
+            }
+        }
+
+        // Route 2: saved relay, if one is configured.
+        if let Some(saved_addr) = &saved {
+            match try_auto_relay(
+                saved_addr,
+                "saved relay",
+                code_hash,
+                handshake_psk,
+                &out,
+                &approver,
+                &progress,
+                overwrite_policy,
+                relay_parallel,
+                &proxy,
+                human,
+            )
+            .await
+            {
+                Ok(Some(report)) => {
+                    return finish_report(&report, &progress, dry_run, json, quiet, human);
+                }
+                Ok(None) => {}
+                Err(e) => failures.push(e),
+            }
+        } else if human {
+            eprintln!(
+                "  {} {}",
+                ui::dim("route"),
+                ui::dim("no saved relay (`lanx relay set <host>` to add one)"),
+            );
+        }
+
+        // Route 3: public pool entries in order; failed relays are
+        // skipped with a warning, invalid entries never reach us
+        // (`load_public_pool` already filtered them).
+        for entry in &pool {
+            match try_auto_relay(
+                entry,
+                "public relay",
+                code_hash,
+                handshake_psk,
+                &out,
+                &approver,
+                &progress,
+                overwrite_policy,
+                relay_parallel,
+                &proxy,
+                human,
+            )
+            .await
+            {
+                Ok(Some(report)) => {
+                    return finish_report(&report, &progress, dry_run, json, quiet, human);
+                }
+                Ok(None) => {}
+                Err(e) => failures.push(e),
+            }
+        }
+
+        if attempt >= max_attempts {
+            eprintln!("  {} {}", ui::red(ui::fail_sym()), ui::red("giving up"));
+            anyhow::bail!(
+                "automatic connection failed after {attempt} attempt(s): {}; \
+                 next: make sure the sender is running with the same code and `--relay auto`, \
+                 check firewalls for UDP 53317, or configure a reachable relay \
+                 (`lanx relay set <host>` / `lanx relay pool add <host:port>`)",
+                failures.join("; ")
+            );
+        }
+        let backoff = Duration::from_secs((1u64 << attempt.min(4)).min(8));
+        let max_label = if retry_forever {
+            String::from("∞")
+        } else {
+            max_attempts.to_string()
+        };
+        eprintln!(
+            "  {} {} {}/{} {} {}s{}",
+            ui::yellow(ui::retry_sym()),
+            ui::dim("retry"),
+            attempt,
+            max_label,
+            ui::dim("in"),
+            backoff.as_secs(),
+            ui::ellipsis(),
+        );
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// Try one relay route for `--relay auto`. Returns `Ok(Some(report))`
+/// when the route connected and the transfer completed, `Ok(None)` when
+/// the route was skipped, and `Err(reason)` when it failed (the caller
+/// records the reason and tries the next route).
+#[allow(clippy::too_many_arguments)]
+async fn try_auto_relay(
+    relay_addr: &str,
+    kind: &str,
+    code_hash: Option<[u8; 32]>,
+    handshake_psk: Option<[u8; 32]>,
+    out: &Path,
+    approver: &Arc<dyn ManifestApprover>,
+    progress: &Arc<dyn Progress>,
+    overwrite_policy: OverwritePolicy,
+    parallel: u16,
+    proxy: &Option<lanx_net::socks::Socks5Config>,
+    human: bool,
+) -> Result<Option<lanx_core::transfer::receiver::ReceiverReport>, String> {
+    if human {
+        eprintln!(
+            "  {} {} {} ({})",
+            ui::dim("route"),
+            ui::arrow(),
+            ui::bold(relay_addr),
+            kind,
+        );
+    }
+    crate::cmd::warn_if_public_relay(relay_addr);
+    let addr: std::net::SocketAddr = "0.0.0.0:0".parse().expect("placeholder addr");
+    let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cfg = TryOnceConfig {
+        addr,
+        relay_addr: Some(relay_addr.to_string()),
+        proxy: proxy.clone(),
+        code_hash,
+        handshake_psk,
+        addr_target_with_code: false,
+        out: out.to_path_buf(),
+        approver: approver.clone(),
+        progress: progress.clone(),
+        parallel,
+        overwrite_policy,
+        agreed_parallel_tx: Some(agreed_tx),
+    };
+    match attempt_transfer(&cfg, &mut agreed_rx).await {
+        Ok(report) => Ok(Some(report)),
+        Err(e) => {
+            let reason = format!("{kind} {relay_addr} failed ({e:#})");
+            eprintln!(
+                "  {} {}",
+                ui::yellow("!"),
+                ui::yellow(&format!("{reason}; trying next route")),
+            );
+            Err(reason)
         }
     }
 }
@@ -526,10 +879,19 @@ async fn try_once(
     cfg: &TryOnceConfig,
     connection_index: u16,
 ) -> Result<lanx_core::transfer::receiver::ReceiverReport> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&cfg.addr))
-        .await
-        .with_context(|| firewall_hint(cfg))?
-        .with_context(|| firewall_hint(cfg))?;
+    // Relay targets (control + transfer share one stream) dial with
+    // IPv4/IPv6 fallback, or through the SOCKS5 proxy with proxy-side
+    // DNS so the relay hostname never needs local resolution.
+    let mut stream = if let Some(target) = &cfg.relay_addr {
+        lanx_net::socks::dial_relay(target, cfg.proxy.as_ref(), CONNECT_TIMEOUT)
+            .await
+            .with_context(|| firewall_hint(cfg))?
+    } else {
+        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&cfg.addr))
+            .await
+            .with_context(|| firewall_hint(cfg))?
+            .with_context(|| firewall_hint(cfg))?
+    };
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(?e, "TCP_NODELAY failed");
     }

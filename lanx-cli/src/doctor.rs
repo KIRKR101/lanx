@@ -1,9 +1,14 @@
 use anyhow::{Context, Result};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::Path;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 
-pub async fn run(relay: Option<String>, relay_receiver: Option<String>, port: u16) -> Result<()> {
+pub async fn run(
+    relay: Option<String>,
+    relay_receiver: Option<String>,
+    port: u16,
+    proxy: Option<lanx_net::socks::Socks5Config>,
+) -> Result<()> {
     println!("lanx doctor");
     let interfaces = crate::iface::list_non_loopback_v4().await;
     if interfaces.is_empty() {
@@ -33,12 +38,35 @@ pub async fn run(relay: Option<String>, relay_receiver: Option<String>, port: u1
     check_writable(Path::new("."));
 
     if let Some(relay) = relay {
-        let sender = resolve_socket_addrs(&relay).context("resolve relay sender address")?;
-        let (receiver_label, receiver) = match relay_receiver {
-            Some(address) => (
-                address.clone(),
-                resolve_socket_addrs(&address).context("resolve relay receiver address")?,
-            ),
+        // `--relay auto` checks every fallback route in selection order:
+        // direct (the sender port above already covers it), then the
+        // saved relay, then each public pool entry.
+        if relay.eq_ignore_ascii_case("auto") {
+            for candidate in crate::cmd::auto_relay_candidates(true) {
+                let addresses = resolve_socket_addrs(&candidate).await.unwrap_or_default();
+                check_relay_endpoint("relay", &candidate, &candidate, &addresses, &proxy).await;
+            }
+            if crate::cmd::auto_relay_candidates(true).is_empty() {
+                println!(
+                    "WARN  no saved or public relays configured for --relay auto ({})",
+                    crate::cmd::empty_pool_warning()
+                );
+            }
+            return Ok(());
+        }
+        // Resolve asynchronously (DNS + both families); with a proxy the
+        // relay hostname stays proxy-side and these addresses are only
+        // used to infer the default receiver port.
+        let sender = resolve_socket_addrs(&relay)
+            .await
+            .context("resolve relay sender address")?;
+        let (receiver_label, receiver_target, receiver) = match relay_receiver {
+            Some(address) => {
+                let addrs = resolve_socket_addrs(&address)
+                    .await
+                    .context("resolve relay receiver address")?;
+                (address.clone(), address, addrs)
+            }
             None => {
                 let receiver = sender
                     .iter()
@@ -52,44 +80,57 @@ pub async fn run(relay: Option<String>, relay_receiver: Option<String>, port: u1
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                (format!("{relay} (sender port + 1)"), receiver)
+                let target = receiver
+                    .first()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("{relay} (sender port + 1)"));
+                (format!("{relay} (sender port + 1)"), target, receiver)
             }
         };
-        check_relay_endpoint("sender", &relay, &sender).await;
-        check_relay_endpoint("receiver", &receiver_label, &receiver).await;
+        check_relay_endpoint("sender", &relay, &relay, &sender, &proxy).await;
+        check_relay_endpoint(
+            "receiver",
+            &receiver_label,
+            &receiver_target,
+            &receiver,
+            &proxy,
+        )
+        .await;
     }
     Ok(())
 }
 
-fn resolve_socket_addrs(address: &str) -> Result<Vec<SocketAddr>> {
-    let addresses = address
-        .to_socket_addrs()
-        .with_context(|| format!("invalid relay address: {address}"))?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        anyhow::bail!("relay address resolved to no endpoints: {address}");
-    }
-    Ok(addresses)
+async fn resolve_socket_addrs(address: &str) -> Result<Vec<SocketAddr>> {
+    lanx_net::tcp::resolve_target_addrs(address)
+        .await
+        .with_context(|| format!("invalid relay address: {address}"))
 }
 
-async fn check_relay_endpoint(role: &str, label: &str, addresses: &[SocketAddr]) {
-    let mut last_error = String::from("connection failed");
-    for address in addresses {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            TcpStream::connect(address),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {
-                println!("OK    relay {role} endpoint reachable: {label}");
-                return;
-            }
-            Ok(Err(error)) => last_error = error.to_string(),
-            Err(_) => last_error = String::from("connection timed out"),
+async fn check_relay_endpoint(
+    role: &str,
+    label: &str,
+    target: &str,
+    addresses: &[SocketAddr],
+    proxy: &Option<lanx_net::socks::Socks5Config>,
+) {
+    // With a proxy the relay hostname resolves proxy-side; otherwise try
+    // every resolved address (IPv4/IPv6 fallback) before reporting.
+    let result = match proxy {
+        Some(proxy) => {
+            lanx_net::socks::dial_relay(target, Some(proxy), std::time::Duration::from_secs(5))
+                .await
+                .map(|_| ())
+        }
+        None => lanx_net::tcp::connect_addrs(addresses, std::time::Duration::from_secs(3))
+            .await
+            .map(|_| ()),
+    };
+    match result {
+        Ok(()) => println!("OK    relay {role} endpoint reachable: {label}"),
+        Err(error) => {
+            println!("WARN  relay {role} endpoint unreachable: {label}: {error}");
         }
     }
-    println!("WARN  relay {role} endpoint unreachable: {label}: {last_error}");
 }
 
 async fn check_tcp_port(port: u16) {

@@ -205,8 +205,12 @@ impl Default for RelayConfig {
 /// Receivers that repeatedly guess wrong IDs are rate-limited
 /// per IP (`MAX_FAILED_ATTEMPTS_PER_WINDOW` per `RATE_LIMIT_WINDOW`).
 pub struct RelayServer {
-    sender_listener: TcpListener,
-    receiver_listener: TcpListener,
+    sender_listener: Option<TcpListener>,
+    receiver_listener: Option<TcpListener>,
+    /// Single-port mode: one listener serves both roles, dispatched by
+    /// `RelayHello::role`. Set exactly when `sender_bind == receiver_bind`;
+    /// otherwise the two split listeners are used (legacy two-port mode).
+    unified_listener: Option<TcpListener>,
     /// Pending sender connections keyed by pairing ID.
     pending_senders: Arc<Mutex<HashMap<[u8; 32], Pending>>>,
     /// Count of active paired sessions (for connection limiting).
@@ -232,18 +236,55 @@ impl RelayServer {
         receiver_bind: String,
         config: RelayConfig,
     ) -> Result<Self, RelayError> {
+        if normalize_bind(&sender_bind) == normalize_bind(&receiver_bind) {
+            return Self::new_unified_with_config(sender_bind, config).await;
+        }
         let sender_listener = TcpListener::bind(&sender_bind).await?;
         let receiver_listener = TcpListener::bind(&receiver_bind).await?;
 
         Ok(Self {
-            sender_listener,
-            receiver_listener,
+            sender_listener: Some(sender_listener),
+            receiver_listener: Some(receiver_listener),
+            unified_listener: None,
             pending_senders: Arc::new(Mutex::new(HashMap::new())),
             active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             attempts: Arc::new(Mutex::new(AttemptTracker::default())),
             receiver_waiters: Arc::new(tokio::sync::Semaphore::new(MAX_RECEIVER_WAITERS)),
             config,
         })
+    }
+
+    /// Create a single-port relay: one listener serves both sender and
+    /// receiver connections, dispatched by `RelayHello::role`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RelayError::Io` if the listener cannot be bound.
+    pub async fn new_unified(bind: String, config: RelayConfig) -> Result<Self, RelayError> {
+        Self::new_unified_with_config(bind, config).await
+    }
+
+    async fn new_unified_with_config(
+        bind: String,
+        config: RelayConfig,
+    ) -> Result<Self, RelayError> {
+        let listener = TcpListener::bind(&bind).await?;
+        Ok(Self {
+            sender_listener: None,
+            receiver_listener: None,
+            unified_listener: Some(listener),
+            pending_senders: Arc::new(Mutex::new(HashMap::new())),
+            active_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            attempts: Arc::new(Mutex::new(AttemptTracker::default())),
+            receiver_waiters: Arc::new(tokio::sync::Semaphore::new(MAX_RECEIVER_WAITERS)),
+            config,
+        })
+    }
+
+    /// True when this server runs in single-port (unified) mode.
+    #[must_use]
+    pub fn is_unified(&self) -> bool {
+        self.unified_listener.is_some()
     }
 
     /// Run the relay server, accepting sender and receiver connections
@@ -253,26 +294,48 @@ impl RelayServer {
     ///
     /// Returns `RelayError::Io` for listener or accept failures.
     pub async fn run(&self) -> Result<(), RelayError> {
-        tracing::info!(
-            sender = %self.sender_listener.local_addr()?,
-            receiver = %self.receiver_listener.local_addr()?,
-            "relay server started"
-        );
+        if let Some(listener) = &self.unified_listener {
+            tracing::info!(
+                unified = %listener.local_addr()?,
+                "relay server started (single-port mode)"
+            );
+            self.run_unified(listener).await
+        } else {
+            let sender = self
+                .sender_listener
+                .as_ref()
+                .expect("split mode has sender listener");
+            let receiver = self
+                .receiver_listener
+                .as_ref()
+                .expect("split mode has receiver listener");
+            tracing::info!(
+                sender = %sender.local_addr()?,
+                receiver = %receiver.local_addr()?,
+                "relay server started"
+            );
+            self.run_split(sender, receiver).await
+        }
+    }
+
+    async fn run_split(
+        &self,
+        sender_listener: &TcpListener,
+        receiver_listener: &TcpListener,
+    ) -> Result<(), RelayError> {
         if self.config.metrics {
             tracing::info!("relay metrics enabled; active_sessions is reported every 60s");
         }
-
         let mut sender_set = tokio::task::JoinSet::new();
         let mut receiver_set = tokio::task::JoinSet::new();
         let mut metrics_tick = tokio::time::interval(std::time::Duration::from_secs(60));
-
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("shutdown signal received, stopping relay");
                     break Ok(());
                 }
-                result = self.sender_listener.accept() => {
+                result = sender_listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
                             let pending = self.pending_senders.clone();
@@ -289,7 +352,7 @@ impl RelayServer {
                         }
                     }
                 }
-                result = self.receiver_listener.accept() => {
+                result = receiver_listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
                             // No slot reserved here: receivers only take a
@@ -297,15 +360,15 @@ impl RelayServer {
                             // `handle_receiver`), so unauthenticated
                             // guessers idling through the wait cannot
                             // exhaust `MAX_ACTIVE_SESSIONS`.
-                            let pending = self.pending_senders.clone();
-                            let sessions = self.active_sessions.clone();
-                            let attempts = self.attempts.clone();
-                            let config = self.config.clone();
                             let waiters = self.receiver_waiters.clone();
                             let Ok(permit) = waiters.try_acquire_owned() else {
                                 tracing::warn!(addr = %addr, "rejecting receiver: wait capacity reached");
                                 continue;
                             };
+                            let pending = self.pending_senders.clone();
+                            let sessions = self.active_sessions.clone();
+                            let attempts = self.attempts.clone();
+                            let config = self.config.clone();
                             receiver_set.spawn(async move {
                                 let _permit = permit;
                                 if let Err(e) = handle_receiver(stream, addr, pending, sessions, attempts, config).await {
@@ -327,6 +390,55 @@ impl RelayServer {
                 Some(result) = receiver_set.join_next() => {
                     if let Err(e) = result {
                         tracing::debug!(error = %e, "receiver handler task panicked");
+                    }
+                }
+                _ = metrics_tick.tick(), if self.config.metrics => {
+                    let pending = self.pending_senders.lock().await.len();
+                    let active = self.active_sessions.load(std::sync::atomic::Ordering::Acquire);
+                    tracing::info!(pending_senders = pending, active_sessions = active, "relay metrics");
+                }
+            }
+        }
+    }
+
+    async fn run_unified(&self, listener: &TcpListener) -> Result<(), RelayError> {
+        if self.config.metrics {
+            tracing::info!("relay metrics enabled; active_sessions is reported every 60s");
+        }
+        let mut set = tokio::task::JoinSet::new();
+        let mut metrics_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("shutdown signal received, stopping relay");
+                    break Ok(());
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, addr)) => {
+                            // Dispatch by RelayHello::role after the
+                            // challenge (see `handle_unified`): one TCP
+                            // listener serves senders and receivers alike.
+                            let pending = self.pending_senders.clone();
+                            let sessions = self.active_sessions.clone();
+                            let attempts = self.attempts.clone();
+                            let config = self.config.clone();
+                            let waiters = self.receiver_waiters.clone();
+                            set.spawn(async move {
+                                if let Err(e) = handle_unified(stream, addr, pending, sessions, attempts, config, waiters).await {
+                                    tracing::warn!(addr = %addr, error = %e, "unified handler error");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "unified accept error");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+                Some(result) = set.join_next() => {
+                    if let Err(e) = result {
+                        tracing::debug!(error = %e, "unified handler task panicked");
                     }
                 }
                 _ = metrics_tick.tick(), if self.config.metrics => {
@@ -425,6 +537,42 @@ pub async fn read_relay_ack(stream: &mut (impl AsyncReadExt + Unpin)) -> Result<
     Ok(buf[0])
 }
 
+/// Normalize a bind address for equality comparison (single-port
+/// detection): trim whitespace and compare case-insensitively so
+/// `--sender-bind X --receiver-bind X` with the same value selects
+/// single-port mode.
+fn normalize_bind(bind: &str) -> String {
+    bind.trim().to_lowercase()
+}
+
+async fn read_hello_after_challenge(
+    stream: &mut TcpStream,
+) -> Result<([u8; RELAY_CHALLENGE_LEN], RelayHello), RelayError> {
+    let challenge = send_relay_challenge(stream).await?;
+    let hello = tokio::time::timeout(RELAY_HELLO_TIMEOUT, read_relay_hello(stream))
+        .await
+        .map_err(|_| {
+            RelayError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "relay hello timeout",
+            ))
+        })??;
+    Ok((challenge, hello))
+}
+
+fn verify_hello_auth(
+    auth_token: Option<&str>,
+    challenge: &[u8; RELAY_CHALLENGE_LEN],
+    hello: &RelayHello,
+) -> Result<(), RelayError> {
+    let expected_auth =
+        auth_token.map(|token| relay_auth_proof(token, challenge, &hello.code_hash));
+    if expected_auth.as_deref() != hello.auth_token.as_deref() {
+        return Err(RelayError::Authentication);
+    }
+    Ok(())
+}
+
 async fn handle_sender(
     mut stream: TcpStream,
     addr: SocketAddr,
@@ -435,27 +583,26 @@ async fn handle_sender(
         tracing::debug!(?e, "TCP_NODELAY failed on sender");
     }
 
-    let challenge = send_relay_challenge(&mut stream).await?;
-    let hello = tokio::time::timeout(RELAY_HELLO_TIMEOUT, read_relay_hello(&mut stream))
-        .await
-        .map_err(|_| {
-            RelayError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "relay hello timeout",
-            ))
-        })??;
-    let expected_auth = auth_token
-        .as_deref()
-        .map(|token| relay_auth_proof(token, &challenge, &hello.code_hash));
-    if expected_auth.as_deref() != hello.auth_token.as_deref() {
-        return Err(RelayError::Authentication);
-    }
+    let (challenge, hello) = read_hello_after_challenge(&mut stream).await?;
+    verify_hello_auth(auth_token.as_deref(), &challenge, &hello)?;
     if hello.role != RelayRole::Sender {
         return Err(RelayError::UnexpectedRole(hello.role));
     }
 
     tracing::info!(addr = %addr, "sender connected, waiting for receiver");
 
+    register_sender_stream(stream, addr, hello, pending).await
+}
+
+/// Insert an authenticated sender hello into the pending map. Shared by
+/// the split sender listener and the single-port dispatcher so both
+/// paths enforce the same duplicate/capacity policy.
+async fn register_sender_stream(
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    hello: RelayHello,
+    pending: Arc<Mutex<HashMap<[u8; 32], Pending>>>,
+) -> Result<(), RelayError> {
     // Decide under the lock, then do network I/O unlocked: holding the
     // map mutex across `write_all` would let one stalled sender block
     // all other registrations and pairings. Re-check under a second
@@ -580,26 +727,35 @@ async fn handle_receiver(
         tracing::debug!(?e, "TCP_NODELAY failed on receiver");
     }
 
-    let challenge = send_relay_challenge(&mut stream).await?;
-    let hello = tokio::time::timeout(RELAY_HELLO_TIMEOUT, read_relay_hello(&mut stream))
-        .await
-        .map_err(|_| {
-            RelayError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "relay hello timeout",
-            ))
-        })??;
-    let expected_auth = config
-        .auth_token
-        .as_deref()
-        .map(|token| relay_auth_proof(token, &challenge, &hello.code_hash));
-    if expected_auth.as_deref() != hello.auth_token.as_deref() {
-        return Err(RelayError::Authentication);
-    }
+    let (challenge, hello) = read_hello_after_challenge(&mut stream).await?;
+    verify_hello_auth(config.auth_token.as_deref(), &challenge, &hello)?;
     if hello.role != RelayRole::Receiver {
         return Err(RelayError::UnexpectedRole(hello.role));
     }
 
+    pair_receiver_stream(
+        stream,
+        addr,
+        hello,
+        pending,
+        active_sessions,
+        attempts,
+        config,
+    )
+    .await
+}
+
+/// Wait for a matching sender and pipe the two streams. Shared by the
+/// split receiver listener and the single-port dispatcher.
+async fn pair_receiver_stream(
+    stream: TcpStream,
+    addr: SocketAddr,
+    hello: RelayHello,
+    pending: Arc<Mutex<HashMap<[u8; 32], Pending>>>,
+    active_sessions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    attempts: Arc<Mutex<AttemptTracker>>,
+    config: RelayConfig,
+) -> Result<(), RelayError> {
     // Pre-check the per-IP guess budget before the (slow) wait loop so a
     // scanner burning through IDs gets cut off fast.
     {
@@ -696,6 +852,53 @@ async fn handle_receiver(
                 }
                 return Err(RelayError::NoSender);
             }
+        }
+    }
+}
+
+/// Single-port connection handler: one listener serves both roles. The
+/// role comes from the authenticated `RelayHello`, so a sender and a
+/// receiver sharing one TCP listener never pair ambiguously — each
+/// connection is dispatched to exactly one of the split-path behaviors.
+async fn handle_unified(
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    pending: Arc<Mutex<HashMap<[u8; 32], Pending>>>,
+    active_sessions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    attempts: Arc<Mutex<AttemptTracker>>,
+    config: RelayConfig,
+    waiters: Arc<tokio::sync::Semaphore>,
+) -> Result<(), RelayError> {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(?e, "TCP_NODELAY failed on unified connection");
+    }
+
+    let (challenge, hello) = read_hello_after_challenge(&mut stream).await?;
+    verify_hello_auth(config.auth_token.as_deref(), &challenge, &hello)?;
+    match hello.role {
+        RelayRole::Sender => {
+            tracing::info!(addr = %addr, "sender connected (single-port), waiting for receiver");
+            register_sender_stream(stream, addr, hello, pending).await
+        }
+        RelayRole::Receiver => {
+            // Receiver-role connections take a waiter permit only after
+            // the role is known, so senders never consume receiver wait
+            // capacity on the shared listener.
+            let Ok(_permit) = waiters.try_acquire_owned() else {
+                tracing::warn!(addr = %addr, "rejecting receiver: wait capacity reached");
+                return Err(RelayError::Capacity);
+            };
+            let _permit = _permit;
+            pair_receiver_stream(
+                stream,
+                addr,
+                hello,
+                pending,
+                active_sessions,
+                attempts,
+                config,
+            )
+            .await
         }
     }
 }
@@ -837,5 +1040,198 @@ mod tests {
         let fresh: std::net::IpAddr = "192.0.2.1".parse().unwrap();
         t.record_failure(fresh);
         assert_eq!(t.failures.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn equal_binds_select_single_port_mode() {
+        let server = RelayServer::new("127.0.0.1:0".to_string(), "127.0.0.1:0".to_string())
+            .await
+            .expect("bind unified");
+        assert!(server.is_unified());
+    }
+
+    #[tokio::test]
+    async fn distinct_binds_keep_two_port_mode() {
+        let server = RelayServer::new("127.0.0.1:0".to_string(), "0.0.0.0:0".to_string())
+            .await
+            .expect("bind split");
+        assert!(!server.is_unified());
+    }
+
+    /// Connect as `role`, completing the challenge/hello exchange.
+    /// Returns the stream; senders must additionally read the ack byte.
+    async fn relay_client(
+        addr: std::net::SocketAddr,
+        role: RelayRole,
+        code_hash: [u8; 32],
+    ) -> TcpStream {
+        let mut stream = TcpStream::connect(addr).await.expect("connect relay");
+        let challenge = read_relay_challenge(&mut stream)
+            .await
+            .expect("read challenge");
+        let _ = challenge;
+        send_relay_hello(
+            &mut stream,
+            &RelayHello {
+                role,
+                code_hash,
+                auth_token: None,
+            },
+        )
+        .await
+        .expect("send hello");
+        stream
+    }
+
+    async fn assert_paired_pipe(mut a: TcpStream, mut b: TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        a.write_all(b"ping").await.expect("sender write");
+        a.flush().await.expect("sender flush");
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(10), b.read_exact(&mut buf))
+            .await
+            .expect("receiver read timeout")
+            .expect("receiver read");
+        assert_eq!(&buf, b"ping");
+        b.write_all(b"pong").await.expect("receiver write");
+        b.flush().await.expect("receiver flush");
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(10), a.read_exact(&mut buf))
+            .await
+            .expect("sender read timeout")
+            .expect("sender read");
+        assert_eq!(&buf, b"pong");
+    }
+
+    #[tokio::test]
+    async fn single_port_pairs_sender_and_receiver() {
+        let code_hash = code_to_hash("7-cobalt-fox-tundra");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unified test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let pending: Arc<Mutex<HashMap<[u8; 32], Pending>>> = Arc::new(Mutex::new(HashMap::new()));
+        let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = Arc::new(Mutex::new(AttemptTracker::default()));
+        let config = RelayConfig::default();
+        let waiters = Arc::new(tokio::sync::Semaphore::new(MAX_RECEIVER_WAITERS));
+
+        // Drive the unified dispatcher for exactly two connections.
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, peer) = listener.accept().await.expect("accept");
+                let pending = pending.clone();
+                let sessions = sessions.clone();
+                let attempts = attempts.clone();
+                let config = config.clone();
+                let waiters = waiters.clone();
+                tokio::spawn(async move {
+                    handle_unified(stream, peer, pending, sessions, attempts, config, waiters)
+                        .await
+                        .expect("handle unified");
+                });
+            }
+        });
+
+        // Sender and receiver share the one listener; roles dispatch by
+        // hello, so connection order carries no pairing meaning.
+        let mut sender = relay_client(addr, RelayRole::Sender, code_hash).await;
+        assert_eq!(
+            read_relay_ack(&mut sender).await.expect("read ack"),
+            RELAY_ACK_OK
+        );
+        let receiver = relay_client(addr, RelayRole::Receiver, code_hash).await;
+        server_task.await.expect("server task");
+        // Give the pairing task a moment to start piping.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_paired_pipe(sender, receiver).await;
+    }
+
+    #[tokio::test]
+    async fn two_port_mode_still_pairs() {
+        let code_hash = code_to_hash("7-cobalt-fox-tundra");
+        let sender_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sender test listener");
+        let receiver_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind receiver test listener");
+        let sender_addr = sender_listener.local_addr().expect("sender addr");
+        let receiver_addr = receiver_listener.local_addr().expect("receiver addr");
+        let pending: Arc<Mutex<HashMap<[u8; 32], Pending>>> = Arc::new(Mutex::new(HashMap::new()));
+        let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = Arc::new(Mutex::new(AttemptTracker::default()));
+        let config = RelayConfig::default();
+
+        let pending_s = pending.clone();
+        let sender_task = tokio::spawn(async move {
+            let (stream, peer) = sender_listener.accept().await.expect("accept sender");
+            handle_sender(stream, peer, pending_s, None)
+                .await
+                .expect("handle sender");
+        });
+        let pending_r = pending.clone();
+        let sessions_r = sessions.clone();
+        let attempts_r = attempts.clone();
+        let config_r = config.clone();
+        let receiver_task = tokio::spawn(async move {
+            let (stream, peer) = receiver_listener.accept().await.expect("accept receiver");
+            handle_receiver(stream, peer, pending_r, sessions_r, attempts_r, config_r)
+                .await
+                .expect("handle receiver");
+        });
+
+        let mut sender = relay_client(sender_addr, RelayRole::Sender, code_hash).await;
+        assert_eq!(
+            read_relay_ack(&mut sender).await.expect("read ack"),
+            RELAY_ACK_OK
+        );
+        let receiver = relay_client(receiver_addr, RelayRole::Receiver, code_hash).await;
+        sender_task.await.expect("sender task");
+        receiver_task.await.expect("receiver task");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_paired_pipe(sender, receiver).await;
+    }
+
+    #[tokio::test]
+    async fn single_port_rejects_wrong_role_pairing() {
+        // A receiver arriving with no sender waiting must not pair: it
+        // waits and gets NoSender rather than matching another receiver.
+        let code_hash = code_to_hash("7-cobalt-fox-tundra");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let pending: Arc<Mutex<HashMap<[u8; 32], Pending>>> = Arc::new(Mutex::new(HashMap::new()));
+        let (stream, peer) = tokio::join!(
+            async { TcpStream::connect(addr).await.expect("connect") },
+            async { listener.accept().await.expect("accept") },
+        );
+        let (_client, (server_stream, _)) = (stream, peer);
+        let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = Arc::new(Mutex::new(AttemptTracker::default()));
+        let config = RelayConfig {
+            max_sessions: 1,
+            ..RelayConfig::default()
+        };
+        let waiters = Arc::new(tokio::sync::Semaphore::new(MAX_RECEIVER_WAITERS));
+        // Drive only the server side; the client never sends a hello, so
+        // the server must time out, not pair anything.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            handle_unified(
+                server_stream,
+                "127.0.0.1:1".parse().expect("peer"),
+                pending,
+                sessions,
+                attempts,
+                config,
+                waiters,
+            ),
+        )
+        .await
+        .expect("handler finished");
+        assert!(result.is_err());
+        let _ = code_hash;
     }
 }

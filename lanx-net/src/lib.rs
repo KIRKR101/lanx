@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod interfaces;
 pub mod pairing;
 pub mod relay;
+pub mod socks;
 pub mod tcp;
 
 pub use discovery::{
@@ -17,4 +18,7 @@ pub use discovery::{
     MIN_CODE_WORDS,
 };
 pub use pairing::{resolve_target, Target};
-pub use tcp::{listen_default, listen_preferred, pick_port, GracefulListener, DEFAULT_SEND_PORT};
+pub use tcp::{
+    connect_addrs, connect_with_fallback, listen_default, listen_preferred, pick_port,
+    resolve_target_addrs, GracefulListener, DEFAULT_SEND_PORT,
+};

@@ -26,6 +26,163 @@ pub enum TcpError {
     Closed,
 }
 
+/// Split a `host:port` target into its host and port parts. Accepts
+/// `host:port`, IPv4 `ip:port`, and bracketed `[v6]:port` forms.
+pub fn split_host_port(target: &str) -> Result<(&str, u16), std::io::Error> {
+    let target = target.trim();
+    if let Some(rest) = target.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid address, expected [ipv6]:port: {target}"),
+            )
+        })?;
+        let port: u16 = port.parse().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid port in address: {target}"),
+            )
+        })?;
+        return Ok((host, port));
+    }
+    let (host, port) = target.rsplit_once(':').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid address, expected host:port: {target}"),
+        )
+    })?;
+    if host.is_empty() || port.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid address, expected host:port: {target}"),
+        ));
+    }
+    let port: u16 = port.parse().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid port in address: {target}"),
+        )
+    })?;
+    Ok((host, port))
+}
+
+/// Resolve a `host:port` target to all of its socket addresses (DNS plus
+/// both IP families). IP literals yield exactly one address; hostnames
+/// are resolved asynchronously so this never blocks the executor.
+///
+/// # Errors
+///
+/// Returns an I/O error if the target shape is invalid or DNS resolution
+/// finds no addresses.
+pub async fn resolve_target_addrs(target: &str) -> Result<Vec<SocketAddr>, std::io::Error> {
+    let target = target.trim();
+    if let Ok(addr) = target.parse::<SocketAddr>() {
+        return Ok(vec![addr]);
+    }
+    let (host, port) = split_host_port(target)?;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("address resolved to no endpoints: {target}"),
+        ));
+    }
+    Ok(addrs)
+}
+
+/// Order resolved addresses for fallback dialing: preserve DNS order
+/// within each family but interleave IPv4 and IPv6 so one broken family
+/// cannot starve the other.
+fn interleave_families(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let v4: Vec<_> = addrs.iter().filter(|a| a.is_ipv4()).copied().collect();
+    let v6: Vec<_> = addrs.iter().filter(|a| a.is_ipv6()).copied().collect();
+    let mut out = Vec::with_capacity(addrs.len());
+    let mut v4 = v4.into_iter();
+    let mut v6 = v6.into_iter();
+    // Alternate families starting with whichever DNS listed first, so a
+    // stalled family cannot delay every address of the working one.
+    let mut v6_turn = addrs.first().is_some_and(|a| a.is_ipv6());
+    loop {
+        let next = if v6_turn {
+            v6.next().or_else(|| v4.next())
+        } else {
+            v4.next().or_else(|| v6.next())
+        };
+        match next {
+            Some(addr) => {
+                // Only flip when both families still have addresses;
+                // otherwise drain the remainder in order.
+                if v4.len() > 0 && v6.len() > 0 {
+                    v6_turn = !v6_turn;
+                }
+                out.push(addr);
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Connect to the first reachable address in `addrs`, trying each in
+/// turn with `timeout` per attempt. Returns the stream and the address
+/// that succeeded.
+///
+/// # Errors
+///
+/// Returns the last connection error when every address fails.
+pub async fn connect_addrs(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+) -> Result<(TcpStream, SocketAddr), std::io::Error> {
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no addresses to connect to",
+        ));
+    }
+    let mut last_error: Option<std::io::Error> = None;
+    for addr in interleave_families(addrs) {
+        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok((stream, addr)),
+            Ok(Err(e)) => last_error = Some(e),
+            Err(_) => {
+                last_error = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("connect {addr} timed out"),
+                ));
+            }
+        }
+    }
+    Err(last_error.expect("non-empty addrs always sets last_error"))
+}
+
+/// Connect to a `host:port` target with IPv4/IPv6 fallback: resolve all
+/// addresses and try each in turn. Returns the stream and the address
+/// that succeeded.
+///
+/// # Errors
+///
+/// Returns an I/O error if resolution fails or every address refuses
+/// the connection.
+pub async fn connect_with_fallback(
+    target: &str,
+    timeout: Duration,
+) -> Result<(TcpStream, SocketAddr), std::io::Error> {
+    let addrs = resolve_target_addrs(target).await?;
+    connect_addrs(&addrs, timeout).await.map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "connect {target} failed (tried {} address(es)): {e}",
+                addrs.len()
+            ),
+        )
+    })
+}
+
 /// Pick an ephemeral port. Returns the bound address.
 ///
 /// # Errors
@@ -206,5 +363,86 @@ mod tests {
             .expect("fallback on AddrInUse");
         assert!(fell_back);
         assert_ne!(addr.port(), candidate);
+    }
+
+    #[tokio::test]
+    async fn resolve_ip_literals_without_dns() {
+        let addrs = resolve_target_addrs("127.0.0.1:29320").await.expect("v4");
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs[0].is_ipv4());
+        let addrs = resolve_target_addrs("[::1]:29320").await.expect("v6");
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs[0].is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn resolve_localhost_covers_both_families() {
+        // `localhost` normally resolves to 127.0.0.1 and/or ::1; either
+        // way we must get at least one usable address.
+        let addrs = resolve_target_addrs("localhost:29320")
+            .await
+            .expect("localhost resolves");
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.port() == 29320));
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_bad_shapes() {
+        for bad in ["", "noport", "host:", ":1234", "[::1]", "host:notaport"] {
+            assert!(resolve_target_addrs(bad).await.is_err(), "resolved {bad:?}");
+        }
+    }
+
+    #[test]
+    fn interleave_keeps_dns_order_within_families() {
+        let v4a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let v4b: SocketAddr = "127.0.0.2:1".parse().unwrap();
+        let v6a: SocketAddr = "[::1]:1".parse().unwrap();
+        // v4 first in DNS: v4, v6, v4.
+        assert_eq!(interleave_families(&[v4a, v6a, v4b]), vec![v4a, v6a, v4b]);
+        // v6 first in DNS: v6, v4, v4.
+        assert_eq!(interleave_families(&[v6a, v4a, v4b]), vec![v6a, v4a, v4b]);
+    }
+
+    #[tokio::test]
+    async fn connect_skips_dead_addresses() {
+        // First address is unroutable; the second is a live listener.
+        // TEST-NET-1 (192.0.2.1) is reserved by RFC 5737 and unroutable.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let live = listener.local_addr().expect("addr");
+        let dead: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let (stream, used) = tokio::time::timeout(
+            Duration::from_secs(15),
+            connect_addrs(&[dead, live], Duration::from_secs(3)),
+        )
+        .await
+        .expect("outer timeout")
+        .expect("fallback connects");
+        assert_eq!(used, live);
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn peek_pends_with_no_data() {
+        // The relay sender waits on `peek()` for pairing bytes; it must not
+        // fire spuriously on an idle connected socket.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (_server, _) = listener.accept().await.expect("accept");
+        let mut probe = [0u8; 1];
+        let fired = tokio::time::timeout(Duration::from_millis(500), client.peek(&mut probe)).await;
+        assert!(fired.is_err(), "peek fired with no data pending");
+    }
+
+    #[tokio::test]
+    async fn connect_with_fallback_reaches_local_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let target = format!("127.0.0.1:{port}");
+        let (_stream, used) = connect_with_fallback(&target, Duration::from_secs(5))
+            .await
+            .expect("connect");
+        assert_eq!(used.port(), port);
     }
 }
