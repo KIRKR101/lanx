@@ -74,11 +74,68 @@ fn spawn_stream(
 }
 
 fn should_start_discovery(
-    relay: Option<&str>,
+    relay: &crate::cmd::RelayMode,
     no_discovery: bool,
     allow_insecure_direct: bool,
 ) -> bool {
-    relay.is_none() && !no_discovery && !allow_insecure_direct
+    matches!(
+        relay,
+        crate::cmd::RelayMode::Direct | crate::cmd::RelayMode::Auto
+    ) && !no_discovery
+        && !allow_insecure_direct
+}
+
+/// Connect to one relay and register as a sender (challenge + hello +
+/// ack). Shared by explicit relay mode and `--relay auto` candidates so
+/// both enforce the same auth and duplicate-registration policy.
+async fn register_sender_with_relay(
+    relay_addr: &str,
+    proxy: Option<&lanx_net::socks::Socks5Config>,
+    code_hash: [u8; 32],
+) -> Result<TcpStream> {
+    let mut stream = lanx_net::socks::dial_relay(relay_addr, proxy, Duration::from_secs(10))
+        .await
+        .with_context(|| crate::cmd::relay_connect_hint(relay_addr, "sender"))?;
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(?e, "TCP_NODELAY failed");
+    }
+
+    // Send hello to register with the relay, then read the
+    // one-byte ack so "code already registered" doesn't look
+    // like a generic connection failure.
+    let challenge = read_relay_challenge(&mut stream)
+        .await
+        .context("relay did not send an authentication challenge")?;
+    let hello = RelayHello {
+        role: RelayRole::Sender,
+        code_hash,
+        auth_token: crate::cmd::relay_auth_token()
+            .map(|token| relay_auth_proof(&token, &challenge, &code_hash)),
+    };
+    send_relay_hello(&mut stream, &hello)
+        .await
+        .context("failed to register sender with relay; check relay auth settings")?;
+    let ack = tokio::time::timeout(
+        Duration::from_secs(10),
+        lanx_net::relay::read_relay_ack(&mut stream),
+    )
+    .await
+    .context("relay registration timed out; check relay reachability and auth settings")?
+    .context("relay closed before sender registration completed")?;
+    match ack {
+        lanx_net::relay::RELAY_ACK_OK => Ok(stream),
+        lanx_net::relay::RELAY_ACK_IN_USE => {
+            anyhow::bail!(
+                "relay reports this pairing ID is already registered (another sender is waiting on it); \
+                 re-run `send` for a fresh code"
+            )
+        }
+        _ => {
+            anyhow::bail!(
+                "relay rejected sender registration (server at capacity?); try again later"
+            )
+        }
+    }
 }
 
 /// Run the `lanx send` subcommand. Builds a manifest from the given
@@ -104,7 +161,7 @@ pub async fn run(
     hidden: bool,
     no_cache: bool,
     parallel: u16,
-    relay: Option<String>,
+    relay: crate::cmd::RelayMode,
     verbose: bool,
     code_words: u8,
     psk_opt: Option<String>,
@@ -129,7 +186,7 @@ pub async fn run(
     {
         anyhow::bail!("--text is limited to 1 MiB");
     }
-    if allow_insecure_direct && relay.is_some() {
+    if allow_insecure_direct && !matches!(relay, crate::cmd::RelayMode::Direct) {
         anyhow::bail!("--allow-insecure-direct is only valid for direct transfers, not --relay");
     }
 
@@ -245,8 +302,18 @@ pub async fn run(
             );
         }
     }
-    if let Some(ref relay_addr) = relay {
-        crate::cmd::warn_if_public_relay(relay_addr);
+    match &relay {
+        crate::cmd::RelayMode::Explicit(relay_addr) => {
+            crate::cmd::warn_if_public_relay(relay_addr);
+        }
+        crate::cmd::RelayMode::Auto => {
+            eprintln!(
+                "  {} {}",
+                ui::dim("mode"),
+                ui::bold("auto: direct + saved relay + public pool"),
+            );
+        }
+        crate::cmd::RelayMode::Direct => {}
     }
     // Direct-listener authentication policy. By default the direct port
     // requires the pairing code (PSK-bound handshake); bare
@@ -263,7 +330,7 @@ pub async fn run(
     } else {
         Some(handshake_psk)
     };
-    if fell_back && relay.is_none() {
+    if fell_back && !matches!(relay, crate::cmd::RelayMode::Explicit(_)) {
         eprintln!(
             "  {} {}",
             ui::yellow("!"),
@@ -278,7 +345,11 @@ pub async fn run(
     }
 
     let parallel = parallel.max(1);
-    crate::cmd::validate_parallel_relay(parallel, &relay)?;
+    // Explicit relay mode stays single-connection; `--relay auto` allows
+    // parallel for the direct route and clamps relay routes to one.
+    if matches!(relay, crate::cmd::RelayMode::Explicit(_)) && parallel > 1 {
+        anyhow::bail!("--parallel > 1 is not supported with --relay");
+    }
     let progress: Arc<dyn lanx_core::progress::Progress> = IndicatifProgress::new("Sending");
 
     // Direct-mode connection details print once here, not every
@@ -288,7 +359,7 @@ pub async fn run(
     // only repeat it. The bare bind address is verbose-only
     // diagnostics. Loopback commands are verbose-only too: they
     // almost never help a transfer to another machine.
-    if relay.is_none() {
+    if !matches!(relay, crate::cmd::RelayMode::Explicit(_)) {
         let addrs: Vec<String> = match bind
             .as_deref()
             .and_then(|value| value.parse::<std::net::IpAddr>().ok())
@@ -344,7 +415,7 @@ pub async fn run(
     }
 
     let mut disc = None;
-    if should_start_discovery(relay.as_deref(), no_discovery, allow_insecure_direct) {
+    if should_start_discovery(&relay, no_discovery, allow_insecure_direct) {
         match start_broadcasting(addr.port(), &code).await {
             Ok(h) => disc = Some(h),
             Err(e) => {
@@ -356,6 +427,35 @@ pub async fn run(
                 );
             }
         }
+    }
+
+    // `--relay auto`: offer direct and every relay route at once; the
+    // receiver's ordered probing (direct, saved, pool) picks the first
+    // one that connects. Single-shot per transport like relay mode: on
+    // failure re-run `send` for a fresh code.
+    if matches!(relay, crate::cmd::RelayMode::Auto) {
+        let result = run_auto_send(
+            manifest.clone(),
+            sources.clone(),
+            listener,
+            code_hash,
+            handshake_psk,
+            direct_psk,
+            chunk_size,
+            message.clone(),
+            text.clone(),
+            parallel,
+            proxy.clone(),
+            progress.clone(),
+        )
+        .await;
+        if let Some(h) = disc {
+            h.stop().await;
+        }
+        result?;
+        let (verified, failed, skipped) = progress.counts();
+        progress.summary(verified, failed, skipped);
+        return Ok(());
     }
 
     let mut listener = GracefulListener::new(listener, Duration::from_secs(60));
@@ -378,7 +478,7 @@ pub async fn run(
         let mut set = tokio::task::JoinSet::new();
         let mut first_task_result = None;
 
-        if let Some(ref relay_addr) = relay {
+        if let crate::cmd::RelayMode::Explicit(relay_addr) = &relay {
             // Relay mode: connect to the relay server and register as a sender.
             eprintln!(
                 "  {} {} {}",
@@ -388,50 +488,7 @@ pub async fn run(
             );
             eprintln!();
 
-            let mut stream =
-                lanx_net::socks::dial_relay(relay_addr, proxy.as_ref(), Duration::from_secs(10))
-                    .await
-                    .with_context(|| crate::cmd::relay_connect_hint(relay_addr, "sender"))?;
-            if let Err(e) = stream.set_nodelay(true) {
-                tracing::debug!(?e, "TCP_NODELAY failed");
-            }
-
-            // Send hello to register with the relay, then read the
-            // one-byte ack so "code already registered" doesn't look
-            // like a generic connection failure.
-            let challenge = read_relay_challenge(&mut stream)
-                .await
-                .context("relay did not send an authentication challenge")?;
-            let hello = RelayHello {
-                role: RelayRole::Sender,
-                code_hash,
-                auth_token: crate::cmd::relay_auth_token()
-                    .map(|token| relay_auth_proof(&token, &challenge, &code_hash)),
-            };
-            send_relay_hello(&mut stream, &hello)
-                .await
-                .context("failed to register sender with relay; check relay auth settings")?;
-            let ack = tokio::time::timeout(
-                Duration::from_secs(10),
-                lanx_net::relay::read_relay_ack(&mut stream),
-            )
-            .await
-            .context("relay registration timed out; check relay reachability and auth settings")?
-            .context("relay closed before sender registration completed")?;
-            match ack {
-                lanx_net::relay::RELAY_ACK_OK => {}
-                lanx_net::relay::RELAY_ACK_IN_USE => {
-                    anyhow::bail!(
-                        "relay reports this pairing ID is already registered (another sender is waiting on it); \
-                         re-run `send` for a fresh code"
-                    )
-                }
-                _ => {
-                    anyhow::bail!(
-                        "relay rejected sender registration (server at capacity?); try again later"
-                    )
-                }
-            }
+            let stream = register_sender_with_relay(relay_addr, proxy.as_ref(), code_hash).await?;
 
             eprintln!(
                 "  {} {}",
@@ -570,7 +627,7 @@ pub async fn run(
         match round_error {
             None => completed = true,
             Some(e) => {
-                if relay.is_some() {
+                if matches!(relay, crate::cmd::RelayMode::Explicit(_)) {
                     return Err(e);
                 }
                 // Keep the port open so the receiver can reconnect and resume.
@@ -597,6 +654,221 @@ pub async fn run(
     progress.summary(verified, failed, skipped);
 
     Ok(())
+}
+
+/// `--relay auto` sender: listen direct while registered on every relay
+/// candidate (saved relay, then the public pool). The first transport
+/// with a receiver wins; the rest are dropped (stale relay registrations
+/// expire server-side). Relay routes that fail to register are skipped
+/// with a warning instead of aborting the whole send.
+#[allow(clippy::too_many_arguments)]
+async fn run_auto_send(
+    manifest: lanx_core::manifest::Manifest,
+    sources: HashMap<lanx_core::manifest::FileId, PathBuf>,
+    listener: tokio::net::TcpListener,
+    code_hash: [u8; 32],
+    handshake_psk: [u8; 32],
+    direct_psk: Option<[u8; 32]>,
+    chunk_size: u32,
+    message: Option<String>,
+    text: Option<String>,
+    parallel: u16,
+    proxy: Option<lanx_net::socks::Socks5Config>,
+    progress: Arc<dyn lanx_core::progress::Progress>,
+) -> Result<()> {
+    let candidates = crate::cmd::auto_relay_candidates(false);
+    if candidates.is_empty() {
+        eprintln!(
+            "  {} {}",
+            ui::yellow("!"),
+            ui::yellow(&crate::cmd::empty_pool_warning()),
+        );
+    }
+    let mut relay_streams = Vec::new();
+    for candidate in &candidates {
+        match register_sender_with_relay(candidate, proxy.as_ref(), code_hash).await {
+            Ok(stream) => {
+                eprintln!(
+                    "  {} {} {}",
+                    ui::dim("relay"),
+                    ui::arrow(),
+                    ui::dim(&format!("{candidate} (waiting for receiver)")),
+                );
+                relay_streams.push((candidate.clone(), stream));
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} {}",
+                    ui::yellow("!"),
+                    ui::yellow(&format!("relay {candidate} skipped: {e:#}")),
+                );
+            }
+        }
+    }
+    eprintln!();
+
+    let base_cfg = SenderConfig {
+        chunk_size,
+        max_retries: DEFAULT_MAX_RETRIES,
+        max_parallel: parallel,
+        agreed_parallel_tx: None,
+        message: message.clone(),
+        text: text.clone(),
+    };
+    let mut set = tokio::task::JoinSet::new();
+    // Direct arm: one accept round with the usual grace period.
+    {
+        let manifest = manifest.clone();
+        let sources = sources.clone();
+        let progress = progress.clone();
+        let base_cfg = base_cfg.clone();
+        set.spawn(async move {
+            let mut listener = GracefulListener::new(listener, Duration::from_secs(60));
+            let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut cfg = base_cfg.clone();
+            cfg.agreed_parallel_tx = Some(agreed_tx);
+            let mut round = tokio::task::JoinSet::new();
+            let stream0 = listener
+                .accept()
+                .await
+                .map_err(|e| anyhow::anyhow!("direct: no receiver connected ({e})"))?;
+            let mut first_result = None;
+            spawn_stream(
+                &mut round,
+                stream0,
+                manifest.clone(),
+                sources.clone(),
+                progress.clone(),
+                cfg.clone(),
+                direct_psk,
+            );
+            let agreed = tokio::select! {
+                Some(p) = agreed_rx.recv() => p,
+                res = round.join_next() => {
+                    if let Some(r) = res {
+                        first_result = Some(r);
+                    }
+                    1
+                }
+            };
+            for _ in 1..agreed {
+                match listener.accept().await {
+                    Ok(stream) => spawn_stream(
+                        &mut round,
+                        stream,
+                        manifest.clone(),
+                        sources.clone(),
+                        progress.clone(),
+                        cfg.clone(),
+                        direct_psk,
+                    ),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "auto direct: extra connection accept failed");
+                        break;
+                    }
+                }
+            }
+            drain_sender_round(&mut round, first_result).await?;
+            Ok::<_, anyhow::Error>(String::from("direct"))
+        });
+    }
+    // Relay arms: the stream is already registered; the Noise handshake
+    // waits (no timeout) until a receiver pairs through the relay.
+    for (candidate, stream) in relay_streams {
+        let manifest = manifest.clone();
+        let sources = sources.clone();
+        let progress = progress.clone();
+        let mut cfg = base_cfg.clone();
+        cfg.max_parallel = 1;
+        set.spawn(async move {
+            let enc = lanx_core::crypto::wrap_responder_with_psk(stream, Some(handshake_psk))
+                .await
+                .map_err(|e| anyhow::anyhow!("relay {candidate}: noise handshake ({e})"))?;
+            let (mut reader, writer) = tokio::io::split(enc);
+            let mut writer = tokio::io::BufWriter::new(writer);
+            run_sender(
+                &mut reader,
+                &mut writer,
+                &manifest,
+                &sources,
+                progress.as_ref(),
+                &cfg,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("relay {candidate}: transfer session ({e})"))?;
+            Ok::<_, anyhow::Error>(candidate)
+        });
+    }
+
+    // First completed transport wins; the rest are abandoned (their relay
+    // registrations expire server-side). Bound the whole wait so an
+    // absent receiver cannot hang the sender forever.
+    let mut failures = Vec::new();
+    let outcome = tokio::time::timeout(Duration::from_secs(600), async {
+        while !set.is_empty() {
+            match set.join_next().await {
+                Some(Ok(Ok(_))) => return Ok::<_, anyhow::Error>(()),
+                Some(Ok(Err(e))) => failures.push(format!("{e:#}")),
+                Some(Err(e)) => failures.push(format!("transfer task ({e})")),
+                None => break,
+            }
+        }
+        Err::<_, anyhow::Error>(anyhow::anyhow!(
+            "all transports failed: {}",
+            failures.join("; ")
+        ))
+    })
+    .await;
+    set.abort_all();
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.context(
+            "no receiver connected via direct or relay; check the receiver ran with the same code and `--relay auto`",
+        )),
+        Err(_) => anyhow::bail!(
+            "no receiver connected within 10 minutes via direct or relay ({})",
+            if failures.is_empty() {
+                "no route reported an error".to_string()
+            } else {
+                failures.join("; ")
+            }
+        ),
+    }
+}
+
+/// Drain one sender round started by `spawn_stream`, including the
+/// connection-0 task that may already have finished during parallelism
+/// negotiation.
+async fn drain_sender_round(
+    set: &mut tokio::task::JoinSet<Result<(), lanx_core::transfer::ProtocolError>>,
+    first_task_result: Option<
+        Result<Result<(), lanx_core::transfer::ProtocolError>, tokio::task::JoinError>,
+    >,
+) -> Result<()> {
+    let mut round_error: Option<anyhow::Error> = match first_task_result {
+        Some(Ok(Ok(()))) => None,
+        Some(Ok(Err(e))) => Some(anyhow::Error::new(e).context("transfer session")),
+        Some(Err(e)) => Some(anyhow::Error::new(e).context("transfer task")),
+        None => None,
+    };
+    while round_error.is_none() {
+        match set.join_next().await {
+            Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(e))) => {
+                round_error = Some(anyhow::Error::new(e).context("transfer session"));
+                break;
+            }
+            Some(Err(e)) => {
+                round_error = Some(anyhow::Error::new(e).context("transfer task"));
+                break;
+            }
+            None => break,
+        }
+    }
+    match round_error {
+        None => Ok(()),
+        Some(e) => Err(e),
+    }
 }
 
 /// Copy all bytes from `reader` into `writer` in 64 KiB chunks.
@@ -743,21 +1015,47 @@ mod tests {
 
     #[test]
     fn insecure_direct_disables_discovery() {
-        assert!(!should_start_discovery(None, false, true));
+        assert!(!should_start_discovery(
+            &crate::cmd::RelayMode::Direct,
+            false,
+            true
+        ));
     }
 
     #[test]
     fn normal_direct_mode_discovers_unless_disabled() {
-        assert!(should_start_discovery(None, false, false));
-        assert!(!should_start_discovery(None, true, false));
+        assert!(should_start_discovery(
+            &crate::cmd::RelayMode::Direct,
+            false,
+            false
+        ));
+        assert!(!should_start_discovery(
+            &crate::cmd::RelayMode::Direct,
+            true,
+            false
+        ));
     }
 
     #[test]
     fn relay_mode_never_discovers() {
         assert!(!should_start_discovery(
-            Some("127.0.0.1:53318"),
+            &crate::cmd::RelayMode::Explicit("127.0.0.1:53318".to_string()),
             false,
             false
+        ));
+    }
+
+    #[test]
+    fn auto_mode_discovers_for_direct_first() {
+        assert!(should_start_discovery(
+            &crate::cmd::RelayMode::Auto,
+            false,
+            false
+        ));
+        assert!(!should_start_discovery(
+            &crate::cmd::RelayMode::Auto,
+            false,
+            true
         ));
     }
 }

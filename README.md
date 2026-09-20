@@ -348,6 +348,64 @@ lanx send ~/photos --relay 198.51.100.1:53318
 lanx recv 7-cobalt-fox-tundra --relay 198.51.100.1:53319 --accept
 ```
 
+Pass the same address for both listeners for single-port mode: one TCP
+listener serves senders and receivers, dispatched by each client's hello,
+so both clients dial the same address:
+
+```sh
+lanx relay \
+  --sender-bind 192.0.2.10:53318 \
+  --receiver-bind 192.0.2.10:53318
+lanx send ~/photos --relay 192.0.2.10:53318
+lanx recv 7-cobalt-fox-tundra --relay 192.0.2.10:53318 --accept
+```
+
+Two-port relays keep working as before; single-port mode is required for
+the public relay pool below, where one address must serve both roles.
+
+## Automatic connection selection
+
+The default stays direct-only. Opt in to automatic fallback with
+`--relay auto`: the receiver tries direct LAN discovery, then the saved
+relay, then each public pool relay in order, and the first route that
+connects runs the transfer. The sender offers direct and all relay
+routes at once. Each attempted route reports why it failed, and the
+final error names the next setup step:
+
+```sh
+lanx send ~/photos --relay auto
+lanx recv 7-cobalt-fox-tundra --relay auto --accept
+```
+
+Maintain the public pool (stored in the normal Lanx config directory,
+one unified `host:port` per line) with:
+
+```sh
+lanx relay pool add relay.example.com:53318
+lanx relay pool list
+lanx relay pool remove relay.example.com:53318
+lanx relay pool clear
+```
+
+An empty pool means no public fallback: `auto` warns and tries direct
+plus the saved relay only. Invalid pool entries are ignored with a
+warning; unreachable pool relays are skipped per attempt.
+
+## Proxies
+
+Route relay traffic through a SOCKS5 proxy (for example Tor at
+`127.0.0.1:9050`) with `--proxy` or `LANX_PROXY`. Relay control and
+transfer traffic share one proxied stream, and relay hostnames always
+resolve proxy-side — never via local DNS:
+
+```sh
+lanx send ~/photos --relay auto --proxy socks5://127.0.0.1:9050
+lanx recv 7-cobalt-fox-tundra --relay auto --proxy socks5://127.0.0.1:9050 --accept
+```
+
+Direct transfers ignore the proxy. Relay hostnames also resolve with
+IPv4/IPv6 fallback when no proxy is set.
+
 The relay forwards encrypted bytes and does not receive the transfer PSK or
 file contents. It does see the public pairing ID needed to match the two
 connections.

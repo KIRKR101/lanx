@@ -6,12 +6,27 @@ use std::net::ToSocketAddrs;
 const DEFAULT_RELAY_SENDER_PORT: u16 = 53318;
 const DEFAULT_RELAY_RECEIVER_PORT: u16 = 53319;
 
-pub fn resolve_relay(
+/// How the relay transport was selected. The default stays direct-only
+/// until relay fallback is proven stable; `--relay auto` is the explicit
+/// opt-in for automatic selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayMode {
+    /// No relay: direct connection only (default).
+    Direct,
+    /// One explicit relay address (or the saved relay expanded per role).
+    Explicit(String),
+    /// Automatic selection: direct discovery, then the saved relay, then
+    /// the public pool — in that order.
+    Auto,
+}
+
+pub fn resolve_relay_mode(
     value: Option<Option<String>>,
     receiver: bool,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<RelayMode> {
     match value {
-        Some(Some(address)) => Ok(Some(address)),
+        Some(Some(address)) if address.eq_ignore_ascii_case("auto") => Ok(RelayMode::Auto),
+        Some(Some(address)) => Ok(RelayMode::Explicit(address)),
         Some(None) => {
             let host = saved_relay()?;
             let port = if receiver {
@@ -24,10 +39,44 @@ pub fn resolve_relay(
             } else {
                 host
             };
-            Ok(Some(format!("{host}:{port}")))
+            Ok(RelayMode::Explicit(format!("{host}:{port}")))
         }
-        None => Ok(None),
+        None => Ok(RelayMode::Direct),
     }
+}
+
+/// Saved relay expanded for `--relay auto` receivers
+/// (`host:53319`), or `None` when no relay was saved with
+/// `lanx relay set <host>`.
+pub fn saved_relay_for_auto() -> Option<String> {
+    let host = saved_relay().ok()?;
+    Some(format_relay_address(&host, DEFAULT_RELAY_RECEIVER_PORT))
+}
+
+/// Ordered relay fallback candidates for `--relay auto` (sender side
+/// uses the sender-port expansion, receiver side the receiver-port one):
+/// saved relay first, then the public pool in file order.
+pub fn auto_relay_candidates(receiver: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(host) = saved_relay() {
+        let port = if receiver {
+            DEFAULT_RELAY_RECEIVER_PORT
+        } else {
+            DEFAULT_RELAY_SENDER_PORT
+        };
+        out.push(format_relay_address(&host, port));
+    }
+    out.extend(load_public_pool());
+    out
+}
+
+/// Message printed when `--relay auto` has no public fallback to try:
+/// an empty pool means no public fallback exists.
+pub fn empty_pool_warning() -> String {
+    "no public relays configured: automatic fallback will try direct discovery \
+     and the saved relay only; add public relays with \
+     `lanx relay pool add <host:port>` (single-port relay address)"
+        .to_string()
 }
 
 fn config_dir() -> anyhow::Result<std::path::PathBuf> {
@@ -446,6 +495,38 @@ mod tests {
     fn missing_pool_file_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(load_pool_from(&dir.path().join("absent")).is_empty());
+    }
+
+    #[test]
+    fn relay_auto_is_explicit_opt_in() {
+        assert_eq!(resolve_relay_mode(None, false).unwrap(), RelayMode::Direct);
+        assert_eq!(resolve_relay_mode(None, true).unwrap(), RelayMode::Direct);
+        for spelling in ["auto", "AUTO", "Auto"] {
+            assert_eq!(
+                resolve_relay_mode(Some(Some(spelling.to_string())), false).unwrap(),
+                RelayMode::Auto
+            );
+            assert_eq!(
+                resolve_relay_mode(Some(Some(spelling.to_string())), true).unwrap(),
+                RelayMode::Auto
+            );
+        }
+        // An explicit address keeps working and never becomes auto.
+        assert_eq!(
+            resolve_relay_mode(Some(Some("relay.example.com:53318".to_string())), false).unwrap(),
+            RelayMode::Explicit("relay.example.com:53318".to_string())
+        );
+        // A host named like auto with a port stays an explicit address.
+        assert!(matches!(
+            resolve_relay_mode(Some(Some("auto:53318".to_string())), false).unwrap(),
+            RelayMode::Explicit(_)
+        ));
+    }
+
+    #[test]
+    fn empty_pool_warning_explains_how_to_configure() {
+        let warning = empty_pool_warning();
+        assert!(warning.contains("lanx relay pool add"), "{warning}");
     }
 
     #[test]

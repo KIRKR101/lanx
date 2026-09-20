@@ -101,6 +101,9 @@ enum Command {
         parallel: u16,
         /// Connect to a relay server instead of listening directly.
         /// The argument is the relay's sender-bind address (e.g. "192.168.1.100:53318").
+        /// `--relay auto` offers direct discovery, the saved relay, then
+        /// the public pool (`lanx relay pool add <host:port>`), in order.
+        /// The default stays direct-only; auto is the explicit opt-in.
         #[arg(long, num_args = 0..=1)]
         relay: Option<Option<String>>,
         /// Number of words in the pairing code (2-5, default 3).
@@ -183,6 +186,9 @@ enum Command {
         parallel: u16,
         /// Connect through a relay server instead of direct connection.
         /// The argument is the relay's receiver-bind address (e.g. "192.168.1.100:53319").
+        /// `--relay auto` tries direct discovery, the saved relay, then
+        /// the public pool (`lanx relay pool add <host:port>`), in order.
+        /// The default stays direct-only; auto is the explicit opt-in.
         #[arg(long, num_args = 0..=1)]
         relay: Option<Option<String>>,
         /// Extra passphrase strengthening the Noise handshake PSK.
@@ -329,7 +335,7 @@ fn main() -> Result<()> {
                 allow_insecure_direct,
                 proxy,
             } => {
-                let relay = cmd::resolve_relay(relay, false)?;
+                let relay = cmd::resolve_relay_mode(relay, false)?;
                 let proxy = cmd::resolve_proxy(proxy)?;
                 cmd::send::run(
                     paths,
@@ -373,7 +379,7 @@ fn main() -> Result<()> {
                 psk,
                 proxy,
             } => {
-                let relay = cmd::resolve_relay(relay, true)?;
+                let relay = cmd::resolve_relay_mode(relay, true)?;
                 let proxy = cmd::resolve_proxy(proxy)?;
                 cmd::recv::run(cmd::recv::RecvOptions {
                     target,
