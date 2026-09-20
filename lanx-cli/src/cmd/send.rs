@@ -85,6 +85,99 @@ fn should_start_discovery(
         && !allow_insecure_direct
 }
 
+/// Failure to register as a sender with a relay.
+#[derive(Debug)]
+enum RegisterError {
+    /// The pairing ID is already registered by another live sender. With
+    /// an explicit relay this is fatal; `--relay auto` treats it as
+    /// transient (usually our own stale slot still draining server-side)
+    /// and retries with warn-once-then-quiet.
+    CodeInUse,
+    /// Dial, challenge, hello, ack, or capacity failure.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CodeInUse => write!(
+                f,
+                "relay reports this pairing ID is already registered (another sender is waiting on it); \
+                 re-run `send` for a fresh code"
+            ),
+            Self::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for RegisterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CodeInUse => None,
+            Self::Other(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+/// Shared deadline state for `--relay auto` arms. The deadline is fixed from
+/// startup, so repeated failed authenticated sessions cannot keep an
+/// abandoned send alive indefinitely.
+///
+/// Lock-free (atomics only) so it can be shared across async tasks without
+/// blocking the executor.
+#[derive(Debug, Clone)]
+struct AutoState {
+    inner: std::sync::Arc<AutoStateInner>,
+}
+
+#[derive(Debug)]
+struct AutoStateInner {
+    created: std::time::Instant,
+    /// Milliseconds from `created` at which the auto-send lifetime lapses.
+    deadline_offset_ms: std::sync::atomic::AtomicU64,
+    had_session: std::sync::atomic::AtomicBool,
+}
+
+impl AutoState {
+    fn new(overall: Duration) -> Self {
+        Self {
+            inner: std::sync::Arc::new(AutoStateInner {
+                created: std::time::Instant::now(),
+                deadline_offset_ms: std::sync::atomic::AtomicU64::new(
+                    u64::try_from(overall.as_millis()).unwrap_or(u64::MAX),
+                ),
+                had_session: std::sync::atomic::AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn had_session(&self) -> bool {
+        self.inner
+            .had_session
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Time left before the auto-send lifetime expires.
+    fn remaining(&self) -> Duration {
+        let offset = self
+            .inner
+            .deadline_offset_ms
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Duration::from_millis(offset).saturating_sub(self.inner.created.elapsed())
+    }
+
+    fn expired(&self) -> bool {
+        self.remaining().is_zero()
+    }
+
+    /// Record that at least one authenticated session was established.
+    fn note_authenticated(&self) {
+        self.inner
+            .had_session
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Connect to one relay and register as a sender (challenge + hello +
 /// ack). Shared by explicit relay mode and `--relay auto` candidates so
 /// both enforce the same auth and duplicate-registration policy.
@@ -92,10 +185,11 @@ async fn register_sender_with_relay(
     relay_addr: &str,
     proxy: Option<&lanx_net::socks::Socks5Config>,
     code_hash: [u8; 32],
-) -> Result<TcpStream> {
+) -> Result<TcpStream, RegisterError> {
     let mut stream = lanx_net::socks::dial_relay(relay_addr, proxy, Duration::from_secs(10))
         .await
-        .with_context(|| crate::cmd::relay_connect_hint(relay_addr, "sender"))?;
+        .with_context(|| crate::cmd::relay_connect_hint(relay_addr, "sender"))
+        .map_err(RegisterError::Other)?;
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(?e, "TCP_NODELAY failed");
     }
@@ -105,7 +199,8 @@ async fn register_sender_with_relay(
     // like a generic connection failure.
     let challenge = read_relay_challenge(&mut stream)
         .await
-        .context("relay did not send an authentication challenge")?;
+        .context("relay did not send an authentication challenge")
+        .map_err(RegisterError::Other)?;
     let hello = RelayHello {
         role: RelayRole::Sender,
         code_hash,
@@ -114,27 +209,23 @@ async fn register_sender_with_relay(
     };
     send_relay_hello(&mut stream, &hello)
         .await
-        .context("failed to register sender with relay; check relay auth settings")?;
+        .context("failed to register sender with relay; check relay auth settings")
+        .map_err(RegisterError::Other)?;
     let ack = tokio::time::timeout(
         Duration::from_secs(10),
         lanx_net::relay::read_relay_ack(&mut stream),
     )
     .await
-    .context("relay registration timed out; check relay reachability and auth settings")?
-    .context("relay closed before sender registration completed")?;
+    .context("relay registration timed out; check relay reachability and auth settings")
+    .map_err(RegisterError::Other)?
+    .context("relay closed before sender registration completed")
+    .map_err(RegisterError::Other)?;
     match ack {
         lanx_net::relay::RELAY_ACK_OK => Ok(stream),
-        lanx_net::relay::RELAY_ACK_IN_USE => {
-            anyhow::bail!(
-                "relay reports this pairing ID is already registered (another sender is waiting on it); \
-                 re-run `send` for a fresh code"
-            )
-        }
-        _ => {
-            anyhow::bail!(
-                "relay rejected sender registration (server at capacity?); try again later"
-            )
-        }
+        lanx_net::relay::RELAY_ACK_IN_USE => Err(RegisterError::CodeInUse),
+        _ => Err(RegisterError::Other(anyhow::anyhow!(
+            "relay rejected sender registration (server at capacity?); try again later"
+        ))),
     }
 }
 
@@ -431,8 +522,8 @@ pub async fn run(
 
     // `--relay auto`: offer direct and every relay route at once; the
     // receiver's ordered probing (direct, saved, pool) picks the first
-    // one that connects. Single-shot per transport like relay mode: on
-    // failure re-run `send` for a fresh code.
+    // one that connects. Each transport stays open across rounds so a
+    // receiver retry can resume without re-running the sender.
     if matches!(relay, crate::cmd::RelayMode::Auto) {
         let result = run_auto_send(
             manifest.clone(),
@@ -677,10 +768,11 @@ pub async fn run(
 }
 
 /// `--relay auto` sender: listen direct while registered on every relay
-/// candidate (saved relay, then the public pool). The first transport
-/// with a receiver wins; the rest are dropped (stale relay registrations
-/// expire server-side). Relay routes that fail to register are skipped
-/// with a warning instead of aborting the whole send.
+/// candidate (saved relay, then the public pool). Each transport loops
+/// across rounds: the direct listener stays bound and idle relay
+/// registrations stay open, so a receiver retry after a failed session
+/// can resume on any route without re-running the sender. The first
+/// transport to complete a transfer wins; the rest are aborted.
 #[allow(clippy::too_many_arguments)]
 async fn run_auto_send(
     manifest: lanx_core::manifest::Manifest,
@@ -704,26 +796,13 @@ async fn run_auto_send(
             ui::yellow(&crate::cmd::empty_pool_warning()),
         );
     }
-    let mut relay_streams = Vec::new();
     for candidate in &candidates {
-        match register_sender_with_relay(candidate, proxy.as_ref(), code_hash).await {
-            Ok(stream) => {
-                eprintln!(
-                    "  {} {} {}",
-                    ui::dim("relay"),
-                    ui::arrow(),
-                    ui::dim(&format!("{candidate} (waiting for receiver)")),
-                );
-                relay_streams.push((candidate.clone(), stream));
-            }
-            Err(e) => {
-                eprintln!(
-                    "  {} {}",
-                    ui::yellow("!"),
-                    ui::yellow(&format!("relay {candidate} skipped: {e:#}")),
-                );
-            }
-        }
+        eprintln!(
+            "  {} {} {}",
+            ui::dim("relay"),
+            ui::arrow(),
+            ui::dim(&format!("{candidate} (trying)")),
+        );
     }
     eprintln!();
 
@@ -735,99 +814,76 @@ async fn run_auto_send(
         message: message.clone(),
         text: text.clone(),
     };
+    // Fixed 10-minute lifetime for the auto send. Authenticated retries do
+    // not extend it, so a crash-looping receiver cannot keep the sender
+    // alive indefinitely.
+    let state = AutoState::new(Duration::from_secs(600));
+    // Only one route may run a transfer session at a time. This keeps the
+    // shared progress UI coherent while preserving parallel streams within
+    // the selected route.
+    let progress_gate = Arc::new(tokio::sync::Mutex::new(()));
+
     let mut set = tokio::task::JoinSet::new();
-    // Direct arm: one accept round with the usual grace period.
+    // Direct arm: owns the listener for the whole send and loops
+    // accept -> transfer -> (on failure) accept again.
     {
         let manifest = manifest.clone();
         let sources = sources.clone();
         let progress = progress.clone();
         let base_cfg = base_cfg.clone();
+        let state = state.clone();
+        let progress_gate = progress_gate.clone();
         set.spawn(async move {
-            let mut listener = GracefulListener::new(listener, Duration::from_secs(60));
-            let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut cfg = base_cfg.clone();
-            cfg.agreed_parallel_tx = Some(agreed_tx);
-            let mut round = tokio::task::JoinSet::new();
-            let stream0 = listener
-                .accept()
-                .await
-                .map_err(|e| anyhow::anyhow!("direct: no receiver connected ({e})"))?;
-            let mut first_result = None;
-            spawn_stream(
-                &mut round,
-                stream0,
-                manifest.clone(),
-                sources.clone(),
-                progress.clone(),
-                cfg.clone(),
+            auto_direct_loop(
+                listener,
+                manifest,
+                sources,
+                base_cfg,
                 direct_psk,
-            );
-            let agreed = tokio::select! {
-                Some(p) = agreed_rx.recv() => p,
-                res = round.join_next() => {
-                    if let Some(r) = res {
-                        first_result = Some(r);
-                    }
-                    1
-                }
-            };
-            for _ in 1..agreed {
-                match listener.accept().await {
-                    Ok(stream) => spawn_stream(
-                        &mut round,
-                        stream,
-                        manifest.clone(),
-                        sources.clone(),
-                        progress.clone(),
-                        cfg.clone(),
-                        direct_psk,
-                    ),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "auto direct: extra connection accept failed");
-                        break;
-                    }
-                }
-            }
-            drain_sender_round(&mut round, first_result).await?;
-            Ok::<_, anyhow::Error>(String::from("direct"))
+                progress,
+                state,
+                progress_gate,
+            )
+            .await
         });
     }
-    // Relay arms: the stream is already registered; the Noise handshake
-    // waits (no timeout) until a receiver pairs through the relay.
-    for (candidate, stream) in relay_streams {
+    // Relay arms: each owns its registration for the whole send and
+    // loops register -> handshake/transfer -> (on failure) re-register.
+    // Idle registrations stay open across rounds; only a consumed or
+    // broken stream is re-registered.
+    for candidate in candidates {
         let manifest = manifest.clone();
         let sources = sources.clone();
         let progress = progress.clone();
-        let mut cfg = base_cfg.clone();
-        cfg.max_parallel = 1;
+        let base_cfg = base_cfg.clone();
+        let proxy = proxy.clone();
+        let state = state.clone();
+        let progress_gate = progress_gate.clone();
         set.spawn(async move {
-            let enc = lanx_core::crypto::wrap_responder_with_psk(stream, Some(handshake_psk))
-                .await
-                .map_err(|e| anyhow::anyhow!("relay {candidate}: noise handshake ({e})"))?;
-            let (mut reader, writer) = tokio::io::split(enc);
-            let mut writer = tokio::io::BufWriter::new(writer);
-            run_sender(
-                &mut reader,
-                &mut writer,
-                &manifest,
-                &sources,
-                progress.as_ref(),
-                &cfg,
+            auto_relay_loop(
+                candidate,
+                code_hash,
+                handshake_psk,
+                manifest,
+                sources,
+                base_cfg,
+                progress,
+                proxy,
+                state,
+                progress_gate,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("relay {candidate}: transfer session ({e})"))?;
-            Ok::<_, anyhow::Error>(candidate)
         });
     }
 
-    // First completed transport wins; the rest are abandoned (their relay
-    // registrations expire server-side). Bound the whole wait so an
-    // absent receiver cannot hang the sender forever.
+    // First completed transport wins. Each arm only exits on success or
+    // when the fixed auto-send lifetime expires, so an empty set means every
+    // route is exhausted.
     let mut failures = Vec::new();
-    let outcome = tokio::time::timeout(Duration::from_secs(600), async {
+    let outcome = tokio::time::timeout(state.remaining(), async {
         while !set.is_empty() {
             match set.join_next().await {
-                Some(Ok(Ok(_))) => return Ok::<_, anyhow::Error>(()),
+                Some(Ok(Ok(route))) => return Ok::<_, anyhow::Error>(route),
                 Some(Ok(Err(e))) => failures.push(format!("{e:#}")),
                 Some(Err(e)) => failures.push(format!("transfer task ({e})")),
                 None => break,
@@ -835,24 +891,407 @@ async fn run_auto_send(
         }
         Err::<_, anyhow::Error>(anyhow::anyhow!(
             "all transports failed: {}",
-            failures.join("; ")
-        ))
-    })
-    .await;
-    set.abort_all();
-    match outcome {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.context(
-            "no receiver connected via direct or relay; check the receiver ran with the same code and `--relay auto`",
-        )),
-        Err(_) => anyhow::bail!(
-            "no receiver connected within 10 minutes via direct or relay ({})",
             if failures.is_empty() {
                 "no route reported an error".to_string()
             } else {
                 failures.join("; ")
             }
-        ),
+        ))
+    })
+    .await;
+    set.abort_all();
+    match outcome {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.context(
+            "no receiver connected via direct or relay; check the receiver ran with the same code and `--relay auto`",
+        )),
+        Err(_) => anyhow::bail!("auto-send lifetime expired before a transfer completed"),
+    }
+}
+
+/// Accept one direct connection, bounded by `wait`. Returns `Ok(None)`
+/// on timeout so the caller re-checks the shared deadline instead of
+/// hanging past it.
+async fn accept_bounded(
+    listener: &tokio::net::TcpListener,
+    wait: Duration,
+) -> Result<Option<TcpStream>> {
+    if wait.is_zero() {
+        return Ok(None);
+    }
+    match tokio::time::timeout(wait, listener.accept()).await {
+        Ok(Ok((stream, _))) => {
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::debug!(?e, "TCP_NODELAY failed");
+            }
+            Ok(Some(stream))
+        }
+        Ok(Err(e)) => Err(anyhow::Error::new(e).context("auto direct accept failed")),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Sleep up to `duration`, returning early when the shared deadline
+/// expires so backoffs never overshoot the lifetime by the full sleep.
+async fn sleep_aware(state: &AutoState, duration: Duration) {
+    let wait = duration.min(state.remaining());
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Acquire exclusive ownership of the shared progress UI for one route
+/// session. The acquisition is bounded by the auto-send lifetime so a route
+/// waiting behind another session cannot outlive the overall deadline.
+async fn acquire_progress_gate(
+    gate: &Arc<tokio::sync::Mutex<()>>,
+    state: &AutoState,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    let remaining = state.remaining();
+    if remaining.is_zero() {
+        return None;
+    }
+    tokio::time::timeout(remaining, gate.clone().lock_owned())
+        .await
+        .ok()
+}
+
+/// Log a failed authenticated session: trace warning plus the terminal
+/// line noting all routes stay open for reconnection.
+fn log_session_failed(route: &str, e: &anyhow::Error) {
+    warn!(?e, "auto {route} session failed; waiting for reconnection");
+    eprintln!(
+        "  {} {} {} {}",
+        ui::red(ui::fail_sym()),
+        ui::dim(&format!("session failed ({route}):")),
+        ui::red(&format!("{e:#}")),
+        ui::dim("(keeping direct + relay routes open for reconnection)"),
+    );
+}
+
+/// Direct arm for `--relay auto`: keep the listener bound across rounds.
+/// Each round accepts one session (plus parallel extras), runs it, and
+/// waits for a reconnection on failure. An abandoned send exits once the
+/// fixed auto-send lifetime lapses.
+#[allow(clippy::too_many_arguments)]
+async fn auto_direct_loop(
+    listener: tokio::net::TcpListener,
+    manifest: lanx_core::manifest::Manifest,
+    sources: HashMap<lanx_core::manifest::FileId, PathBuf>,
+    base_cfg: SenderConfig,
+    direct_psk: Option<[u8; 32]>,
+    progress: Arc<dyn lanx_core::progress::Progress>,
+    state: AutoState,
+    progress_gate: Arc<tokio::sync::Mutex<()>>,
+) -> Result<String> {
+    /// Grace for one accept interval. The shared deadline (not this interval)
+    /// decides when an abandoned send ends.
+    const ROUND_GRACE: Duration = Duration::from_secs(60);
+    loop {
+        if state.expired() {
+            if state.had_session() {
+                anyhow::bail!("direct: auto-send lifetime expired before a transfer completed");
+            }
+            anyhow::bail!("direct: no receiver connected within 10 minutes");
+        }
+        let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = base_cfg.clone();
+        cfg.agreed_parallel_tx = Some(agreed_tx);
+        let mut round = tokio::task::JoinSet::new();
+        // Bound this accept by the time left on the shared deadline so an
+        // expiry is noticed promptly instead of up to a full grace late.
+        let wait = ROUND_GRACE.min(state.remaining());
+        let stream0 = match accept_bounded(&listener, wait).await {
+            Ok(Some(stream)) => stream,
+            // Window elapsed with no receiver; loop around and re-check
+            // the shared deadline.
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!(error = %e, "auto direct accept failed");
+                sleep_aware(&state, Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Some(_progress_guard) = acquire_progress_gate(&progress_gate, &state).await else {
+            continue;
+        };
+        let mut first_result = None;
+        // Set only once connection 0 proves it is an authenticated
+        // receiver (see `agreed` below). A bare port-scan or wrong-code
+        // probe that fails the handshake must never lift the overall
+        // wait, print a session failure, or look like a session.
+        let mut authenticated = false;
+        spawn_stream(
+            &mut round,
+            stream0,
+            manifest.clone(),
+            sources.clone(),
+            progress.clone(),
+            cfg.clone(),
+            direct_psk,
+        );
+        // `agreed` arrives after the Noise handshake plus the Hello exchange
+        // on connection 0 and marks the route as authenticated.
+        let mut agreed: u16 = 1;
+        tokio::select! {
+            Some(p) = agreed_rx.recv() => {
+                authenticated = true;
+                state.note_authenticated();
+                agreed = p;
+            }
+            res = round.join_next() => {
+                if let Some(r) = res {
+                    first_result = Some(r);
+                }
+                // `agreed` may already be queued when both branches are
+                // ready in the same poll; check before concluding this
+                // round never authenticated.
+                if let Ok(p) = agreed_rx.try_recv() {
+                    authenticated = true;
+                    state.note_authenticated();
+                    agreed = p;
+                }
+            }
+        };
+        // Extra parallel connections are bounded like the first accept. A
+        // receiver that negotiates parallelism but never opens the rest
+        // must fail the round (and retry) rather than hang past the
+        // deadline or report a false partial success.
+        let mut extras_error: Option<anyhow::Error> = None;
+        for _ in 1..agreed {
+            let wait = ROUND_GRACE.min(state.remaining());
+            match accept_bounded(&listener, wait).await {
+                Ok(Some(stream)) => spawn_stream(
+                    &mut round,
+                    stream,
+                    manifest.clone(),
+                    sources.clone(),
+                    progress.clone(),
+                    cfg.clone(),
+                    direct_psk,
+                ),
+                Ok(None) => {
+                    extras_error = Some(anyhow::anyhow!(
+                        "timed out waiting for {agreed} parallel receiver connections"
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    extras_error = Some(e);
+                    break;
+                }
+            }
+        }
+        // `agreed` arrived above, so this is always an authenticated
+        // failure, never a probe.
+        if let Some(e) = extras_error {
+            round.abort_all();
+            log_session_failed("direct", &e);
+            sleep_aware(&state, Duration::from_secs(2)).await;
+            continue;
+        }
+        match drain_sender_round(&mut round, first_result).await {
+            Ok(()) => return Ok(String::from("direct")),
+            Err(e) => {
+                // Pre-authentication failures (port-scan, wrong code) are
+                // probes, not sessions: log quietly without the
+                // session-failed terminal line.
+                if !authenticated {
+                    tracing::debug!("auto direct connection failed before handshake: {e:#}");
+                    continue;
+                }
+                log_session_failed("direct", &e);
+                continue;
+            }
+        }
+    }
+}
+
+/// Relay arm for `--relay auto`: keep one registration open at a time
+/// and re-register only after the stream is consumed or broken. Pairing
+/// is awaited with a non-destructive peek, so an idle arm holds its relay
+/// slot across rounds without churning registrations. An authenticated
+/// session does not extend the fixed auto-send lifetime.
+#[allow(clippy::too_many_arguments)]
+async fn auto_relay_loop(
+    candidate: String,
+    code_hash: [u8; 32],
+    handshake_psk: [u8; 32],
+    manifest: lanx_core::manifest::Manifest,
+    sources: HashMap<lanx_core::manifest::FileId, PathBuf>,
+    base_cfg: SenderConfig,
+    progress: Arc<dyn lanx_core::progress::Progress>,
+    proxy: Option<lanx_net::socks::Socks5Config>,
+    state: AutoState,
+    progress_gate: Arc<tokio::sync::Mutex<()>>,
+) -> Result<String> {
+    let mut warned_once = false;
+    let mut announced = false;
+    loop {
+        if state.expired() {
+            if state.had_session() {
+                anyhow::bail!(
+                    "relay {candidate}: auto-send lifetime expired before a transfer completed"
+                );
+            }
+            anyhow::bail!("relay {candidate}: no receiver connected within 10 minutes");
+        }
+        let stream = match register_sender_with_relay(&candidate, proxy.as_ref(), code_hash).await {
+            Ok(s) => {
+                warned_once = false;
+                if !announced {
+                    eprintln!(
+                        "  {} {} {}",
+                        ui::dim("relay"),
+                        ui::arrow(),
+                        ui::dim(&format!("{candidate} (waiting for receiver)")),
+                    );
+                    announced = true;
+                }
+                s
+            }
+            // A duplicate registration is usually our own stale slot
+            // still draining server-side after a broken stream, so it is
+            // transient: warn once, then back off quietly like `Other`.
+            Err(RegisterError::CodeInUse) => {
+                if !warned_once {
+                    eprintln!(
+                        "  {} {}",
+                        ui::yellow("!"),
+                        ui::yellow(&format!(
+                            "relay {candidate} skipped: pairing ID still registered (retrying)"
+                        )),
+                    );
+                    warned_once = true;
+                } else {
+                    tracing::debug!("relay {candidate} still registered; retrying quietly");
+                }
+                sleep_aware(&state, Duration::from_secs(5)).await;
+                continue;
+            }
+            Err(RegisterError::Other(e)) => {
+                // Registration churns server slots if retried hot, and a
+                // missing relay should not drown the direct route's logs:
+                // warn once, then back off quietly.
+                if !warned_once {
+                    eprintln!(
+                        "  {} {}",
+                        ui::yellow("!"),
+                        ui::yellow(&format!("relay {candidate} skipped: {e:#}")),
+                    );
+                    warned_once = true;
+                } else {
+                    tracing::debug!("relay {candidate} re-register failed: {e:#}");
+                }
+                sleep_aware(&state, Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        // Wait for the receiver's first Noise frame before starting the
+        // handshake: registration produces no traffic, so the handshake
+        // timeout must not run while no receiver is there. `peek` only
+        // borrows the stream, so bounding it by the deadline never kills
+        // a late pairing; the short fixed handshake timeout below owns
+        // the stream and stays capped at 10 s like the direct arm.
+        let remaining = state.remaining();
+        if remaining.is_zero() {
+            continue;
+        }
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(remaining, stream.peek(&mut probe)).await {
+            Ok(Ok(0)) => {
+                tracing::debug!("relay {candidate} closed while waiting for receiver");
+                sleep_aware(&state, Duration::from_secs(2)).await;
+                continue;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::debug!("relay {candidate} failed while waiting for receiver: {e:#}");
+                sleep_aware(&state, Duration::from_secs(2)).await;
+                continue;
+            }
+            // Window elapsed; loop around and re-check the deadline.
+            Err(_) => continue,
+        }
+        let handshake = lanx_core::crypto::wrap_responder_with_psk(stream, Some(handshake_psk));
+        let enc = match tokio::time::timeout(Duration::from_secs(10), handshake).await {
+            Ok(Ok(enc)) => enc,
+            Ok(Err(e)) => {
+                tracing::debug!("relay {candidate} handshake failed: {e:#}");
+                // Back off so a crash-looping receiver does not churn
+                // relay registrations with no delay.
+                sleep_aware(&state, Duration::from_secs(2)).await;
+                continue;
+            }
+            Err(_) => {
+                tracing::debug!("relay {candidate} handshake timed out");
+                sleep_aware(&state, Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let Some(_progress_guard) = acquire_progress_gate(&progress_gate, &state).await else {
+            continue;
+        };
+        // Run the session in a task so the Hello `agreed` signal marks
+        // the authenticated session exactly like the direct arm: a
+        // receiver that finishes Noise then drops before Hello is a
+        // probe, not a session.
+        let (agreed_tx, mut agreed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = base_cfg.clone();
+        cfg.max_parallel = 1;
+        cfg.agreed_parallel_tx = Some(agreed_tx);
+        let task_manifest = manifest.clone();
+        let task_sources = sources.clone();
+        let task_progress = progress.clone();
+        let (mut reader, writer) = tokio::io::split(enc);
+        let mut sender_set = tokio::task::JoinSet::new();
+        sender_set.spawn(async move {
+            let mut writer = tokio::io::BufWriter::new(writer);
+            run_sender(
+                &mut reader,
+                &mut writer,
+                &task_manifest,
+                &task_sources,
+                task_progress.as_ref(),
+                &cfg,
+            )
+            .await
+        });
+        let mut first_result = None;
+        let mut authenticated = false;
+        tokio::select! {
+            Some(_) = agreed_rx.recv() => {
+                authenticated = true;
+                state.note_authenticated();
+            }
+            res = sender_set.join_next() => {
+                if let Some(r) = res {
+                    first_result = Some(r);
+                }
+                // `agreed` may already be queued when both branches are
+                // ready in the same poll; check before concluding this
+                // round never authenticated.
+                if agreed_rx.try_recv().is_ok() {
+                    authenticated = true;
+                    state.note_authenticated();
+                }
+            }
+        }
+        match drain_sender_round(&mut sender_set, first_result).await {
+            Ok(()) => return Ok(candidate),
+            Err(e) => {
+                if !authenticated {
+                    tracing::debug!("relay {candidate} failed before handshake: {e:#}");
+                    sleep_aware(&state, Duration::from_secs(2)).await;
+                    continue;
+                }
+                log_session_failed("relay", &anyhow::anyhow!("relay {candidate}: {e:#}"));
+                // Back off before re-registering so a fast-failing route
+                // does not hammer the relay.
+                sleep_aware(&state, Duration::from_secs(2)).await;
+                continue;
+            }
+        }
     }
 }
 

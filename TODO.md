@@ -23,6 +23,14 @@
 - [x] Add SOCKS5 proxy support, including Tor-friendly proxy-side DNS.
       - Acceptance: both relay control and transfer traffic work through a
         SOCKS5 proxy without requiring local DNS resolution of the relay.
+- [x] Add full reconnection across transports for `--relay auto`: today an
+      auto sender is single-shot per transport (relay-style), so a failed
+      session needs a fresh `send`. Keep the direct listener plus idle relay
+      registrations alive across rounds so a receiver retry can resume on
+      any route without re-running the sender.
+      - Acceptance: killing and restarting the receiver mid-transfer under
+        `--relay auto` resumes to completion with no new sender invocation,
+        on both the direct and the relay route.
 
 ### Priority 2: simpler transfer UX
 
