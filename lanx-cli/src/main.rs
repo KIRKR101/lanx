@@ -183,10 +183,13 @@ enum Command {
     Relay {
         #[command(subcommand)]
         action: Option<RelayCommand>,
-        /// Address to listen on for sender connections.
+        /// Address to listen on for sender connections. Pass the same
+        /// value as `--receiver-bind` for single-port mode: one listener
+        /// serves both roles, dispatched by the client's hello.
         #[arg(long, default_value = "0.0.0.0:53318")]
         sender_bind: String,
-        /// Address to listen on for receiver connections.
+        /// Address to listen on for receiver connections. Pass the same
+        /// value as `--sender-bind` for single-port mode.
         #[arg(long, default_value = "0.0.0.0:53319")]
         receiver_bind: String,
         /// Maximum number of active paired sessions.
