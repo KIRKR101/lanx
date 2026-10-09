@@ -5,8 +5,6 @@
 //! Receivers filter by `code_hash` (now a domain-separated pairing ID,
 //! see [`code_to_pairing_id`]).
 //!
-//! # Security model (v2)
-//!
 //! The pairing ID broadcast/relayed in the clear is a *public identifier*,
 //! not a secret. Secrecy comes from the PSK derived from the code
 //! ([`code_to_psk`]) and mixed into the `Noise_NNpsk0` handshake
@@ -82,7 +80,6 @@ const WORDS: &[&str] = &[
     "nard", "nest", "nimbus", "nova", "oak", "orca", "peak", "pond", "puma", "rift", "rill",
     "robin", "seal", "sloe", "span", "spar", "spur", "star", "stem", "swan", "tarn", "tile",
     "vale", "vole", "wasp",
-    // Extension batch: short, typable, unambiguous words (ASCII alpha only).
     "almond", "anvil", "apron", "arbor", "aster", "atlas", "autumn", "badger", "bamboo", "banjo",
     "bark", "barley", "beacon", "beaver", "bison", "blizzard", "boron", "boulder", "brave",
     "brisk", "bronze", "bramble", "buffalo", "burrow", "butter", "cactus", "camel", "caribou",
