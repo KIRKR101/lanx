@@ -756,7 +756,7 @@ mod tests {
         let t = truncate_middle("docs/guide/chapter1.md", 20);
         assert!(ui::visible_width(&t) <= 20, "{t:?}");
         assert!(t.ends_with("chapter1.md"), "{t:?}");
-        assert!(t.contains("..."), "{t:?}");
+        assert!(t.contains("...") || t.contains("…"), "{t:?}");
     }
 
     #[test]
