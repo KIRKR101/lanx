@@ -41,10 +41,9 @@ fn looks_like_code(s: &str) -> bool {
     // Trimmed by caller; also trim here defensively for direct callers.
     // Format: digit-word-...-word (a single ASCII digit plus 2-5 words).
     // Accepts legacy 2-word codes and new longer codes from
-    // `--code-words`. Wordlist membership is NOT enforced (see below).
-    // Wordlist membership is intentionally not checked (a user may
-    // mistype or use a future expanded wordlist; discovery times out
-    // with a clear message). The segmentation rules live in
+    // `--code-words`. Wordlist membership is intentionally not checked
+    // (a user may mistype or use a future expanded wordlist; discovery
+    // times out with a clear message). The segmentation rules live in
     // [`crate::discovery::code_word_count`] so this parser and that
     // one cannot drift apart on `MIN_CODE_WORDS`/`MAX_CODE_WORDS`.
     crate::discovery::code_word_count(s.trim()) >= crate::discovery::MIN_CODE_WORDS
