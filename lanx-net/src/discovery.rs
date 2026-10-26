@@ -99,6 +99,64 @@ pub const DEFAULT_CODE_WORDS: usize = 3;
 pub const MIN_CODE_WORDS: usize = 2;
 pub const MAX_CODE_WORDS: usize = 5;
 
+// Compile-time guarantees about the wordlist, replacing the old
+// `wordlist_unique_and_alpha` runtime test: bad edits fail `cargo build`,
+// not `cargo test`. O(n²) uniqueness checking is fine for ~290 words.
+const fn words_unique(words: &[&str]) -> bool {
+    let mut i = 0;
+    while i < words.len() {
+        let mut j = i + 1;
+        while j < words.len() {
+            if str_eq(words[i], words[j]) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+// `str` equality is still not callable in `const fn` on the pinned
+// toolchain (1.85), so compare bytes directly.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn words_lowercase(words: &[&str]) -> bool {
+    let mut i = 0;
+    while i < words.len() {
+        let bytes = words[i].as_bytes();
+        let mut j = 0;
+        while j < bytes.len() {
+            if !bytes[j].is_ascii_lowercase() {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(!WORDS.is_empty(), "WORDS must not be empty");
+const _: () = assert!(
+    words_unique(WORDS),
+    "WORDS contains duplicate words (drains entropy)"
+);
+const _: () = assert!(words_lowercase(WORDS), "WORDS must be lowercase");
+
 /// Build a code of the form `digit-word-...-word` with
 /// [`DEFAULT_CODE_WORDS`] words. The `digit` is a random 0-9
 /// discriminator, decoupled from the port. Words come from [`WORDS`]
@@ -121,7 +179,7 @@ pub fn generate_code_with_words(n: usize) -> String {
     for _ in 0..n {
         let w = WORDS
             .choose(&mut rng)
-            .expect("WORDS is non-empty (compile-time const)");
+            .expect("WORDS is non-empty (const-asserted)");
         code.push('-');
         code.push_str(w);
     }
@@ -571,18 +629,7 @@ mod tests {
         assert_eq!(code_word_count("x-cobalt-fox"), 0);
         assert_eq!(code_entropy_bits("7-a-b-"), 0.0);
     }
-    #[test]
-    fn wordlist_unique_and_alpha() {
-        // Ensure no duplicate words in the wordlist (duplicates waste entropy).
-        let mut words: Vec<&str> = WORDS.to_vec();
-        words.sort_unstable();
-        words.dedup();
-        assert_eq!(words.len(), WORDS.len(), "WORDLIST contains duplicates");
-        for w in WORDS {
-            assert!(
-                w.chars().all(|c| c.is_ascii_lowercase()),
-                "non-lowercase word: {w}"
-            );
-        }
-    }
+    // Wordlist uniqueness, casing, and non-emptiness are enforced by
+    // `const _ = assert!(...)` declarations above, so bad edits to `WORDS`
+    // fail `cargo build` directly. No runtime test needed.
 }
