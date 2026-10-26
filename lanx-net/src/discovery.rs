@@ -102,6 +102,9 @@ pub const MAX_CODE_WORDS: usize = 5;
 // Compile-time guarantees about the wordlist, replacing the old
 // `wordlist_unique_and_alpha` runtime test: bad edits fail `cargo build`,
 // not `cargo test`. O(n²) uniqueness checking is fine for ~290 words.
+// Non-emptiness of the list and of each entry were previously accepted
+// (both by the old test and the first const asserts), so they are now
+// asserted explicitly.
 const fn words_unique(words: &[&str]) -> bool {
     let mut i = 0;
     while i < words.len() {
@@ -150,12 +153,24 @@ const fn words_lowercase(words: &[&str]) -> bool {
     true
 }
 
+const fn words_non_empty(words: &[&str]) -> bool {
+    let mut i = 0;
+    while i < words.len() {
+        if words[i].is_empty() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 const _: () = assert!(!WORDS.is_empty(), "WORDS must not be empty");
 const _: () = assert!(
     words_unique(WORDS),
     "WORDS contains duplicate words (drains entropy)"
 );
 const _: () = assert!(words_lowercase(WORDS), "WORDS must be lowercase");
+const _: () = assert!(words_non_empty(WORDS), "WORDS must not contain empty words");
 
 /// Build a code of the form `digit-word-...-word` with
 /// [`DEFAULT_CODE_WORDS`] words. The `digit` is a random 0-9
