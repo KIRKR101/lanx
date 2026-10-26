@@ -38,3 +38,15 @@ lanx-net = { path = "lanx-net" }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Dev: dependencies get light optimization only. lanx does real work under
+# `cargo test` and `cargo run` (ChaCha20 through snow, deflate through zip,
+# BLAKE3 over real files), and opt-level 1 keeps that work fast while
+# workspace crates stay in the fast, fully instrumented debug mode.
+[profile.dev.package."*"]
+opt-level = 1
+
+# Line tables are enough for panic backtraces; smaller debug info keeps
+# dev builds and links fast.
+[profile.dev]
+debug = "line-tables-only"
