@@ -34,9 +34,11 @@ const PATTERN: &str = "Noise_NN_25519_ChaChaPoly_BLAKE2s";
 /// mixed at token 0, so a wrong guess fails the handshake immediately.
 const PATTERN_PSK: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 
-/// Maximum plaintext bytes in a single Noise transport message. Each message
-/// carries a 16-byte Poly1305 tag, so the largest safe payload is 65535 - 16.
-const MAX_PAYLOAD: usize = 65519;
+/// Maximum plaintext bytes in a single Noise transport message.
+///
+/// Noise messages cap ciphertext at 65,535 bytes; each carries a 16-byte
+/// Poly1305 tag, so the expressed subtraction is the safe payload limit.
+const MAX_PAYLOAD: usize = 65_535 - 16;
 
 /// Wire framing overhead: 2-byte big-endian ciphertext length.
 const LENGTH_PREFIX: usize = 2;
