@@ -7,7 +7,7 @@ use super::{
     DEFAULT_MAX_RETRIES, MAX_TRANSFER_MESSAGE_BYTES, MAX_TRANSFER_TEXT_BYTES, PROTOCOL_VERSION,
 };
 use crate::hashing::IncrementalHasher;
-use crate::manifest::{FileEntry, FileId, Manifest};
+use crate::manifest::{FileEntry, FileId, Manifest, DEFAULT_CHUNK_SIZE};
 use crate::progress::{Progress, TransferSummary};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
-const CHUNK_BUF: usize = 1024 * 1024;
+const CHUNK_BUF: usize = DEFAULT_CHUNK_SIZE as usize;
 
 /// Maximum parallel TCP connections the sender will honor. Values above
 /// this are capped to prevent resource exhaustion.
