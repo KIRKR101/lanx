@@ -42,23 +42,12 @@ fn looks_like_code(s: &str) -> bool {
     // Format: digit-word-...-word (a single ASCII digit plus 2-5 words).
     // Accepts legacy 2-word codes and new longer codes from
     // `--code-words`. Wordlist membership is NOT enforced (see below).
-    let s = s.trim();
-    let parts: Vec<_> = s.split('-').collect();
-    if parts.len() < 3 || parts.len() > 6 {
-        return false;
-    }
-    // The prefix must be one ASCII digit.
-    if parts[0].len() != 1 || !parts[0].chars().next().unwrap().is_ascii_digit() {
-        return false;
-    }
-    // Validate that words are alphabetic. We do NOT enforce wordlist
-    // membership here because generate_code produces codes from the
-    // wordlist, but a user may mistype or use a future expanded list.
-    // If the code doesn't match any sender, discovery will time out
-    // with a clear message.
-    parts[1..]
-        .iter()
-        .all(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic()))
+    // Wordlist membership is intentionally not checked (a user may
+    // mistype or use a future expanded wordlist; discovery times out
+    // with a clear message). The segmentation rules live in
+    // [`crate::discovery::code_word_count`] so this parser and that
+    // one cannot drift apart on `MIN_CODE_WORDS`/`MAX_CODE_WORDS`.
+    crate::discovery::code_word_count(s.trim()) >= crate::discovery::MIN_CODE_WORDS
 }
 
 /// Resolve a `Target` into a concrete `SocketAddr`.
