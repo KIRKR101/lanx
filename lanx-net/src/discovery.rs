@@ -105,6 +105,12 @@ pub const MAX_CODE_WORDS: usize = 5;
 // Non-emptiness of the list and of each entry were previously accepted
 // (both by the old test and the first const asserts), so they are now
 // asserted explicitly.
+//
+// The helpers below are only called from `const _` initializers. rustc
+// 1.85's dead-code analysis does not walk const initializers, so it flags
+// them as unused; the `#[allow(dead_code)]` is required on that toolchain
+// (newer rustc sees through the const calls and is unaffected by the allow).
+#[allow(dead_code)]
 const fn words_unique(words: &[&str]) -> bool {
     let mut i = 0;
     while i < words.len() {
@@ -122,6 +128,7 @@ const fn words_unique(words: &[&str]) -> bool {
 
 // `str` equality is still not callable in `const fn` on the pinned
 // toolchain (1.85), so compare bytes directly.
+#[allow(dead_code)]
 const fn str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -137,6 +144,7 @@ const fn str_eq(a: &str, b: &str) -> bool {
     true
 }
 
+#[allow(dead_code)]
 const fn words_lowercase(words: &[&str]) -> bool {
     let mut i = 0;
     while i < words.len() {
@@ -153,6 +161,7 @@ const fn words_lowercase(words: &[&str]) -> bool {
     true
 }
 
+#[allow(dead_code)]
 const fn words_non_empty(words: &[&str]) -> bool {
     let mut i = 0;
     while i < words.len() {
